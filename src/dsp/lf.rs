@@ -270,7 +270,12 @@ pub(crate) unsafe fn filter_unit(
         16
     };
     // The samples on each side that a lane may read.
-    let reach = [2, 3, 4, 7][filter_len / 5];
+    let reach = match filter_len {
+        4 => 2,
+        6 => 3,
+        8 => 4,
+        _ => 7,
+    };
     assert!(pos >= reach * step && pos + 3 * along + (reach - 1) * step < len);
     let sh = k.bit_depth - 8;
     let (limit, blimit, thresh) = (k.limit << sh, k.blimit << sh, k.thresh << sh);
@@ -1437,5 +1442,84 @@ mod tests {
         // Lanes left alone, and lanes through the narrow filter and each
         // wide one (which change at most 4, 8 and 12 samples).
         assert!(took.iter().all(|&n| n > 15000), "{took:?}");
+    }
+
+    /// The kernels refuse an edge whose samples are not all inside the
+    /// plane, and take one whose samples just are: for every filter length
+    /// and direction, the plane that ends with the last sample a lane may
+    /// read is filtered, and neither that plane less its last sample nor
+    /// the same edge one sample nearer the start is.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn in_plane_kernels_check_their_bounds() {
+        const W: usize = 32;
+        let refuses =
+            |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+        let mut failures = Vec::new();
+        for (filter_size, chroma, reach) in
+            [(4, false, 2), (8, true, 3), (8, false, 4), (16, false, 7)]
+        {
+            for vertical in [false, true] {
+                let (step, along) = if vertical { (1, W) } else { (W, 1) };
+                let params = Params {
+                    limit: 4,
+                    blimit: 40,
+                    thresh: 1,
+                    filter_size,
+                    chroma,
+                    bit_depth: 8,
+                };
+                // A sample at a time: four lanes, `reach` samples on each
+                // side of the edge.
+                let pos = reach * step;
+                let len = pos + 3 * along + (reach - 1) * step + 1;
+                let run = |pos: usize, len: usize| {
+                    let mut plane = vec![128u16; len];
+                    // SAFETY: the plane is this call's, and the kernel
+                    // checks `pos` against `len` before it touches it.
+                    unsafe { filter_unit(plane.as_mut_ptr(), len, pos, step, along, &params) }
+                };
+                let ok = !refuses(&|| run(pos, len))
+                    && refuses(&|| run(pos, len - 1))
+                    && refuses(&|| run(pos - 1, len - 1));
+                if !ok {
+                    failures.push(format!("filter_unit {filter_size} {chroma} {vertical}"));
+                }
+                // Eight lanes: whole rows of eight samples across a
+                // horizontal edge, whole blocks of eight columns (two
+                // blocks for the 16-sample size) across a vertical one.
+                #[cfg(any(
+                    target_arch = "aarch64",
+                    all(target_arch = "wasm32", target_feature = "simd128")
+                ))]
+                {
+                    let pair = Pair {
+                        limits: [[4, 40, 1]; 2],
+                        on: [true, true],
+                        filter_size,
+                        chroma,
+                        bit_depth: 8,
+                    };
+                    let columns = if filter_size == 16 { 8 } else { 4 };
+                    let (pos, len) = if vertical {
+                        (columns, columns + 7 * W + columns)
+                    } else {
+                        (reach * W, reach * W + (reach - 1) * W + 8)
+                    };
+                    let run = |pos: usize, len: usize| {
+                        let mut plane = vec![128u16; len];
+                        // SAFETY: as above.
+                        unsafe { filter_pair(plane.as_mut_ptr(), len, pos, W, vertical, &pair) }
+                    };
+                    let ok = !refuses(&|| run(pos, len))
+                        && refuses(&|| run(pos, len - 1))
+                        && refuses(&|| run(pos - 1, len - 1));
+                    if !ok {
+                        failures.push(format!("filter_pair {filter_size} {chroma} {vertical}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }
