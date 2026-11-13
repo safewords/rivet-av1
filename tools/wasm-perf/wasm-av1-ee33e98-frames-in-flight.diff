@@ -1,0 +1,308 @@
+diff --git a/src/core_rivet.rs b/src/core_rivet.rs
+index 557661d..da588cc 100644
+--- a/src/core_rivet.rs
++++ b/src/core_rivet.rs
+@@ -25,13 +25,28 @@ pub(crate) struct Core {
+     inner: av1::Decoder,
+     threads: usize,
+     apply_grain: bool,
+-    /// Frames the last temporal unit showed, not yet pulled.
++    /// The pts of the units queued in the decoder, oldest first.
++    pts: VecDeque<i64>,
++    /// Frames decoded, not yet pulled.
+     ready: VecDeque<Frame>,
+ }
+ 
++/// How many frames rivet-av1 decodes at once: one for each thread, up to 8
++/// (each holds a frame's buffers). `RIVET_FRAMES_IN_FLIGHT` at build time
++/// overrides it (the benchmark's "one frame at a time" builds).
++fn frames_in_flight(threads: usize) -> usize {
++    match option_env!("RIVET_FRAMES_IN_FLIGHT").and_then(|v| v.parse().ok()) {
++        Some(n) => n,
++        None => threads.clamp(1, 8),
++    }
++}
++
+ fn new_decoder(threads: usize, apply_grain: bool) -> av1::Decoder {
+     let mut dec = av1::Decoder::new();
+     dec.set_threads(threads);
++    dec.set_frames_in_flight(frames_in_flight(threads));
++    // Eight frames of 1920x1088 between them, however large the frames.
++    dec.set_samples_in_flight(8 * 1920 * 1088);
+     #[cfg(feature = "rivet-av1-pending")]
+     dec.set_apply_grain(apply_grain);
+     #[cfg(not(feature = "rivet-av1-pending"))]
+@@ -62,21 +77,25 @@ impl Core {
+             inner: new_decoder(threads, config.apply_grain),
+             threads,
+             apply_grain: config.apply_grain,
++            pts: VecDeque::new(),
+             ready: VecDeque::new(),
+         })
+     }
+ 
+-    /// Forget the stream: reference frames, headers, anything decoded and
+-    /// not yet pulled. A new `av1::Decoder` is exactly that and costs
+-    /// nothing — the worker threads belong to the pool in
+-    /// [`crate::threads`], not to the decoder, so a seek does not respawn
+-    /// them.
++    /// Forget the stream: reference frames, headers, anything queued, in
++    /// flight or decoded and not yet pulled. The decoder keeps its threads
++    /// (and they are the pool's in [`crate::threads`] anyway), so a seek
++    /// does not respawn them.
+     pub(crate) fn flush(&mut self) {
+-        self.inner = new_decoder(self.threads, self.apply_grain);
++        self.inner.reset();
++        self.pts.clear();
+         self.ready.clear();
+     }
+ 
+-    /// Decode one temporal unit. Always takes all of it (`Ok(true)`).
++    /// Queue one temporal unit. Always takes all of it (`Ok(true)`). With
++    /// several frames in flight its frames come out of [`Core::picture`]
++    /// some units later; an error reported here is that of an earlier
++    /// unit, whose frames are dropped.
+     pub(crate) fn send(&mut self, data: Vec<u8>, pts: i64) -> Result<bool, CoreError> {
+         // A temporal unit begins with a temporal delimiter; MP4 and Matroska
+         // samples come without theirs. rivet-av1 takes the delimiter as the
+@@ -84,10 +103,12 @@ impl Core {
+         // with no tiles, a frame that failed half way) is over; without it
+         // every later frame would be "a frame in progress". Give it one —
+         // a second in front of a unit that has its own changes nothing.
+-        self.inner.decode_all(&TEMPORAL_DELIMITER)?;
+-        for f in self.inner.decode_all(&data)? {
+-            self.ready.push_back(frame_from_av1(f, pts));
+-        }
++        let mut unit = Vec::with_capacity(TEMPORAL_DELIMITER.len() + data.len());
++        unit.extend_from_slice(&TEMPORAL_DELIMITER);
++        unit.extend_from_slice(&data);
++        self.inner.queue(&unit);
++        self.pts.push_back(pts);
++        self.take(false)?;
+         Ok(true)
+     }
+ 
+@@ -96,11 +117,48 @@ impl Core {
+         Ok(true)
+     }
+ 
+-    /// The next frame of the last temporal unit, `Ok(None)` when all have
+-    /// been pulled.
++    /// Moves the results of the units that are decoded (all of them, if
++    /// `wait`: decoding goes on on this thread until they are) to `ready`.
++    /// Stops at a unit's error: that unit is dropped, the rest stays for
++    /// the next call.
++    fn take(&mut self, wait: bool) -> Result<(), CoreError> {
++        loop {
++            let result = if wait {
++                self.inner.wait()
++            } else {
++                self.inner.poll()
++            };
++            let Some(result) = result else {
++                return Ok(());
++            };
++            let pts = self.pts.pop_front().unwrap_or(0);
++            for f in result? {
++                self.ready.push_back(frame_from_av1(f, pts));
++            }
++        }
++    }
++
++    /// The next decoded frame, `Ok(None)` when none is ready (frames may
++    /// still be in flight: see [`Core::finish`]).
+     pub(crate) fn picture(&mut self) -> Result<Option<Frame>, CoreError> {
++        if self.ready.is_empty() {
++            self.take(false)?;
++        }
+         Ok(self.ready.pop_front())
+     }
++
++    /// The end of the input: everything queued is decoded before this
++    /// returns, and waits in [`Core::picture`]. Units that fail are
++    /// dropped; returns how many did.
++    pub(crate) fn finish(&mut self) -> u64 {
++        let mut errors = 0;
++        while self.inner.queued() > 0 {
++            if self.take(true).is_err() {
++                errors += 1;
++            }
++        }
++        errors
++    }
+ }
+ 
+ /// Take a decoded rivet-av1 frame as ours: the sample buffer moves, nothing
+diff --git a/src/decoder.rs b/src/decoder.rs
+index 9526da4..1e150f5 100644
+--- a/src/decoder.rs
++++ b/src/decoder.rs
+@@ -718,6 +718,12 @@ impl Decoder {
+     /// full. Single-threaded there is never anything in flight and the extra
+     /// call is a cheap TryAgain.
+     fn drain_in_flight(&mut self) {
++        // rivet-av1 with several frames in flight: the units still queued
++        // are decoded now.
++        #[cfg(feature = "rivet-av1")]
++        {
++            self.stats.decode_errors += self.inner.finish();
++        }
+         while self.ring.len() < self.config.max_buffered {
+             match self.inner.picture() {
+                 Ok(Some(frame)) => self.push_picture(frame),
+diff --git a/src/threads.rs b/src/threads.rs
+index 73d4fc7..30d2381 100644
+--- a/src/threads.rs
++++ b/src/threads.rs
+@@ -99,7 +99,7 @@ pub use pool::install;
+ #[cfg(feature = "rivet-av1-pending")]
+ mod pool {
+     use super::*;
+-    use std::sync::{Condvar, Mutex};
++    use std::sync::{Arc, Condvar, Mutex};
+ 
+     /// A job as rivet-av1 hands it over, its borrow of the caller's stack
+     /// erased so that the pool's threads can hold it. Sound because
+@@ -109,10 +109,23 @@ mod pool {
+     // SAFETY: the pointee is `Sync`; see `Job`.
+     unsafe impl Send for Job {}
+ 
++    /// A job rivet-av1 started and does not wait for
++    /// (`Runner::start`: a decoder with several frames in flight decodes
++    /// on the pool while the thread that called it is away), the indices
++    /// `next..limit` nobody has taken yet, and the workers inside it.
++    struct Started {
++        job: Arc<dyn Fn(usize) + Send + Sync>,
++        next: usize,
++        limit: usize,
++        running: usize,
++    }
++
+     #[derive(Default)]
+     struct State {
+         /// Workers asked for so far (each is running, or about to).
+         spawned: usize,
++        /// Workers waiting for a job.
++        idle: usize,
+         /// The job in progress, and the indices `next..limit` nobody has
+         /// taken yet.
+         job: Option<Job>,
+@@ -120,6 +133,8 @@ mod pool {
+         limit: usize,
+         /// Workers inside the job.
+         running: usize,
++        /// The job that was started, until every call of it has returned.
++        started: Option<Started>,
+     }
+ 
+     struct Pool {
+@@ -133,10 +148,12 @@ mod pool {
+     static POOL: Pool = Pool {
+         state: Mutex::new(State {
+             spawned: 0,
++            idle: 0,
+             job: None,
+             next: 0,
+             limit: 0,
+             running: 0,
++            started: None,
+         }),
+         work: Condvar::new(),
+         idle: Condvar::new(),
+@@ -148,6 +165,25 @@ mod pool {
+         fn worker(&'static self) {
+             let mut st = self.state.lock().unwrap();
+             loop {
++                // A call of the started job, if one is still to be made.
++                if let Some(s) = st.started.as_mut().filter(|s| s.next < s.limit) {
++                    let k = s.next;
++                    s.next += 1;
++                    s.running += 1;
++                    let job = s.job.clone();
++                    drop(st);
++                    job(k);
++                    drop(job);
++                    st = self.state.lock().unwrap();
++                    let s = st.started.as_mut().expect("the started job");
++                    s.running -= 1;
++                    if s.running == 0 && s.next >= s.limit {
++                        // Every call was made and has returned: the pool
++                        // is free again.
++                        st.started = None;
++                    }
++                    continue;
++                }
+                 match st.job {
+                     Some(job) if st.next < st.limit => {
+                         let k = st.next;
+@@ -163,7 +199,11 @@ mod pool {
+                             self.idle.notify_all();
+                         }
+                     }
+-                    _ => st = self.work.wait(st).unwrap(),
++                    _ => {
++                        st.idle += 1;
++                        st = self.work.wait(st).unwrap();
++                        st.idle -= 1;
++                    }
+                 }
+             }
+         }
+@@ -173,9 +213,10 @@ mod pool {
+         fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+             {
+                 let mut st = self.state.lock().unwrap();
+-                if st.job.is_some() {
+-                    // Another decoder's job has the pool (two decoders on
+-                    // two threads of one instance): do this one alone.
++                if st.job.is_some() || st.started.is_some() {
++                    // Another job has the pool (two decoders on two
++                    // threads of one instance, or a decoder's frames in
++                    // flight): do this one alone.
+                     drop(st);
+                     return job(0);
+                 }
+@@ -202,6 +243,43 @@ mod pool {
+             }
+             st.job = None;
+         }
++
++        fn start(&self, n: usize, job: Arc<dyn Fn(usize) + Send + Sync>) -> usize {
++            let mut st = self.state.lock().unwrap();
++            if st.job.is_some() {
++                return 0;
++            }
++            // The calls added before, if this is the job already started,
++            // and those of them no Worker has taken yet.
++            let (before, untaken) = match &st.started {
++                None => (0, 0),
++                Some(s) if Arc::ptr_eq(&s.job, &job) => (s.limit - 1, s.limit - s.next),
++                Some(_) => return 0,
++            };
++            // A call for every Worker that is waiting right now and not
++            // already spoken for: one that has not come up yet is not
++            // promised (it may never), and is asked for again when
++            // rivet-av1 asks again.
++            let free = st.idle.saturating_sub(untaken);
++            let calls = (before + free).min(n.saturating_sub(1));
++            if calls <= before {
++                return 0;
++            }
++            match st.started.as_mut() {
++                Some(s) => s.limit = calls + 1,
++                None => {
++                    st.started = Some(Started {
++                        job,
++                        next: 1,
++                        limit: calls + 1,
++                        running: 0,
++                    })
++                }
++            }
++            drop(st);
++            self.work.notify_all();
++            calls - before
++        }
+     }
+ 
+     /// Make sure the pool has the `threads - 1` workers a decoder with

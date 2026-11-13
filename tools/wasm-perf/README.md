@@ -35,9 +35,29 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `iter-threads.sh <label>`: the simd-threads variant of wasm-av1 on the
   working tree (atomics, shared memory, std rebuilt), beside what
   `iter.sh` builds.
+- `wasm-av1-ee33e98-frames-in-flight.diff`: what that checkout's adapter
+  needs to decode with several frames in flight (`git apply` it in
+  `$WASM_PERF/wasm-av1`): units are queued and their frames taken as they
+  come, the end of the input waits for the rest, and the thread pool can
+  run a job nobody waits for (`Runner::start`). A frame in flight for
+  each thread, up to 8; `RIVET_FRAMES_IN_FLIGHT=1` in the environment of
+  a build gives one that decodes a frame at a time. Without the diff the
+  checkout decodes with `decode_all`, a frame at a time.
+- `bench-threads.mjs <runs> <pkgdir> <variant> <threads> <ivf...>`: one
+  threads build at one thread count. Like `bench-node.mjs` it times the
+  decode calls alone, which flatters a decoder that goes on decoding on
+  its threads while the caller hashes the frame it was just given
+  (rav1d's frame threads; this crate's frames in flight); `WALL=1` times
+  the whole loop instead, frames taken and not hashed.
 - `threads-table.sh <rounds> "<label>=<pkgdir> ..." "1 2 4 8" <ivf...>`:
   the threads builds at each thread count, taking turns (a process for
-  every cell of every round): the tables of the "Threads" section.
+  every cell of every round): the tables of the "Threads" section
+  (`WALL=1` as for `bench-threads.mjs`).
+- `native-threads-table.sh <rounds> "<label>=<decode_ivf> ..." "1 2 4 8"
+  <ivf...>`: the same for native builds of wasm-av1's `decode_ivf`.
+- `examples/av1_decbench.rs` (this crate's own, no wasm-av1): megapixels
+  and frames a second over the wall time of a decode, `[runs] [threads]
+  [frames in flight]`.
 - `bench-native.py <runs> <threads> <decode_ivf>...`: the same natively,
   with wasm-av1's `decode_ivf` example.
 - `prof.sh <label> <variant> <clip>`: V8's CPU profile by function.

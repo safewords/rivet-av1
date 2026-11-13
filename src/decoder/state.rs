@@ -2,7 +2,7 @@
 //! of the specification (`MiSizes`, `YModes`, `RefFrames`, `Mvs`, ...),
 //! and what a reference slot keeps (7.20).
 
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::cdf::CdfContext;
 use crate::decoder::shared::Shared;
@@ -34,6 +34,14 @@ impl PlaneBuf {
     #[inline(always)]
     pub(crate) fn get(&self, x: usize, y: usize) -> u16 {
         self.data[y * self.stride + x]
+    }
+
+    /// A sample of the rows this plane writes: what the reconstruction of
+    /// a block reads back of the frame it is writing (`get` reads the rows
+    /// before the ones a plane lent by rows may read; see `Shared`).
+    #[inline(always)]
+    pub(crate) fn mine(&self, x: usize, y: usize) -> u16 {
+        *self.data.mine(y * self.stride + x)
     }
 
     #[inline(always)]
@@ -81,8 +89,14 @@ pub(crate) struct Mi {
 
 /// What a reference slot holds beyond the header state (7.20): the
 /// decoded frame and the side data later frames read from it.
+///
+/// A frame is in a slot as soon as its header is parsed, when the decoder
+/// has several frames in flight (`docs/threading.md`): what its header
+/// says is there from the start, what its parsing leaves (`syntax`) once
+/// its last tile is parsed, and its samples (`frame`) once its
+/// post-filters are done. A frame that reads one or the other is not
+/// started before it is there.
 pub(crate) struct RefData {
-    pub(crate) frame: FrameBuf,
     pub(crate) frame_type: u32,
     pub(crate) upscaled_width: usize,
     pub(crate) frame_height: usize,
@@ -96,11 +110,43 @@ pub(crate) struct RefData {
     pub(crate) order_hint: u32,
     /// `SavedOrderHints[ i ][ ref ]`.
     pub(crate) saved_order_hints: [u32; 8],
+    pub(crate) syntax: OnceLock<RefSyntax>,
+    pub(crate) frame: OnceLock<FrameBuf>,
+}
+
+/// What parsing a frame leaves for the frames that refer to it.
+pub(crate) struct RefSyntax {
     /// `SavedRefFrames` on the 8x8 grid (the odd 4x4 positions are the
     /// only ones read).
-    pub(crate) saved_ref_frames: Arc<Vec<i8>>,
+    pub(crate) saved_ref_frames: Vec<i8>,
     /// `SavedMvs` on the 8x8 grid.
-    pub(crate) saved_mvs: Arc<Vec<Mv>>,
-    pub(crate) saved_segment_ids: Arc<Vec<u8>>,
-    pub(crate) cdfs: Arc<CdfContext>,
+    pub(crate) saved_mvs: Vec<Mv>,
+    pub(crate) saved_segment_ids: Vec<u8>,
+    pub(crate) cdfs: CdfContext,
+}
+
+impl RefData {
+    /// The decoded frame.
+    ///
+    /// # Panics
+    ///
+    /// If it is not complete: a frame was started before its reference.
+    #[inline]
+    pub(crate) fn frame(&self) -> &FrameBuf {
+        self.frame
+            .get()
+            .expect("a reference frame's samples, before they are complete")
+    }
+
+    /// What the frame's parsing left.
+    ///
+    /// # Panics
+    ///
+    /// If it is not parsed: a frame was started before its reference.
+    #[inline]
+    pub(crate) fn syntax(&self) -> &RefSyntax {
+        self.syntax
+            .get()
+            .expect("a reference frame's saved state, before it is parsed")
+    }
 }

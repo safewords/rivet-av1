@@ -130,13 +130,46 @@ and intra edges stop at the tile (`AvailU`, `AvailL`, `haveAboveRt` through
 `MiColEnd`). The frame keeps the CDFs of one of them
 (`context_update_tile_id`).
 
+### Between frames
+
+What a frame reads of the frames before it, and when that is final:
+
+- **Its header** (5.9) reads what earlier headers left: `RefValid`,
+  `RefOrderHint`, `RefFrameId`, the sizes, the loop filter deltas, the
+  segmentation and global motion parameters and the film grain parameters
+  saved with each slot (7.20, 7.21). All of that is header data: the
+  reference update process copies it into the slots from the frame's own
+  header, and nothing of it comes out of decoding the frame's tiles. So
+  **a frame's header can be parsed, and the slots updated for the next
+  header, before any frame is decoded.**
+- **Its parsing** reads, besides its own bitstream, the saved state of
+  frames in its slots: the CDFs and the segment map of
+  `primary_ref_frame` (`load_cdfs`, `load_previous_segment_ids`), and for
+  the motion field (7.9) the `SavedMvs`, `SavedRefFrames` and
+  `SavedOrderHints` of its references. Those are final when that frame's
+  last tile is parsed (the CDFs at `frame_end_update_cdf`, the motion
+  vectors and segment map from its mode info, 7.19, 7.20): its
+  reconstruction and filters do not touch them. So **a frame can be
+  parsed once the frames it names are parsed**, and two frames that name
+  the same earlier frame can be parsed at the same time.
+- **Its prediction** reads the samples of its references (7.11.3) as the
+  post-filters left them. So **a frame's rows can be reconstructed once
+  its references are complete**, and frames that are no reference of each
+  other at the same time. (A row needs only the rows of a reference its
+  motion vectors reach; waiting for whole frames is what is implemented.)
+- **What it shows** (7.18, 7.21): the frame itself or the frame in a
+  slot, complete, in the order of the headers.
+
+Nothing else passes from frame to frame.
+
 ## One-tile frames: a pipeline of rows
 
 `src/decoder/pipeline.rs`, taken for a frame of one tile without intra
-block copy when the decoder has more than one thread. (Other frames are
-decoded as before: tiles in parallel, each into a frame state of its own
-that is copied back, a tile's blocks parsed and reconstructed as they
-come; then each post-filter over the whole frame, in bands.)
+block copy when the decoder has more than one thread: such a frame is a
+`Job`, whose work is tasks that the threads take from an `Engine`. (Other
+frames are decoded as before: tiles in parallel, each into a frame state
+of its own that is copied back, a tile's blocks parsed and reconstructed
+as they come; then each post-filter over the whole frame, in bands.)
 
 ### Parsing apart from reconstruction
 
@@ -168,29 +201,37 @@ walk they are already there. The 244 conformance vectors decode
 bit-exactly through it (`AV1_DECODE_THREADS`), and `tests/threads.rs`
 holds every thread count to one thread.
 
-### The threads of a frame
+### The tasks of a frame
 
-One `parallel::run` for the frame's tile.
+**Parsing is one task**, the whole tile: it sets up the frame's state
+(its CDFs and segment map from `primary_ref_frame`, its motion field),
+then parses superblock row after superblock row. When a row is complete
+the task gives up its claim to write the row's mode info and transform
+sizes (below), copies the CDEF indices and loop restoration units the row
+coded to where the filters will look for them, and publishes the row's
+record. At the end it leaves the frame's saved state (CDFs, motion
+vectors, segment map) for the frames that refer to it.
 
-**The calling thread parses**, superblock row after superblock row. When
-a row is complete it gives up its claim to write the row's mode info and
-transform sizes (below), copies the CDEF indices and loop restoration
-units the row coded to where the filters will look for them, and
-publishes the row's record.
-
-**Every thread takes tasks** (the calling thread too, once it has parsed
-the last row). A task is one stage of one row, and is ready when what it
+**The rest is a task for each stage of each row**, ready when what it
 reads is final:
 
 | task | ready when | reads | writes |
 |---|---|---|---|
-| reconstruct row `r` | row `r` is parsed and rows before it have been taken | its record; mode info of rows `r - 1`, `r`; a copy of the last sample line of row `r - 1` | `CurrFrame`, the sample rows of row `r` |
+| parse | the frames whose saved state it reads are parsed | their saved state; the bitstream | mode info, transform sizes and records, row by row |
+| reconstruct row `r` | row `r` is parsed, rows before it have been taken, and the frame's references are complete | its record; mode info of rows `r - 1`, `r`; a copy of the last sample line of row `r - 1`; the references' samples | `CurrFrame`, the sample rows of row `r` |
 | deblock row `r` | row `r` and all before it are reconstructed, rows before it deblocked | mode info and transform sizes of rows `r - 1`, `r` | `CurrFrame`, row `r` and the last 8 (4 in chroma) sample rows of row `r - 1` |
-| CDEF row `r` | rows to `r + 1` are deblocked (reconstructed, in a frame without loop filter), or `r` is the last | `CurrFrame`, row `r` and 2 sample rows either side; skip flags of row `r`; its CDEF indices | `CdefFrame`, row `r` |
-| restore stripe `s` | the superblock rows holding its luma rows are through CDEF (in a frame without CDEF: deblocked, and the row after them too) | `CdefFrame`, its rows; `CurrFrame`, 2 rows either side; its units | `LrFrame`, its rows, in each restored plane |
+| CDEF row `r` | rows to `r + 1` are deblocked (reconstructed, in a frame without loop filter), or `r` is the last | `CurrFrame`, to 2 sample rows below row `r`; skip flags of row `r`; its CDEF indices | `CdefFrame`, row `r` |
+| restore stripe `s` | the superblock rows holding its luma rows are through CDEF (in a frame without CDEF: deblocked, and the row after them too) | `CdefFrame`, to its last row; `CurrFrame`, to 2 rows below it; its units | `LrFrame`, its rows, in each restored plane |
 
-Among the ready tasks a thread takes the stage furthest along, so that
-few rows are in flight. Rows are reconstructed in order and a row is
+(A reading task is given everything up to the last row it reads: the rows
+above are final as well, and "up to here" is the cheap window.)
+
+A thread takes a task of the oldest frame that has one ready, and there
+the stage furthest along, so that few rows are in flight. A thread with
+no task waits on a condition variable of its own; when tasks become
+ready, as many waiting threads are woken as there are tasks, the one that
+went to wait last first (it is the likeliest to still be running, and to
+have the frame in its caches). Rows are reconstructed in order and a row is
 taken only after the one above it; inside the task, superblock `c` waits
 until the row above has finished superblock `c + 1`, and after each
 superblock the task publishes the last sample line of that superblock:
@@ -219,53 +260,130 @@ has wrote: `LrFrame` for a restored plane, else `CdefFrame`, else
 The first two rows are single allocations whose parts belong to different
 threads at the same time. They are [`Shared<T>`](../src/decoder/shared.rs),
 the one type with `unsafe` in the scheme, and a small one. A `Shared` is a
-*window* on an array: a range of elements it may read and a range it may
-write. Indexing checks the range (as indexing a `Vec` checks its length).
-A window is made by `Lender::window`, which refuses, by panicking, to make
-one that could conflict with a window in existence: the invariant is that
-**the write range of every window is disjoint from both ranges of every
-other window of the same array**. From it follows that a `&mut T` handed
-out is unique and a `&T` handed out is to an element nobody can write,
-which is all its `unsafe` blocks need; and a mistake in the schedule
-(two tasks given the same rows) stops the decoder with a panic rather
-than racing. Windows are registered and dropped under the array's lock,
-which also orders one thread's last write before the next thread's first
-read of the same elements. A task takes its windows when it starts and
-drops them before it is recorded as done, so the readiness rules of the
-table are what keeps the windows from ever conflicting; the windows are
-the check on the rules. (The loop filter's and CDEF's kernels address a
-plane by pointer, as they did: `SharedPlane` is now made from a window
-and reaches exactly the window's samples.)
+*window* on an array: it may read the elements before a limit, from the
+first on, and it may write a range of elements. What is shared read-only
+in a frame is always "everything up to here" (the rows parsed so far, the
+rows filtered so far), so a reading window's check of an index is one
+comparison, as a slice's is; a window reads the rows it writes by name
+(`Shared::mine`), which is what the reconstruction of a block does when
+it reads back the frame it is writing (an intra edge, the luma under a
+chroma-from-luma block). A window is made by `Lender::window`, which
+refuses, by panicking, to make one that could conflict with a window in
+existence: the invariant is that **what a window writes is disjoint from
+everything any other window of the same array may read or write**. From
+it follows that a `&mut T` handed out is unique and a `&T` handed out is
+to an element nobody else can write, which is all its `unsafe` blocks
+need; and a mistake in the schedule (two tasks given the same rows) stops
+the decoder with a panic rather than racing. Windows are registered and
+dropped under the array's lock, which also orders one thread's last write
+before the next thread's first read of the same elements. A task takes
+its windows when it starts and drops them before it is recorded as done,
+so the readiness rules of the table are what keeps the windows from ever
+conflicting; the windows are the check on the rules. (The loop filter's
+and CDEF's kernels address a plane by pointer, as they did: `SharedPlane`
+is now made from a window and reaches exactly the samples the window
+writes.)
+
+The array nothing shares is the window onto all of it: one thread's
+decode goes through the same type, and its reads cost what indexing the
+`Vec` did (the first version of the window, a general range to read,
+cost about 1 % of a one-thread decode in wasm in the subtraction of the
+range's start; `wasm-performance.md`).
 
 The unit tests of `shared.rs` cover the window arithmetic, every kind of
 refused conflict, indexing outside a window, and rows changing hands
 between two threads.
 
+### One frame at a time
+
+`Decoder::decode_all` (and `decode`) decode their unit before they
+return. A frame that is a job is submitted when its tile group arrives,
+and the calling thread and the others (`parallel::run`) take its tasks
+until it is settled: then the reference update process (7.20) and the
+output process run on the calling thread, as they always did.
+
 ### Errors, and never waiting forever
 
 Only parsing reports errors (reconstruction and the filters have nothing
-to refuse: the syntax fixed every size and position they use). When a row
-fails to parse, the parsing thread marks the frame abandoned and wakes
-everybody: a row being reconstructed stops at its next superblock, no
-new task is taken, and the error is returned as the one-thread decoder
-returns it; the frame is dropped, as it is there. A thread that panics
-does the same on its way out (a drop guard), so the others end instead of
-waiting for a row that will never come.
+to refuse: the syntax fixed every size and position they use). When a
+tile fails to parse, the frame is marked abandoned and everybody is
+woken: a row being reconstructed stops at its next superblock, no new
+task of the frame is taken. **The frame is then decoded again, from its
+header, the way one thread decodes it**: that reports the error, and
+leaves the decoder exactly as a one-thread decoder is after it (the frame
+state a later tile group of a damaged stream would go on into, among
+other things). The same for a tile whose padding is wrong, for a decoder
+that checks it (`set_strict`). Errors are rare, and the second decode is
+what makes "the same errors at every thread count" true by construction
+rather than by argument. A thread that panics marks its frame abandoned
+on its way out (a drop guard), so the others end instead of waiting for a
+row that will never come.
 
 Every wait is for something another thread is committed to doing: a row
 waits for the row above, which was taken before it; a thread without a
-task waits for the parser (which publishes a row, finishes or fails) or
-for a task in hand to finish. If ever nothing were ready with the parser
-finished and no task in hand, the wait would never end: that would be a
-mistake in the readiness rules, and the thread that finds it panics
-instead of waiting. With no other thread at all (a `Runner` that starts
-none) the calling thread parses the tile and then carries out every task
-itself, in the order the rules allow, and waits for nothing.
+task waits to be woken, which happens whenever a task becomes ready (a
+row is published, a task finishes, a frame is submitted or completes) and
+whenever a frame is settled. With no other thread at all (a `Runner`
+that starts none) the calling thread takes every task itself, in the
+order the rules allow, and waits for nothing.
 
 `tests/threads.rs` decodes the committed vectors on 2, 3, 4, 8 and 16
 threads against one thread, repeats threaded decodes many times, and
 decodes streams with flipped bits and cut units on 1, 2, 4 and 8 threads
 under a watchdog: the same frames and the same errors, and no hang.
+
+## Several frames in flight
+
+`Decoder::set_frames_in_flight(n)`, with `Decoder::queue`, `poll` and
+`wait` (`src/decoder/flight.rs`). Not the default: a unit's frames then
+come out later than the unit goes in.
+
+One frame at a time, a frame of one tile has work for two or three
+threads and no more: its parsing is one thread's, and everything else
+together is less than twice that. More threads need more frames. From
+"Between frames" above:
+
+- `queue(unit)` parses the unit's headers on the calling thread, as if
+  each frame were decoded on the spot: for each frame that is a job, the
+  job is submitted, and the reference update process runs at once with a
+  slot entry (`RefData`) whose header part is there and whose saved state
+  and samples are still to come. The next header sees the slots it would
+  have seen. What the unit shows is noted (`Shown`): the frame, its film
+  grain parameters, the metadata in force.
+- A job's parsing task is ready when the frames whose saved state it
+  reads are parsed; its rows are reconstructed when its references are
+  complete (the table above). Everything else is as for one frame.
+- `poll()` gives the oldest unit's result if its frames are complete,
+  `wait()` decodes on the calling thread until they are: the frames it
+  shows, through the output process, in order. One result for each unit
+  queued, in the order queued.
+- At most `n` jobs are in flight: `queue` takes tasks itself, on the
+  calling thread, until an earlier frame is complete, before it submits
+  one more.
+
+**Whatever does not fit is decoded in place.** A frame that is not a job
+(several tiles, intra block copy), a unit that begins inside a frame, an
+error of any kind, a tile that does not parse: the decoder goes back to
+how it was before that unit (a snapshot: the slots, the header state,
+the sequence header), waits for every unit before it, gives up the
+frames in flight from that unit on, and decodes the unit with
+`decode_all`'s code. The units after it are then queued again from their
+bytes, which are kept until a unit's result is taken. So a unit's result,
+frames or error, and the decoder's state after it are always those of
+decoding it in place: that is the argument for "strictly compatible",
+and `tests/threads.rs` holds every unit's result to it on intact and
+damaged streams. When a frame fails, the frames submitted after it are
+abandoned with it by the engine (they were submitted as if it had
+decoded, and may be waiting for it), which is what keeps `queue` and
+`wait` from waiting for them.
+
+The threads: between two calls of the decoder its caller is away, so the
+tasks are taken by threads started for that, `parallel::start` (the
+decoder's own pool, or the embedder's `Runner::start`): a *session*,
+which the decoder begins when it first flies a unit and ends before it
+decodes anything in place (so that the tiles and filter bands of that
+have the threads) and when it is reset or dropped. `Decoder::reset()`
+forgets the stream and keeps the threads, for a seek.
 
 ### Memory
 
@@ -275,13 +393,37 @@ without CDEF has no `CdefFrame`, and `LrFrame` only the restored planes)
 and besides: the records of the rows parsed and not yet reconstructed (at
 most the frame's rows: the dequantised coefficients and about 60 bytes a
 block), one sample line per superblock row, and per thread a frame state
-without arrays and a tile walker. One frame is in flight at a time:
-`decode_all` returns when the frame is complete.
+without arrays and a tile walker. With `decode_all` one frame is in
+flight at a time. With `set_frames_in_flight(n)` at most `n` are, each
+with its own buffers, and besides: the bytes of every unit whose result
+has not been taken, and the frames those units show (a caller that queues
+without taking results keeps them all).
 
 ## Where the threads come from
 
-`parallel::run(n, job)` as before: scoped threads of the standard
-library, or the embedder's `Runner` (a pool of Web Workers in wasm-av1).
+`parallel::run(n, job)` calls the job on `n` threads at once, the caller's
+among them, and returns when every call has; `parallel::start(n, job)`
+has the other threads call a job the caller does not wait for (a
+session, above). Both:
+
+- through the embedder's `Runner` if one is registered (a pool of Web
+  Workers in wasm-av1, where there is no `std::thread::spawn`).
+  `Runner::start` is optional: without it a decoder decodes one frame at
+  a time, whatever `set_frames_in_flight` says;
+- else on the decoder's own threads (`parallel::Pool`): started when a
+  frame first needs them, parked between jobs, ended and joined when the
+  `Decoder` is dropped. A decoder makes its pool the one in use on the
+  calling thread for the length of each call (`Pool::enter`), so the
+  tiles and post-filter bands of the frames that are not jobs run on the
+  same threads. A pool thread holds a job given to `run` only as a
+  pointer whose lifetime was erased, the second `unsafe` of the scheme:
+  `run` does not return, and does not unwind, before every thread that
+  took the job has left it, and a panic in one of them is raised again
+  in the caller once they have. (A job given to `start` is owned.)
+- else (the encoder, or a job started while the pool is in the middle of
+  one) `run` uses scoped threads, started for the job and joined after
+  it, and `start` starts nothing.
+
 The waits are `std::sync::Mutex` and `Condvar`, which on `wasm32` with
 `+atomics` are `memory.atomic.wait32` and `notify`: the calling thread
 blocks too, so it must be a Worker there, as it had to be already.
@@ -298,4 +440,8 @@ record must hold (from the fields 7.11 and 7.12.3 read), and how far each
 filter trails the stage before it (from the samples 7.14.6, 7.15.3 and
 7.17.6 read). That post-filters can follow reconstruction row by row is
 likewise a known arrangement; the margins here are the ones derived
-above. No other decoder's source or design notes were read.
+above. So is decoding several frames at once with the output delayed
+("frame threading"): what a frame waits for here was read off 5.9, 7.9,
+7.19 and 7.20 ("Between frames"), with whole frames as the unit for
+samples, and the handling of errors (decode again in place) is this
+crate's own. No other decoder's source or design notes were read.

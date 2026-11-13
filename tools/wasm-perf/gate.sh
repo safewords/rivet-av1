@@ -16,8 +16,11 @@ run cargo doc --no-deps
 run cargo test --release
 run env AV1_DECODE_THREADS=4 cargo test --release --test committed_vectors --test parallel --test vectors
 run env AV1_DECODE_THREADS=8 cargo test --release --test vectors
+run env AV1_DECODE_THREADS=4 AV1_FRAMES_IN_FLIGHT=4 cargo test --release --test vectors
+run env AV1_DECODE_THREADS=8 AV1_FRAMES_IN_FLIGHT=8 cargo test --release --test vectors
 run cargo test --test fuzz --test encode --test threads
 run env AV1_DECODE_THREADS=4 cargo test --test fuzz
+run env AV1_DECODE_THREADS=4 AV1_FRAMES_IN_FLIGHT=4 cargo test --test fuzz
 run cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 run env RUSTFLAGS="-C target-feature=+simd128" cargo clippy --target wasm32-unknown-unknown --lib --target-dir target/wasm-simd -- -D warnings
 run env RUSTC_BOOTSTRAP=1 cargo clippy -Zbuild-std=std,panic_abort --target x86_64-apple-darwin --all-targets --all-features --target-dir target/x86 -- -D warnings

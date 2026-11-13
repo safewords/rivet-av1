@@ -151,7 +151,7 @@ impl TileDecoder<'_, '_> {
                 if yy < top {
                     line[xx] as i32
                 } else {
-                    cur.get(xx, yy) as i32
+                    cur.mine(xx, yy) as i32
                 }
             };
             for i in 0..w + h {
@@ -542,7 +542,7 @@ impl TileDecoder<'_, '_> {
                     let mut t = 0i32;
                     for dy in 0..=sub_y {
                         for dx in 0..=sub_x {
-                            t += luma.get(luma_x + dx, luma_y + dy) as i32;
+                            t += luma.mine(luma_x + dx, luma_y + dy) as i32;
                         }
                     }
                     let v = t << (3 - sub_x - sub_y);
@@ -559,7 +559,7 @@ impl TileDecoder<'_, '_> {
         let cur = &mut self.f.cur.planes[plane];
         for i in 0..h {
             for j in 0..w {
-                let dc = cur.get(start_x + j, start_y + i) as i32;
+                let dc = cur.mine(start_x + j, start_y + i) as i32;
                 let scaled = round2signed(alpha * (l[i * w + j] - luma_avg), 6);
                 cur.set(
                     start_x + j,
@@ -728,7 +728,7 @@ impl TileDecoder<'_, '_> {
                     // are `128 * sample` and the rounding gives the sample
                     // back, so the block is the reference's samples (its
                     // edges repeated), copied.
-                    let refp = &r.frame.planes[plane];
+                    let refp = &r.frame().planes[plane];
                     let cur = &mut self.f.cur.planes[plane];
                     let (x0, y0) = ((sx >> 10) as i32, (sy >> 10) as i32);
                     let inside = x0 >= 0 && x0 + w as i32 <= last_x + 1;
@@ -748,7 +748,7 @@ impl TileDecoder<'_, '_> {
                     continue;
                 }
                 block_inter_prediction(
-                    &r.frame.planes[plane],
+                    &r.frame().planes[plane],
                     last_x,
                     last_y,
                     sx,
@@ -913,7 +913,7 @@ impl TileDecoder<'_, '_> {
             &f.refs[ref_idx]
                 .as_ref()
                 .expect("reference checked at header")
-                .frame
+                .frame()
                 .planes[plane]
         };
         let cur = &mut f.cur.planes[plane];
@@ -1024,7 +1024,7 @@ impl TileDecoder<'_, '_> {
                 };
                 if interintra {
                     let pred0 = round2(preds[0][yy * w + xx], post).clamp(0, maxv);
-                    let pred1 = cur.get(xx + dst_x, yy + dst_y) as i32;
+                    let pred1 = cur.mine(xx + dst_x, yy + dst_y) as i32;
                     cur.set(
                         xx + dst_x,
                         yy + dst_y,
@@ -1162,7 +1162,7 @@ impl TileDecoder<'_, '_> {
         let rv = self.f.rounding_variables(false);
         let mut obmc_pred = vec![0i32; pred_w * pred_h];
         block_inter_prediction(
-            &r.frame.planes[plane],
+            &r.frame().planes[plane],
             last_x,
             last_y,
             sx,
@@ -1181,7 +1181,7 @@ impl TileDecoder<'_, '_> {
             for j in 0..pred_w {
                 let o = obmc_pred[i * pred_w + j].clamp(0, maxv);
                 let m = if pass == 0 { mask[i] } else { mask[j] };
-                let c = cur.get(pred_x + j, pred_y + i) as i32;
+                let c = cur.mine(pred_x + j, pred_y + i) as i32;
                 cur.set(
                     pred_x + j,
                     pred_y + i,
@@ -1299,7 +1299,7 @@ impl TileDecoder<'_, '_> {
         let r = self.f.refs[ref_idx]
             .as_ref()
             .expect("reference checked at header");
-        let refp = &r.frame.planes[plane];
+        let refp = &r.frame().planes[plane];
         let (sub_x, sub_y) = self.f.plane_ss(plane);
         let last_x = ((r.upscaled_width as i64 + sub_x as i64) >> sub_x) - 1;
         let last_y = ((r.frame_height as i64 + sub_y as i64) >> sub_y) - 1;

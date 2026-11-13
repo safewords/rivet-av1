@@ -35,6 +35,21 @@ fn decoder() -> av1::Decoder {
 
 fn decode_all(packets: &[Vec<u8>]) {
     let mut d = decoder();
+    // `AV1_FRAMES_IN_FLIGHT`: the units are queued, with that many frames
+    // in flight, and their results taken as they come.
+    let flight: usize = std::env::var("AV1_FRAMES_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if flight > 1 {
+        d.set_frames_in_flight(flight);
+        for p in packets {
+            d.queue(p);
+            while d.poll().is_some() {}
+        }
+        while d.wait().is_some() {}
+        return;
+    }
     for p in packets {
         let _ = d.decode(p);
     }
