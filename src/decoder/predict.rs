@@ -935,10 +935,8 @@ impl TileDecoder<'_, '_> {
                 last_y1,
                 edge1,
             );
-            for i in 0..h {
-                let dst = &mut cur.data[(y + i) * stride + x..][..w];
-                mc::avg_samples(&a[i * a_stride..][..w], &b[i * b_stride..][..w], dst);
-            }
+            let dst = &mut cur.data[y * stride + x..];
+            mc::avg_samples(a, a_stride, b, b_stride, w, h, dst, stride);
             EDGES.set(edges);
             return true;
         }
@@ -963,12 +961,8 @@ impl TileDecoder<'_, '_> {
                 &mut pred[..w * h],
             );
         }
-        let rows = preds[0][..w * h]
-            .chunks_exact(w)
-            .zip(preds[1][..w * h].chunks_exact(w));
-        for (i, (p0, p1)) in rows.enumerate() {
-            mc::compound_avg(p0, p1, c, &mut cur.data[(y + i) * stride + x..][..w]);
-        }
+        let dst = &mut cur.data[y * stride + x..];
+        mc::compound_avg(&preds[0], &preds[1], c, w, h, dst, stride);
         PREDS16.set(preds);
         true
     }

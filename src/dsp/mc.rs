@@ -445,58 +445,100 @@ impl Compound {
 }
 
 /// The average of two predictions that are both whole samples of their
-/// references: `(a + b + 1) >> 1`. (Each is the sample times `1 <<
-/// InterPostRound`, and `Round2(a + b, 1 + InterPostRound)` of those is
-/// this; it needs no clip.)
+/// references, a block of them: `(a + b + 1) >> 1`. (Each is the sample
+/// times `1 << InterPostRound`, and `Round2(a + b, 1 + InterPostRound)` of
+/// those is this; it needs no clip.) Row `r` of each starts at `r` times
+/// its stride.
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 #[inline]
-pub(crate) fn avg_samples(a: &[u16], b: &[u16], dst: &mut [u16]) {
-    debug_assert!(a.len() >= dst.len() && b.len() >= dst.len());
+pub(crate) fn avg_samples(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    if dst.len() >= 8 {
-        avg_samples_simd128(a, b, dst);
+    if w >= 8 {
+        avg_samples_simd128(a, a_stride, b, b_stride, w, h, dst, dst_stride);
         return;
     }
     #[cfg(target_arch = "aarch64")]
-    if dst.len() >= 8 {
+    if w >= 8 {
         // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { avg_samples_neon(a, b, dst) };
+        unsafe { avg_samples_neon(a, a_stride, b, b_stride, w, h, dst, dst_stride) };
         return;
     }
-    avg_samples_scalar(a, b, dst)
+    avg_samples_scalar(a, a_stride, b, b_stride, w, h, dst, dst_stride)
 }
 
 /// The average of a compound block's two predictions (7.11.3.1), as
-/// samples: `Clip1(Round2(a + b, 1 + InterPostRound))`.
+/// samples: `Clip1(Round2(a + b, 1 + InterPostRound))`. Row `r` of each
+/// prediction starts at `r * w`, row `r` of `dst` at `r * dst_stride`.
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
-pub(crate) fn compound_avg(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
-    debug_assert!(a.len() >= dst.len() && b.len() >= dst.len());
+pub(crate) fn compound_avg(
+    a: &[i16],
+    b: &[i16],
+    c: Compound,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    if dst.len() >= 8 {
-        compound_avg_simd128(a, b, c, dst);
+    if w >= 8 {
+        compound_avg_simd128(a, b, c, w, h, dst, dst_stride);
         return;
     }
     #[cfg(target_arch = "aarch64")]
-    if dst.len() >= 8 {
+    if w >= 8 {
         // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { compound_avg_neon(a, b, c, dst) };
+        unsafe { compound_avg_neon(a, b, c, w, h, dst, dst_stride) };
         return;
     }
-    compound_avg_scalar(a, b, c, dst)
+    compound_avg_scalar(a, b, c, w, h, dst, dst_stride)
 }
 
-pub(crate) fn avg_samples_scalar(a: &[u16], b: &[u16], dst: &mut [u16]) {
-    for ((o, &a), &b) in dst.iter_mut().zip(a).zip(b) {
-        *o = ((a as u32 + b as u32 + 1) >> 1) as u16;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn avg_samples_scalar(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
+    for r in 0..h {
+        let (a, b) = (&a[r * a_stride..][..w], &b[r * b_stride..][..w]);
+        for ((o, &a), &b) in dst[r * dst_stride..][..w].iter_mut().zip(a).zip(b) {
+            *o = ((a as u32 + b as u32 + 1) >> 1) as u16;
+        }
     }
 }
 
-pub(crate) fn compound_avg_scalar(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+pub(crate) fn compound_avg_scalar(
+    a: &[i16],
+    b: &[i16],
+    c: Compound,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     let shift = 1 + c.post;
     let add = (1 << c.post) + 2 * c.bias;
-    for ((o, &a), &b) in dst.iter_mut().zip(a).zip(b) {
-        *o = ((a as i32 + b as i32 + add) >> shift).clamp(0, c.maxv) as u16;
+    for r in 0..h {
+        let (a, b) = (&a[r * w..][..w], &b[r * w..][..w]);
+        for ((o, &a), &b) in dst[r * dst_stride..][..w].iter_mut().zip(a).zip(b) {
+            *o = ((a as i32 + b as i32 + add) >> shift).clamp(0, c.maxv) as u16;
+        }
     }
 }
 
@@ -751,22 +793,43 @@ fn cols16_simd128<T: Lane16, const P: usize, const WIDE: bool>(
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn avg_samples_simd128(a: &[u16], b: &[u16], dst: &mut [u16]) {
+#[allow(clippy::too_many_arguments)]
+fn avg_samples_simd128(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     use std::arch::wasm32::*;
-    let w = dst.len();
-    assert!(w >= 8 && a.len() >= w && b.len() >= w);
-    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
-    let mut c = 0;
-    while c < w {
-        let c0 = c.min(w - 8);
-        // SAFETY: c0 + 8 <= w, which none of the three slices is shorter
-        // than.
-        unsafe {
-            let va = v128_load(ap.add(c0) as *const v128);
-            let vb = v128_load(bp.add(c0) as *const v128);
-            v128_store(dp.add(c0) as *mut v128, u16x8_avgr(va, vb));
+    assert!(w >= 8 && h > 0);
+    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w);
+    assert!(dst.len() >= (h - 1) * dst_stride + w);
+    for r in 0..h {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (ap, bp, dp) = unsafe {
+            (
+                a.as_ptr().add(r * a_stride),
+                b.as_ptr().add(r * b_stride),
+                dst.as_mut_ptr().add(r * dst_stride),
+            )
+        };
+        // Whole vectors, then one more ending at the last column
+        // (overlapping what is done: the same values are stored again).
+        let mut c = 0;
+        while c < w {
+            let c0 = c.min(w - 8);
+            // SAFETY: c0 + 8 <= w, and every row holds w samples.
+            unsafe {
+                let va = v128_load(ap.add(c0) as *const v128);
+                let vb = v128_load(bp.add(c0) as *const v128);
+                v128_store(dp.add(c0) as *mut v128, u16x8_avgr(va, vb));
+            }
+            c = c0 + 8;
         }
-        c = c0 + 8;
     }
 }
 
@@ -776,29 +839,46 @@ fn avg_samples_simd128(a: &[u16], b: &[u16], dst: &mut [u16]) {
 /// and that shifted down is at most the largest sample at 10 and 12 bits
 /// (at 8 it is clipped).
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn compound_avg_simd128(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+fn compound_avg_simd128(
+    a: &[i16],
+    b: &[i16],
+    c: Compound,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     use std::arch::wasm32::*;
-    let w = dst.len();
-    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    assert!(w >= 8 && h > 0 && a.len() >= h * w && b.len() >= h * w);
+    assert!(dst.len() >= (h - 1) * dst_stride + w);
     let shift = 1 + c.post;
     let neg_add = i16x8_splat(-((1 << c.post) + 2 * c.bias) as i16);
     let maxv = i16x8_splat(c.maxv as i16);
-    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
-    let mut col = 0;
-    while col < w {
-        let c0 = col.min(w - 8);
-        // SAFETY: c0 + 8 <= w, which neither `a` nor `b` is shorter than.
-        let (va, vb) = unsafe {
+    for r in 0..h {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (ap, bp, dp) = unsafe {
             (
-                v128_load(ap.add(c0) as *const v128),
-                v128_load(bp.add(c0) as *const v128),
+                a.as_ptr().add(r * w),
+                b.as_ptr().add(r * w),
+                dst.as_mut_ptr().add(r * dst_stride),
             )
         };
-        let s = i16x8_max(i16x8_add_sat(va, vb), neg_add);
-        let v = i16x8_min(i16x8_shr(i16x8_sub_sat(s, neg_add), shift), maxv);
-        // SAFETY: c0 + 8 <= w = dst.len().
-        unsafe { v128_store(dp.add(c0) as *mut v128, v) };
-        col = c0 + 8;
+        let mut col = 0;
+        while col < w {
+            let c0 = col.min(w - 8);
+            // SAFETY: c0 + 8 <= w, and every row holds w values.
+            let (va, vb) = unsafe {
+                (
+                    v128_load(ap.add(c0) as *const v128),
+                    v128_load(bp.add(c0) as *const v128),
+                )
+            };
+            let s = i16x8_max(i16x8_add_sat(va, vb), neg_add);
+            let v = i16x8_min(i16x8_shr(i16x8_sub_sat(s, neg_add), shift), maxv);
+            // SAFETY: c0 + 8 <= w.
+            unsafe { v128_store(dp.add(c0) as *mut v128, v) };
+            col = c0 + 8;
+        }
     }
 }
 
@@ -1015,45 +1095,83 @@ unsafe fn cols16_neon<T: Lane16, const N: usize>(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn avg_samples_neon(a: &[u16], b: &[u16], dst: &mut [u16]) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn avg_samples_neon(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     use std::arch::aarch64::*;
-    let w = dst.len();
-    assert!(w >= 8 && a.len() >= w && b.len() >= w);
-    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
-    let mut c = 0;
-    while c < w {
-        let c0 = c.min(w - 8);
-        // SAFETY: c0 + 8 <= w, which none of the three slices is shorter
-        // than.
-        unsafe {
-            let v = vrhaddq_u16(vld1q_u16(ap.add(c0)), vld1q_u16(bp.add(c0)));
-            vst1q_u16(dp.add(c0), v);
+    assert!(w >= 8 && h > 0);
+    assert!(a.len() >= (h - 1) * a_stride + w && b.len() >= (h - 1) * b_stride + w);
+    assert!(dst.len() >= (h - 1) * dst_stride + w);
+    for r in 0..h {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (ap, bp, dp) = unsafe {
+            (
+                a.as_ptr().add(r * a_stride),
+                b.as_ptr().add(r * b_stride),
+                dst.as_mut_ptr().add(r * dst_stride),
+            )
+        };
+        // Whole vectors, then one more ending at the last column
+        // (overlapping what is done: the same values are stored again).
+        let mut c = 0;
+        while c < w {
+            let c0 = c.min(w - 8);
+            // SAFETY: c0 + 8 <= w, and every row holds w samples.
+            unsafe {
+                let v = vrhaddq_u16(vld1q_u16(ap.add(c0)), vld1q_u16(bp.add(c0)));
+                vst1q_u16(dp.add(c0), v);
+            }
+            c = c0 + 8;
         }
-        c = c0 + 8;
     }
 }
 
 /// The SIMD128 version's arithmetic: 16-bit lanes, saturation as the clip.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn compound_avg_neon(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+unsafe fn compound_avg_neon(
+    a: &[i16],
+    b: &[i16],
+    c: Compound,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
     use std::arch::aarch64::*;
-    let w = dst.len();
-    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    assert!(w >= 8 && h > 0 && a.len() >= h * w && b.len() >= h * w);
+    assert!(dst.len() >= (h - 1) * dst_stride + w);
     let shift = vdupq_n_s16(-(1 + c.post as i16));
     let neg_add = vdupq_n_s16(-((1 << c.post) + 2 * c.bias) as i16);
     let maxv = vdupq_n_s16(c.maxv as i16);
-    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
-    let mut col = 0;
-    while col < w {
-        let c0 = col.min(w - 8);
-        // SAFETY: c0 + 8 <= w, which neither `a` nor `b` is shorter than.
-        let (va, vb) = unsafe { (vld1q_s16(ap.add(c0)), vld1q_s16(bp.add(c0))) };
-        let s = vmaxq_s16(vqaddq_s16(va, vb), neg_add);
-        let v = vminq_s16(vshlq_s16(vqsubq_s16(s, neg_add), shift), maxv);
-        // SAFETY: c0 + 8 <= w = dst.len().
-        unsafe { vst1q_u16(dp.add(c0), vreinterpretq_u16_s16(v)) };
-        col = c0 + 8;
+    for r in 0..h {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (ap, bp, dp) = unsafe {
+            (
+                a.as_ptr().add(r * w),
+                b.as_ptr().add(r * w),
+                dst.as_mut_ptr().add(r * dst_stride),
+            )
+        };
+        let mut col = 0;
+        while col < w {
+            let c0 = col.min(w - 8);
+            // SAFETY: c0 + 8 <= w, and every row holds w values.
+            let (va, vb) = unsafe { (vld1q_s16(ap.add(c0)), vld1q_s16(bp.add(c0))) };
+            let s = vmaxq_s16(vqaddq_s16(va, vb), neg_add);
+            let v = vminq_s16(vshlq_s16(vqsubq_s16(s, neg_add), shift), maxv);
+            // SAFETY: c0 + 8 <= w.
+            unsafe { vst1q_u16(dp.add(c0), vreinterpretq_u16_s16(v)) };
+            col = c0 + 8;
+        }
     }
 }
 
@@ -1224,7 +1342,8 @@ mod tests {
 
     /// The blends agree with the specification's arithmetic on 32-bit
     /// predictions, over the whole range a prediction can take, its
-    /// extremes together included, at every depth and width.
+    /// extremes together included, at every depth and width, on blocks of
+    /// one to three rows whose strides differ.
     #[test]
     fn blends_match_the_specification() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -1238,8 +1357,10 @@ mod tests {
             let post = if bd == 12 { 2 } else { 4 };
             let c = Compound::new(bd, post);
             let (lo, hi) = compound_range(bd);
-            for w in [4usize, 8, 12, 16, 32, 64, 128] {
+            for w in [2usize, 4, 8, 12, 16, 32, 64, 128] {
                 for round in 0..40 {
+                    let h = 1 + round % 3;
+                    let ds = w + rnd(5) as usize;
                     // Predictions as the specification has them, and as
                     // they are stored.
                     let mut pick = || match (round, rnd(8)) {
@@ -1247,34 +1368,47 @@ mod tests {
                         (1, _) | (_, 1) => lo,
                         _ => lo + rnd((hi - lo + 1) as u64) as i32,
                     };
-                    let p0: Vec<i32> = (0..w).map(|_| pick()).collect();
-                    let p1: Vec<i32> = (0..w).map(|_| pick()).collect();
+                    let p0: Vec<i32> = (0..w * h).map(|_| pick()).collect();
+                    let p1: Vec<i32> = (0..w * h).map(|_| pick()).collect();
                     let a: Vec<i16> = p0.iter().map(|&v| (v - c.bias) as i16).collect();
                     let b: Vec<i16> = p1.iter().map(|&v| (v - c.bias) as i16).collect();
-                    let spec = |f: &dyn Fn(usize) -> i32| -> Vec<u16> {
-                        (0..w).map(|j| f(j).clamp(0, c.maxv) as u16).collect()
+                    // `f(row, column)` clipped, where the block's samples
+                    // go in a destination of stride `ds`; 7 elsewhere.
+                    let spec = |f: &dyn Fn(usize, usize) -> i32| -> Vec<u16> {
+                        let mut v = vec![7u16; h * ds];
+                        for r in 0..h {
+                            for j in 0..w {
+                                v[r * ds + j] = f(r, j).clamp(0, c.maxv) as u16;
+                            }
+                        }
+                        v
                     };
-                    let mut out = vec![0u16; w];
-                    let mut out_scalar = vec![0u16; w];
+                    let mut out = vec![7u16; h * ds];
+                    let mut out_scalar = vec![7u16; h * ds];
 
-                    let want = spec(&|j| (p0[j] + p1[j] + (1 << post)) >> (1 + post));
-                    compound_avg_scalar(&a, &b, c, &mut out_scalar);
-                    compound_avg(&a, &b, c, &mut out);
-                    assert_eq!(want, out_scalar, "avg scalar {bd}-bit w {w}");
-                    assert_eq!(want, out, "avg {bd}-bit w {w}");
+                    let want =
+                        spec(&|r, j| (p0[r * w + j] + p1[r * w + j] + (1 << post)) >> (1 + post));
+                    compound_avg_scalar(&a, &b, c, w, h, &mut out_scalar, ds);
+                    compound_avg(&a, &b, c, w, h, &mut out, ds);
+                    assert_eq!(want, out_scalar, "avg scalar {bd}-bit {w}x{h}");
+                    assert_eq!(want, out, "avg {bd}-bit {w}x{h}");
 
                     // Whole samples: the predictions are the samples times
                     // `1 << post`.
-                    let s0: Vec<u16> = (0..w).map(|_| rnd(1 << bd) as u16).collect();
-                    let s1: Vec<u16> = (0..w).map(|_| rnd(1 << bd) as u16).collect();
-                    let want = spec(&|j| {
-                        let (p0, p1) = ((s0[j] as i32) << post, (s1[j] as i32) << post);
+                    let (s0s, s1s) = (w + rnd(5) as usize, w + rnd(5) as usize);
+                    let s0: Vec<u16> = (0..h * s0s).map(|_| rnd(1 << bd) as u16).collect();
+                    let s1: Vec<u16> = (0..h * s1s).map(|_| rnd(1 << bd) as u16).collect();
+                    let want = spec(&|r, j| {
+                        let p0 = (s0[r * s0s + j] as i32) << post;
+                        let p1 = (s1[r * s1s + j] as i32) << post;
                         (p0 + p1 + (1 << post)) >> (1 + post)
                     });
-                    avg_samples_scalar(&s0, &s1, &mut out_scalar);
-                    avg_samples(&s0, &s1, &mut out);
-                    assert_eq!(want, out_scalar, "whole samples scalar {bd}-bit w {w}");
-                    assert_eq!(want, out, "whole samples {bd}-bit w {w}");
+                    out.fill(7);
+                    out_scalar.fill(7);
+                    avg_samples_scalar(&s0, s0s, &s1, s1s, w, h, &mut out_scalar, ds);
+                    avg_samples(&s0, s0s, &s1, s1s, w, h, &mut out, ds);
+                    assert_eq!(want, out_scalar, "whole samples scalar {bd}-bit {w}x{h}");
+                    assert_eq!(want, out, "whole samples {bd}-bit {w}x{h}");
                 }
             }
         }

@@ -310,6 +310,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 51.7 (0.80x) | 104 (0.72x) | 123 (1.50x) |
 |  | mandelbrot 720p 10-bit | 63.8 (0.86x) | 139 (1.72x) | 164 (1.70x) |
 |  | mandelbrot 1080p | 24.8 (0.79x) | 54.8 (0.74x) | 66.3 (1.62x) |
+| 12. the averages take a block | fixture 320x180 | 754 (0.65x) | 1093 (0.65x) | 1289 (0.84x) |
+|  | testsrc2 720p | 127 (0.73x) | 195 (0.65x) | 224 (0.96x) |
+|  | mandelbrot 720p | 52.1 (0.80x) | 106 (0.73x) | 128 (1.53x) |
+|  | mandelbrot 720p 10-bit | 64.1 (0.86x) | 142 (1.74x) | 170 (1.74x) |
+|  | mandelbrot 1080p | 25.8 (0.80x) | 56.7 (0.76x) | 68.1 (1.66x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -334,5 +339,9 @@ Two thirds of the samples that mandelbrot 720p predicts from two references have
 ### 11. The block warp reads a window of the reference
 
 The block warp process (7.11.3.5) read every sample under every tap of its horizontal filters through a clamp of both coordinates and a bounds-checked `get`: 960 of them for an 8x8 block. It takes the 15 rows of 15 samples it reads as a window, once (`source_window`, on every architecture: the reference itself unless the window reaches past an edge), and its filters run over slices of that. Inter prediction on mandelbrot 720p, where 1 % of the predicted samples are warped: simd 1.13 to 1.10 ms a frame, baseline 3.52 to 3.46, native 0.99 to 0.92.
+
+### 12. The averages take a block
+
+The two averages (of two whole-sample references, and of a compound block's two 16-bit predictions) were called a row at a time, each call slicing its three rows and testing the width again. They take the block, with the row loop inside the kernel. Inter prediction on mandelbrot 720p: native 0.92 to 0.86 ms a frame, simd 1.08 to 0.96 over nine turns (1.02 to 1.00 over five before that: within what V8's profile resolves on this machine), baseline within noise. A SIMD128 copy for whole-sample single predictions, in place of the `memory.copy` that `copy_from_slice` compiles to, was written with it and measured to gain nothing (0.93 and 0.95 ms): that time is the reference's and the frame's memory, not the call. It is in `tools/wasm-perf/tried/`.
 
 `tools/wasm-perf/` has the scripts every number here came from.
