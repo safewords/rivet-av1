@@ -1103,10 +1103,11 @@ pub(crate) fn lr_units_of_sb(
 }
 
 /// Codes (or decodes) the tiles `tiles` of frame `f` on up to `threads`
-/// threads: `job(state, i)` handles `tiles[i]` in a frame state of the
-/// worker's own (`FrameCtx::shard`), whose tile region is then copied into
-/// `f`. The tiles of a frame are independent, so the result is the same as
-/// handling them one after the other in `f`.
+/// threads (the caller's among them, see [`crate::parallel`]): `job(state,
+/// i)` handles `tiles[i]` in a frame state of the worker's own
+/// (`FrameCtx::shard`), whose tile region is then copied into `f`. The
+/// tiles of a frame are independent, so the result is the same as handling
+/// them one after the other in `f`.
 pub(crate) fn tiles_in_parallel<T: Send>(
     f: &mut FrameCtx,
     tiles: &[usize],
@@ -1115,28 +1116,29 @@ pub(crate) fn tiles_in_parallel<T: Send>(
 ) -> Vec<T> {
     let cols = f.hdr.tile_info.cols;
     let workers = threads.min(tiles.len()).max(1);
-    let shards: Vec<FrameCtx> = (0..workers).map(|_| f.shard()).collect();
+    // One frame state per worker, taken by the worker that runs.
+    let shards: Vec<std::sync::Mutex<Option<FrameCtx>>> = (0..workers)
+        .map(|_| std::sync::Mutex::new(Some(f.shard())))
+        .collect();
     let main = std::sync::Mutex::new(f);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: Vec<std::sync::Mutex<Option<T>>> =
         tiles.iter().map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|s| {
-        for mut shard in shards {
-            let (main, next, out, job) = (&main, &next, &out, &job);
-            s.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= tiles.len() {
-                        break;
-                    }
-                    let r = job(&mut shard, i);
-                    let t = tiles[i];
-                    main.lock()
-                        .expect("frame state")
-                        .merge_tile(&shard, t / cols, t % cols);
-                    *out[i].lock().expect("result slot") = Some(r);
-                }
-            });
+    crate::parallel::run(workers, &|k| {
+        let Some(mut shard) = shards[k].lock().expect("frame state").take() else {
+            return;
+        };
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= tiles.len() {
+                break;
+            }
+            let r = job(&mut shard, i);
+            let t = tiles[i];
+            main.lock()
+                .expect("frame state")
+                .merge_tile(&shard, t / cols, t % cols);
+            *out[i].lock().expect("result slot") = Some(r);
         }
     });
     out.into_iter()
@@ -1158,7 +1160,7 @@ pub(crate) fn parallel_map<T: Send>(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: Vec<std::sync::Mutex<Option<T>>> =
         (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    let work = || {
+    crate::parallel::run(threads.min(n).max(1), &|_| {
         loop {
             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if i >= n {
@@ -1167,12 +1169,6 @@ pub(crate) fn parallel_map<T: Send>(
             let v = job(i);
             *out[i].lock().expect("result slot") = Some(v);
         }
-    };
-    std::thread::scope(|s| {
-        for _ in 1..threads.min(n) {
-            s.spawn(work);
-        }
-        work();
     });
     out.into_iter()
         .map(|m| m.into_inner().expect("result slot").expect("every job ran"))

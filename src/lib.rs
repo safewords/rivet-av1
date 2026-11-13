@@ -29,6 +29,7 @@
 //!   film grain, reference management.
 //! - `dsp` — inverse transforms.
 //! - [`ivf`] — the IVF container.
+//! - [`parallel`] — where the decoder's threads come from.
 
 #![warn(missing_docs)]
 // The decoding processes are written as the specification writes them:
@@ -45,6 +46,7 @@ pub mod frame;
 pub(crate) mod header;
 pub mod ivf;
 pub(crate) mod obu;
+pub mod parallel;
 pub(crate) mod symbol;
 #[rustfmt::skip]
 pub(crate) mod tables;
