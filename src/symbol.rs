@@ -99,21 +99,24 @@ impl<'a> SymbolDecoder<'a> {
             self.pos += bytes as usize;
             self.cnt += 8 * bytes;
         } else {
-            self.refill_bytes();
+            (self.pos, self.dif, self.cnt) =
+                Self::refill_bytes(self.data, self.pos, self.dif, self.cnt);
         }
     }
 
     /// [`Self::refill`] a byte at a time, for the end of the data and
-    /// past it.
+    /// past it. On values, not on the decoder: a caller that keeps its
+    /// decoder in registers is not made to put it in memory for this.
     #[cold]
     #[inline(never)]
-    fn refill_bytes(&mut self) {
-        while self.cnt <= 40 {
-            let b = self.data.get(self.pos).copied().unwrap_or(0);
-            self.dif |= ((b ^ 0xFF) as u64) << (40 - self.cnt);
-            self.pos += 1;
-            self.cnt += 8;
+    fn refill_bytes(data: &[u8], mut pos: usize, mut dif: u64, mut cnt: i32) -> (usize, u64, i32) {
+        while cnt <= 40 {
+            let b = data.get(pos).copied().unwrap_or(0);
+            dif |= ((b ^ 0xFF) as u64) << (40 - cnt);
+            pos += 1;
+            cnt += 8;
         }
+        (pos, dif, cnt)
     }
 
     /// `read_symbol( cdf )`: `cdf` holds N + 1 entries, the last being the
@@ -123,12 +126,96 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// [`Self::read_symbol`] for a CDF whose size is known where it is
-    /// read, compiled into its caller: the search and the adaptation are
-    /// then loops of a fixed length. For the few reads that are most of a
-    /// stream (the coefficient levels).
+    /// read, compiled into its caller. For the few reads that are most of
+    /// a stream (the coefficient levels): those of two to four symbols take
+    /// [`Self::read_symbol_small`].
     #[inline(always)]
     pub(crate) fn read_symbol_fixed<const N: usize>(&mut self, cdf: &mut [u16; N]) -> usize {
-        self.read_symbol_inline(cdf)
+        match N {
+            3..=5 => self.read_symbol_small(cdf),
+            _ => self.read_symbol_inline(cdf),
+        }
+    }
+
+    /// `read_symbol( cdf )` for a CDF of two, three or four symbols
+    /// (`N` of 3, 4 or 5), with no branch that depends on the data.
+    ///
+    /// A coefficient's symbol cannot be predicted (that is what its bits
+    /// pay for), and a search that branches on it is mispredicted for
+    /// about one symbol in three; in the coefficient loop each of those
+    /// throws away the next coefficients' contexts along with it. So: all
+    /// the thresholds of 8.2.6 are computed (`cur` for each symbol but the
+    /// last, whose `cur` is 0 because every CDF ends at `1 << 15`); they
+    /// decrease strictly from one symbol to the next (a CDF does not
+    /// decrease, and the `EC_MIN_PROB` term does), so the symbol the
+    /// search stops at is the number of thresholds above `SymbolValue`,
+    /// and entry `i` of the CDF adapts towards 0 exactly when threshold
+    /// `i` is above it (8.2.6: the entries below the symbol). Both
+    /// adaptations of an entry are computed and one selected by its own
+    /// comparison; the interval's ends are selected the same way.
+    #[inline(always)]
+    fn read_symbol_small<const N: usize>(&mut self, cdf: &mut [u16; N]) -> usize {
+        use core::hint::select_unpredictable as select;
+        let n = N - 1;
+        debug_assert!((2..=4).contains(&n) && cdf[n - 1] == 1 << 15);
+        debug_assert!(cdf[..n].is_sorted());
+        let value = (self.dif >> 48) as u32;
+        let r = self.range >> 8;
+        // `cur` for symbol `i` of the `n`.
+        let threshold = |entry: u16, i: usize| {
+            let f = (1u32 << 15) - entry as u32;
+            ((r * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - i - 1) as u32
+        };
+        // The rate of 8.2.6: `( cnt > 15 ) + ( cnt > 31 )` is `cnt >> 4`
+        // up to 2.
+        let count = cdf[n];
+        let rate = 3 + (count >> 4).min(2) as u32 + floor_log2(n as u32).min(2);
+        // An entry after the symbol: towards 0 if the symbol is above it.
+        let adapted = |entry: u16, symbol_above: bool| {
+            select(
+                symbol_above,
+                entry - (entry >> rate),
+                entry + (((1u32 << 15) - entry as u32) >> rate) as u16,
+            )
+        };
+        let (prev, cur, symbol, entries): (u32, u32, usize, [u16; 3]);
+        match n {
+            2 => {
+                let e0 = cdf[0];
+                let t0 = threshold(e0, 0);
+                let a0 = value < t0;
+                prev = select(a0, t0, self.range);
+                cur = select(a0, 0, t0);
+                symbol = a0 as usize;
+                entries = [adapted(e0, a0), 0, 0];
+            }
+            3 => {
+                let (e0, e1) = (cdf[0], cdf[1]);
+                let (t0, t1) = (threshold(e0, 0), threshold(e1, 1));
+                let (a0, a1) = (value < t0, value < t1);
+                prev = select(a0, select(a1, t1, t0), self.range);
+                cur = select(a0, select(a1, 0, t1), t0);
+                symbol = a0 as usize + a1 as usize;
+                entries = [adapted(e0, a0), adapted(e1, a1), 0];
+            }
+            _ => {
+                let (e0, e1, e2) = (cdf[0], cdf[1], cdf[2]);
+                let (t0, t1, t2) = (threshold(e0, 0), threshold(e1, 1), threshold(e2, 2));
+                let (a0, a1, a2) = (value < t0, value < t1, value < t2);
+                prev = select(a1, select(a2, t2, t1), select(a0, t0, self.range));
+                cur = select(a1, select(a2, 0, t2), select(a0, t1, t0));
+                symbol = a0 as usize + a1 as usize + a2 as usize;
+                entries = [adapted(e0, a0), adapted(e1, a1), adapted(e2, a2)];
+            }
+        }
+        self.range = prev - cur;
+        self.dif -= (cur as u64) << 48;
+        self.renormalize();
+        if !self.disable_update {
+            cdf[..n - 1].copy_from_slice(&entries[..n - 1]);
+            cdf[n] = count + (count < 32) as u16;
+        }
+        symbol
     }
 
     #[inline(always)]
@@ -177,7 +264,7 @@ impl<'a> SymbolDecoder<'a> {
     /// `[1 << 14, 1 << 15, 0]`, worked out: with `r = range >> 8`, the
     /// threshold for 0 is `(r << 7) + EC_MIN_PROB` and the one for 1 is
     /// zero, and the throwaway CDF's adaptation has no effect.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read_bool(&mut self) -> u32 {
         let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
         let bit = if (self.dif >> 48) as u32 >= cur {
@@ -902,6 +989,53 @@ mod tests {
                     .collect();
                 same_as_reference(&data, 400, trial % 7 == 0, &mut seed);
             }
+        }
+    }
+
+    /// The adaptation keeps a CDF a CDF: no entry above the next, the
+    /// last at `1 << 15`, the counter at most 32. What
+    /// `read_symbol_small` takes for granted.
+    #[test]
+    fn adaptation_keeps_a_cdf_sorted() {
+        let mut seed = 0x0bad_5eedu32;
+        for n in 2..=16usize {
+            for _ in 0..200 {
+                // Any CDF: sorted values, some of them equal or at the ends.
+                let mut cdf = vec![0u16; n + 1];
+                for v in cdf[..n - 1].iter_mut() {
+                    *v = match xorshift(&mut seed) % 5 {
+                        0 => 0,
+                        1 => 1 << 15,
+                        _ => (xorshift(&mut seed) % 32769) as u16,
+                    };
+                }
+                cdf[..n - 1].sort();
+                cdf[n - 1] = 1 << 15;
+                for _ in 0..300 {
+                    update_cdf(&mut cdf, xorshift(&mut seed) as usize % n);
+                    assert!(cdf[..n].is_sorted() && cdf[n - 1] == 1 << 15 && cdf[n] <= 32);
+                }
+            }
+        }
+    }
+
+    /// What `SymbolDecoder::read_symbol_small` takes for granted of the
+    /// CDFs the coefficient reader hands it: they do not decrease and end at `1 << 15`, in
+    /// every default table.
+    #[test]
+    fn coefficient_cdfs_are_cdfs() {
+        fn check<const N: usize>(cdf: &[u16; N]) {
+            assert!(cdf[..N - 1].is_sorted() && cdf[N - 2] == 1 << 15 && cdf[N - 1] == 0);
+        }
+        for base_q_idx in [0, 21, 61, 121, 255] {
+            let cdf = crate::cdf::CdfContext::new(base_q_idx);
+            let eob = cdf.coeff_base_eob.as_flattened().as_flattened();
+            let base = cdf.coeff_base.as_flattened().as_flattened();
+            let br = cdf.coeff_br.as_flattened().as_flattened();
+            eob.iter().for_each(check);
+            base.iter().for_each(check);
+            br.iter().for_each(check);
+            cdf.dc_sign.as_flattened().iter().for_each(check);
         }
     }
 }

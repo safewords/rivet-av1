@@ -291,7 +291,10 @@ timers around `coeffs()` and `reconstruct()` in `transform_block`
 (`parts.sh` and `parts-native.sh` in `tools/wasm-perf`).
 
 Each row is the state after the step: fps, and its ratio to rav1d's in the
-same run. `before` is `829b1e1`.
+same run. `before` is `829b1e1`. The rows of different steps come from
+different runs on a machine whose load kept changing: across steps compare
+the ratios, and for what a step bought, its own paragraph, which gives the
+step before and after from one run.
 
 | step | clip | baseline | simd | native |
 |---|---|---|---|---|
@@ -305,6 +308,11 @@ same run. `before` is `829b1e1`.
 | | mandelbrot 720p | 49.3 (0.77x) | 97.4 (0.69x) | 114 |
 | | mandelbrot 720p 10-bit | 61.0 (0.84x) | 130 (1.65x) | 150 |
 | | mandelbrot 1080p | 24.3 (0.79x) | 52.2 (0.72x) | 61.5 |
+| 9. coefficient symbols read without a branch on what they are | fixture 320x180 | 760 (0.63x) | 1101 (0.62x) | 1291 |
+| | testsrc2 720p | 135 (0.76x) | 211 (0.70x) | 231 |
+| | mandelbrot 720p | 51.3 (0.79x) | 104 (0.72x) | 125 |
+| | mandelbrot 720p 10-bit | 66.0 (0.88x) | 147 (1.80x) | 166 |
+| | mandelbrot 1080p | 25.3 (0.76x) | 55.1 (0.73x) | 65.3 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -312,6 +320,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 |---|---|---|---|---|---|---|
 | before | 2.92 | 2.82 | 2.46 | 1.66 | 2.96 | 0.97 |
 | 8 | 2.40 | 2.42 | 1.98 | 1.60 | 2.94 | 0.97 |
+| 9 | 2.06 | 2.10 | 1.71 | 1.62 | 2.96 | 0.97 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -322,3 +331,11 @@ Where the time went first: a frame of mandelbrot 720p is 1020 transform blocks, 
 The decoder as 8.2 writes it stays in the crate as `ReferenceSymbolDecoder`. Tests read mixed symbols with both, from encoded streams and from arbitrary bytes of every length from 0 to 40, and require the same symbol, CDF and state (value, range, position, `SymbolMaxBits`) after each, past the end of the data included. And `CoefficientReader::Checked` now puts the reference symbol decoder beside the window one for everything in the tile from its first transform block on (`Coder::Both`): the shared coefficient reader, the mode info, the motion vectors. Three planted differences were each caught by the committed vectors in that mode: a context clamp of 2 for 3 in the fast coefficient reader, the lowest bit of a refill dropped, `>` for `>=` in `read_bool`.
 
 The recording after the change: 6.9 ns a symbol (4-symbol 7.3, bit 3.2 in wasm and 4.1 natively). Three further variants were measured on it and left out, none of them a gain in wasm: the 4-symbol search without branches (every threshold computed, the symbol counted) is level with the loop natively and in wasm; the adaptation as one vector operation on four lanes is slower everywhere (9.1 against 7.1 ns in wasm simd: the next read of the same CDF waits on a store it cannot forward from); an equiprobable bit without a branch changes nothing in the decoder itself.
+
+### 9. Coefficient symbols read without a branch on what they are
+
+After step 8 a 4-symbol read still cost 7.3 ns, about 29 cycles, for a dependent chain of perhaps ten. The rest is branches. The search stopped at the symbol with a conditional branch per threshold, and the adaptation was two loops whose lengths are the symbol, so each read ended in branches on a value that cannot be predicted: that it cannot is what its bits are for (the recording averages 0.87 bits a symbol, most of them zeros with ones scattered in). About a read in three was mispredicted. Alone that is a pipeline refill; in the coefficient loop it also discards the contexts the processor had already worked out for the next coefficients, which is why the loop cost 11 ns a coefficient around a read that cost 7.
+
+`read_symbol_fixed` for two, three and four symbols (every CDF the coefficient loop reads: `coeff_base`, `coeff_base_eob`, `coeff_br`, `dc_sign`) now has no branch that depends on the symbol. Every threshold of 8.2.6 is computed. They decrease strictly from one symbol to the next (a CDF does not decrease, and the `EC_MIN_PROB` term does), so the symbol is the number of thresholds above `SymbolValue`, and the entries the adaptation moves towards zero, those below the symbol, are exactly those whose threshold is above it: each entry's two possible adaptations are computed and one is selected by that entry's own comparison, and the two ends of the new interval are selected the same way (`core::hint::select_unpredictable`, so that they stay selects). What this takes for granted of a CDF, that it does not decrease and ends at `1 << 15`, is tested for every default coefficient CDF and for the adaptation, which keeps both. The general `read_symbol` is unchanged, and so is everything that is not a coefficient.
+
+On a recording of the level and sign passes of twelve frames (16 000 blocks, 1.6 million coefficients) replayed outside the decoder, with the loop otherwise as it was: 12.3 to 9.5 ns a coefficient natively, 12.9 to 11.0 in wasm. In the decoder, from one run: the part 2.37 to 2.06 ms in wasm simd and 1.98 to 1.71 natively; testsrc2 720p 198 to 211 fps simd and 124 to 135 baseline, mandelbrot 720p 101.2 to 103.8 and 50.8 to 51.3, natively 120 to 125. Two variants measured on the way and left out: one arm for each symbol (the search's exit for a symbol doing that symbol's renormalisation and adaptation, so that the adaptation has no loop) is 12 % faster than the loops on the symbols alone and 3 to 5 % in the coefficient loop, where the mispredictions stay; the adaptation without a branch but computed from the symbol after the search (masks) is slower than the loops, because the next read of the same CDF then waits for the whole search.
