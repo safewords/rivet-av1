@@ -99,7 +99,9 @@ impl Lane for i32 {
 
 /// Eight independent values, transformed together: written lane by lane
 /// in 32-bit arithmetic, which the compiler turns into vector code (AVX2
-/// where the kernel is compiled for it, NEON on aarch64). 32 bits are
+/// where the kernel is compiled for it, NEON on aarch64; for wasm32 with
+/// `simd128` the same arithmetic is written out in SIMD128 operations,
+/// below). 32 bits are
 /// exact when the values stay in the ranges conformance requires at bit
 /// depths up to 10 (`8 + BitDepth` bits: products of at most 2^17 * 2^13);
 /// [`inverse_transform_2d`] uses it only there.
@@ -114,6 +116,7 @@ impl Lane for i32 {
 )]
 pub(crate) struct Lanes(pub(crate) [i32; 8]);
 
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 impl Lane for Lanes {
     const N: usize = 8;
     #[inline(always)]
@@ -165,6 +168,99 @@ impl Lane for Lanes {
             o[l] = a.0[l].wrapping_mul(c);
         }
         Lanes(o)
+    }
+    #[inline(always)]
+    fn get(&self, l: usize) -> i32 {
+        self.0[l]
+    }
+    #[inline(always)]
+    fn set(&mut self, l: usize, v: i32) {
+        self.0[l] = v;
+    }
+}
+
+/// The two halves of eight lanes as SIMD128 vectors.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn halves(a: &Lanes) -> (core::arch::wasm32::v128, core::arch::wasm32::v128) {
+    use core::arch::wasm32::*;
+    // SAFETY: eight `i32`s are two unaligned 128-bit loads.
+    unsafe {
+        (
+            v128_load(a.0.as_ptr() as *const v128),
+            v128_load(a.0.as_ptr().add(4) as *const v128),
+        )
+    }
+}
+
+/// Eight lanes from their two halves.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn whole(lo: core::arch::wasm32::v128, hi: core::arch::wasm32::v128) -> Lanes {
+    use core::arch::wasm32::*;
+    let mut o = Lanes([0; 8]);
+    // SAFETY: two unaligned 128-bit stores fill the eight `i32`s.
+    unsafe {
+        v128_store(o.0.as_mut_ptr() as *mut v128, lo);
+        v128_store(o.0.as_mut_ptr().add(4) as *mut v128, hi);
+    }
+    o
+}
+
+/// The same lane arithmetic as above (wrapping, 32 bits a lane), written
+/// with SIMD128 operations: the compiler does not turn the lane-by-lane
+/// form into them for wasm32 as it does for aarch64.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl Lane for Lanes {
+    const N: usize = 8;
+    #[inline(always)]
+    fn zero() -> Self {
+        Lanes([0; 8])
+    }
+    #[inline(always)]
+    fn rot(a: Self, ca: i32, b: Self, cb: i32) -> Self {
+        use core::arch::wasm32::*;
+        let (ca, cb, half) = (i32x4_splat(ca), i32x4_splat(cb), i32x4_splat(1 << 11));
+        let ((a0, a1), (b0, b1)) = (halves(&a), halves(&b));
+        let f = |x, y| {
+            i32x4_shr(
+                i32x4_add(i32x4_add(i32x4_mul(x, ca), i32x4_mul(y, cb)), half),
+                12,
+            )
+        };
+        whole(f(a0, b0), f(a1, b1))
+    }
+    #[inline(always)]
+    fn add_sub_clamp(a: Self, b: Self, lo: i32, hi: i32) -> (Self, Self) {
+        use core::arch::wasm32::*;
+        let (lo, hi) = (i32x4_splat(lo), i32x4_splat(hi));
+        let ((a0, a1), (b0, b1)) = (halves(&a), halves(&b));
+        let clamp = |x| i32x4_min(i32x4_max(x, lo), hi);
+        (
+            whole(clamp(i32x4_add(a0, b0)), clamp(i32x4_add(a1, b1))),
+            whole(clamp(i32x4_sub(a0, b0)), clamp(i32x4_sub(a1, b1))),
+        )
+    }
+    #[inline(always)]
+    fn neg(a: Self) -> Self {
+        use core::arch::wasm32::*;
+        let (a0, a1) = halves(&a);
+        whole(i32x4_neg(a0), i32x4_neg(a1))
+    }
+    #[inline(always)]
+    fn scale12(a: Self, c: i32) -> Self {
+        use core::arch::wasm32::*;
+        let (c, half) = (i32x4_splat(c), i32x4_splat(1 << 11));
+        let (a0, a1) = halves(&a);
+        let f = |x| i32x4_shr(i32x4_add(i32x4_mul(x, c), half), 12);
+        whole(f(a0), f(a1))
+    }
+    #[inline(always)]
+    fn mul(a: Self, c: i32) -> Self {
+        use core::arch::wasm32::*;
+        let c = i32x4_splat(c);
+        let (a0, a1) = halves(&a);
+        whole(i32x4_mul(a0, c), i32x4_mul(a1, c))
     }
     #[inline(always)]
     fn get(&self, l: usize) -> i32 {
@@ -626,10 +722,24 @@ fn run(t: &mut [i32], kind: Kind, n: u32, r: u32, lossless: bool, wht_shift: u32
 #[inline(always)]
 fn run_lanes<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
     let mut tx = Tx { t };
-    match kind {
-        Kind::Dct => tx.idct(n, r),
-        Kind::Adst => tx.iadst(n, r),
-        Kind::Identity => tx.iidentity(n),
+    // Each size on its own. The processes of 7.13.2 are written for any
+    // size, and compiled that way they test the size at every stage, find
+    // the permutation's indices bit by bit as they run and look their
+    // angles up; with the size a constant where each is compiled in, all
+    // of that is decided there.
+    match (kind, n) {
+        (Kind::Dct, 2) => tx.idct(2, r),
+        (Kind::Dct, 3) => tx.idct(3, r),
+        (Kind::Dct, 4) => tx.idct(4, r),
+        (Kind::Dct, 5) => tx.idct(5, r),
+        (Kind::Dct, _) => tx.idct(6, r),
+        (Kind::Adst, 2) => tx.iadst(2, r),
+        (Kind::Adst, 3) => tx.iadst(3, r),
+        (Kind::Adst, _) => tx.iadst(4, r),
+        (Kind::Identity, 2) => tx.iidentity(2),
+        (Kind::Identity, 3) => tx.iidentity(3),
+        (Kind::Identity, 4) => tx.iidentity(4),
+        (Kind::Identity, _) => tx.iidentity(5),
     }
 }
 
@@ -702,11 +812,33 @@ pub(crate) fn inverse_transform_2d(
     bit_depth: u32,
     residual: &mut [i32],
 ) {
-    if !lossless && bit_depth <= 10 {
+    if lossless {
+        return inverse_transform_2d_scalar(dequant, tx_sz, tx_type, true, bit_depth, residual);
+    }
+    let rows = (1usize << TX_HEIGHT_LOG2[tx_sz]).min(32);
+    let cols = (1usize << TX_WIDTH_LOG2[tx_sz]).min(32);
+    inverse_transform_2d_within(dequant, tx_sz, tx_type, bit_depth, (rows, cols), residual)
+}
+
+/// [`inverse_transform_2d`] for a block that is not lossless and whose
+/// coefficients are zero outside its first `rows` rows and `cols` columns
+/// (`within`: at least 1 each, at most the 32 that can hold a
+/// coefficient): what is known to be zero is not transformed.
+pub(crate) fn inverse_transform_2d_within(
+    dequant: &[i32],
+    tx_sz: usize,
+    tx_type: usize,
+    bit_depth: u32,
+    within: (usize, usize),
+    residual: &mut [i32],
+) {
+    if bit_depth <= 10 {
         #[cfg(target_arch = "x86_64")]
         if crate::dsp::avx2() {
             // SAFETY: AVX2 is available.
-            unsafe { inverse_transform_2d_avx2(dequant, tx_sz, tx_type, bit_depth, residual) };
+            unsafe {
+                inverse_transform_2d_avx2(dequant, tx_sz, tx_type, bit_depth, within, residual)
+            };
             return;
         }
         // NEON is part of the aarch64 baseline, and a wasm module built
@@ -716,11 +848,12 @@ pub(crate) fn inverse_transform_2d(
             all(target_arch = "wasm32", target_feature = "simd128")
         ))]
         {
-            inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, residual);
+            inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, within, residual);
             return;
         }
     }
-    inverse_transform_2d_scalar(dequant, tx_sz, tx_type, lossless, bit_depth, residual)
+    let _ = within;
+    inverse_transform_2d_scalar(dequant, tx_sz, tx_type, false, bit_depth, residual)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -730,14 +863,20 @@ unsafe fn inverse_transform_2d_avx2(
     tx_sz: usize,
     tx_type: usize,
     bit_depth: u32,
+    within: (usize, usize),
     residual: &mut [i32],
 ) {
-    inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, residual)
+    inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, within, residual)
 }
 
 /// The 2D inverse transform eight rows, then eight columns, at a time
-/// (not lossless; bit depth 10 at most). Bit-exact with the scalar
-/// version for the values conformance allows.
+/// (not lossless; bit depth 10 at most), for coefficients that are zero
+/// outside the first `rows` rows and `cols` columns. Bit-exact with the
+/// scalar version for the values conformance allows.
+///
+/// A row transform of zeros is zeros (every step of 7.13.2 maps zeros to
+/// zeros), so the rows from `rows` on are not transformed, and the column
+/// transforms take them as zeros without their having been stored.
 #[inline(always)]
 #[cfg_attr(
     not(any(
@@ -752,6 +891,7 @@ fn inverse_transform_2d_lanes(
     tx_sz: usize,
     tx_type: usize,
     bit_depth: u32,
+    (rows, cols): (usize, usize),
     residual: &mut [i32],
 ) {
     let log2w = TX_WIDTH_LOG2[tx_sz] as u32;
@@ -764,78 +904,74 @@ fn inverse_transform_2d_lanes(
     let rk = row_kind(tx_type);
     let ck = col_kind(tx_type);
     let rect = log2w.abs_diff(log2h) == 1;
-    let nz = w.min(32);
-    // Rows, eight at a time (four for the 4-high sizes, one by one).
-    let mut i0 = 0;
-    while i0 < h {
-        if i0 >= 32 {
-            residual[i0 * w..h * w].fill(0);
-            break;
-        }
-        if h - i0 < 8 {
-            let mut t = [0i32; 64];
-            for i in i0..h {
-                let src = &dequant[i * 64..i * 64 + 32];
-                let out = &mut residual[i * w..(i + 1) * w];
-                if src[..nz].iter().all(|&v| v == 0) {
-                    out.fill(0);
-                    continue;
-                }
-                t[..w].fill(0);
-                t[..nz].copy_from_slice(&src[..nz]);
-                if rect {
-                    for v in t[..w].iter_mut() {
-                        *v = round2_12(*v as i64 * 2896);
-                    }
-                }
-                run_lanes(&mut t[..], rk, log2w, row_clamp);
-                for j in 0..w {
-                    out[j] = round2(t[j], row_shift);
-                }
-            }
-            break;
-        }
-        let mut t = [Lanes::zero(); 64];
-        let mut any = false;
-        for l in 0..8 {
-            let src = &dequant[(i0 + l) * 64..(i0 + l) * 64 + nz];
-            for (j, &v) in src.iter().enumerate() {
-                t[j].0[l] = v;
-                any |= v != 0;
-            }
-        }
-        if !any {
-            residual[i0 * w..(i0 + 8) * w].fill(0);
-            i0 += 8;
-            continue;
-        }
-        if rect {
-            for v in t[..w].iter_mut() {
-                *v = Lanes::scale12(*v, 2896);
-            }
-        }
-        run_lanes(&mut t[..], rk, log2w, row_clamp);
-        let add = (1i32 << row_shift) >> 1;
-        for l in 0..8 {
-            let out = &mut residual[(i0 + l) * w..(i0 + l + 1) * w];
-            for j in 0..w {
-                out[j] = t[j].0[l].wrapping_add(add) >> row_shift;
-            }
-        }
-        i0 += 8;
-    }
     let lo = -(1i32 << (col_clamp - 1));
     let hi = (1i32 << (col_clamp - 1)) - 1;
-    for v in residual[..w * h].iter_mut() {
-        *v = (*v).clamp(lo, hi);
+    let mut t = [Lanes::zero(); 64];
+    // Rows, eight at a time (the 4-high sizes one by one), each clamped
+    // for the column transforms as it is stored. `done` rows are stored.
+    let done;
+    if h < 8 {
+        done = h;
+        let mut t = [0i32; 64];
+        for i in 0..h {
+            let src = &dequant[i * 64..i * 64 + cols];
+            let out = &mut residual[i * w..(i + 1) * w];
+            if i >= rows || src.iter().all(|&v| v == 0) {
+                out.fill(0);
+                continue;
+            }
+            t[..w].fill(0);
+            t[..cols].copy_from_slice(src);
+            if rect {
+                for v in t[..cols].iter_mut() {
+                    *v = round2_12(*v as i64 * 2896);
+                }
+            }
+            run_lanes(&mut t[..], rk, log2w, row_clamp);
+            for j in 0..w {
+                out[j] = round2(t[j], row_shift).clamp(lo, hi);
+            }
+        }
+    } else {
+        done = rows.next_multiple_of(8);
+        let add = (1i32 << row_shift) >> 1;
+        for i0 in (0..done).step_by(8) {
+            let mut any = false;
+            for l in 0..8 {
+                let src = &dequant[(i0 + l) * 64..(i0 + l) * 64 + cols];
+                for (j, &v) in src.iter().enumerate() {
+                    t[j].0[l] = v;
+                    any |= v != 0;
+                }
+            }
+            if !any {
+                residual[i0 * w..(i0 + 8) * w].fill(0);
+                continue;
+            }
+            t[cols..w].fill(Lanes::zero());
+            if rect {
+                for v in t[..cols].iter_mut() {
+                    *v = Lanes::scale12(*v, 2896);
+                }
+            }
+            run_lanes(&mut t[..], rk, log2w, row_clamp);
+            for l in 0..8 {
+                let out = &mut residual[(i0 + l) * w..(i0 + l + 1) * w];
+                for j in 0..w {
+                    out[j] = (t[j].0[l].wrapping_add(add) >> row_shift).clamp(lo, hi);
+                }
+            }
+        }
     }
-    // Columns, eight at a time (four-wide sizes one by one).
+    // Columns, eight at a time (four-wide sizes one by one): the rows
+    // that were not stored are zeros.
     if w < 8 {
         let mut t = [0i32; 64];
         for j in 0..w {
-            for i in 0..h {
+            for i in 0..done {
                 t[i] = residual[i * w + j];
             }
+            t[done..h].fill(0);
             run_lanes(&mut t[..], ck, log2h, col_clamp);
             for i in 0..h {
                 residual[i * w + j] = round2(t[i], 4);
@@ -843,13 +979,12 @@ fn inverse_transform_2d_lanes(
         }
         return;
     }
-    let mut j0 = 0;
-    while j0 < w {
-        let mut t = [Lanes::zero(); 64];
-        for i in 0..h {
+    for j0 in (0..w).step_by(8) {
+        for i in 0..done {
             t[i].0
                 .copy_from_slice(&residual[i * w + j0..i * w + j0 + 8]);
         }
+        t[done..h].fill(Lanes::zero());
         run_lanes(&mut t[..], ck, log2h, col_clamp);
         for i in 0..h {
             let out = &mut residual[i * w + j0..i * w + j0 + 8];
@@ -857,7 +992,6 @@ fn inverse_transform_2d_lanes(
                 out[l] = t[i].0[l].wrapping_add(8) >> 4;
             }
         }
-        j0 += 8;
     }
 }
 
@@ -962,6 +1096,11 @@ mod tests {
         }
     }
 
+    /// The transform eight rows / columns at a time (SIMD where available)
+    /// agrees with the reference for every size and type, on coefficients
+    /// in the conformance range at 8 and 10 bits: with all of the block
+    /// transformed, with only the rows and columns that hold a coefficient,
+    /// and with any bound between the two.
     #[test]
     fn lanes_match_scalar() {
         let mut seed = 0x1234_5678_9abc_def1u64;
@@ -983,28 +1122,115 @@ mod tests {
                     if w.max(h) == 64 && tx_type != DCT_DCT {
                         continue;
                     }
-                    for case in 0..20 {
+                    for case in 0..40 {
                         let mut dq = vec![0i32; 64 * 64];
-                        let n = 1 + rnd(16) as usize;
-                        // A few coefficients, sometimes large, as a
-                        // conformant stream may carry.
+                        // A few coefficients or many, sometimes large, as
+                        // a conformant stream may carry; in a corner of the
+                        // block or anywhere in it.
+                        let n = if case % 8 == 7 {
+                            w * h
+                        } else {
+                            1 + rnd(16) as usize
+                        };
                         let scale = if case % 4 == 0 {
                             1 << (bd + 3)
                         } else {
                             1 << (bd - 2)
                         };
+                        let (hh, ww) = (h.min(32) as u64, w.min(32) as u64);
+                        let (hh, ww) = if case % 3 == 0 {
+                            (1 + rnd(hh), 1 + rnd(ww))
+                        } else {
+                            (hh, ww)
+                        };
+                        let (mut rows, mut cols) = (1, 1);
                         for _ in 0..n {
-                            let i = rnd(h.min(32) as u64) as usize;
-                            let j = rnd(w.min(32) as u64) as usize;
+                            let i = rnd(hh) as usize;
+                            let j = rnd(ww) as usize;
                             dq[i * 64 + j] = rnd(2 * scale) as i32 - scale as i32;
+                            if dq[i * 64 + j] != 0 {
+                                rows = rows.max(i + 1);
+                                cols = cols.max(j + 1);
+                            }
                         }
+                        let at = format!("{bd}-bit size {tx_sz} type {tx_type} case {case}");
                         let mut a = vec![0i32; w * h];
                         let mut b = vec![0i32; w * h];
                         inverse_transform_2d_scalar(&dq, tx_sz, tx_type, false, bd, &mut a);
                         inverse_transform_2d(&dq, tx_sz, tx_type, false, bd, &mut b);
-                        assert_eq!(a, b, "{bd}-bit size {tx_sz} type {tx_type} case {case}");
-                        inverse_transform_2d_lanes(&dq, tx_sz, tx_type, bd, &mut b);
-                        assert_eq!(a, b, "lanes, {bd}-bit size {tx_sz} type {tx_type}");
+                        assert_eq!(a, b, "{at}");
+                        // What was there before must not show through.
+                        let looser = (
+                            rows + rnd((h.min(32) - rows + 1) as u64) as usize,
+                            cols + rnd((w.min(32) - cols + 1) as u64) as usize,
+                        );
+                        for within in [(rows, cols), looser] {
+                            b.fill(0x5a5a5a);
+                            inverse_transform_2d_within(&dq, tx_sz, tx_type, bd, within, &mut b);
+                            assert_eq!(a, b, "{at} within {within:?}");
+                            b.fill(-0x5a5a5a);
+                            inverse_transform_2d_lanes(&dq, tx_sz, tx_type, bd, within, &mut b);
+                            assert_eq!(a, b, "lanes, {at} within {within:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 1D transforms compiled for each size give what the processes of
+    /// 7.13.2 give when called with the size as a variable, for every kind
+    /// and size, one value at a time and eight.
+    #[test]
+    fn sizes_match_the_general_processes() {
+        /// The dispatch as it was: one body for all sizes.
+        #[inline(never)]
+        fn general<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
+            let n = std::hint::black_box(n);
+            let mut tx = Tx { t };
+            match kind {
+                Kind::Dct => tx.idct(n, r),
+                Kind::Adst => tx.iadst(n, r),
+                Kind::Identity => tx.iidentity(n),
+            }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for (kind, sizes) in [
+            (Kind::Dct, 2..=6u32),
+            (Kind::Adst, 2..=4),
+            (Kind::Identity, 2..=5),
+        ] {
+            for n in sizes {
+                for r in [16u32, 18] {
+                    for _ in 0..200 {
+                        let mut a = [Lanes::zero(); 64];
+                        for v in a[..1 << n].iter_mut() {
+                            for l in 0..8 {
+                                v.0[l] = rnd(1 << (r - 1)) as i32 - (1 << (r - 2));
+                            }
+                        }
+                        let mut b = a;
+                        run_lanes(&mut a[..], kind, n, r);
+                        general(&mut b[..], kind, n, r);
+                        let name = ["DCT", "ADST", "identity"][kind as usize];
+                        for i in 0..1usize << n {
+                            assert_eq!(a[i].0, b[i].0, "{name} of {} at {i}", 1 << n);
+                        }
+                        // One value at a time: the first lane of each.
+                        let mut c = [0i32; 64];
+                        for (c, a) in c.iter_mut().zip(&b) {
+                            *c = a.0[0];
+                        }
+                        let mut d = c;
+                        run_lanes(&mut c[..], kind, n, r);
+                        general(&mut d[..], kind, n, r);
+                        assert_eq!(c, d, "{name} of {}, one value at a time", 1 << n);
                     }
                 }
             }

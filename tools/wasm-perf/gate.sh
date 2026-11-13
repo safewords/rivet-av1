@@ -19,6 +19,7 @@ run cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 run env RUSTFLAGS="-C target-feature=+simd128" cargo clippy --target wasm32-unknown-unknown --lib --target-dir target/wasm-simd -- -D warnings
 run env RUSTC_BOOTSTRAP=1 cargo clippy -Zbuild-std=std,panic_abort --target x86_64-apple-darwin --all-targets --all-features --target-dir target/x86 -- -D warnings
 run env RUSTC_BOOTSTRAP=1 cargo test -Zbuild-std=std,panic_abort --target x86_64-apple-darwin --release --target-dir target/x86
+run bash "$S/rivet-av1/tools/wasm-perf/itxbench/bench.sh" "$S/rivet-av1" gate check
 cd "$W"
 run cargo test --release --config "paths=['$S/rivet-av1']" --no-default-features --features rivet-av1-pending,container
 cargo build --release --config "paths=['$S/rivet-av1']" --no-default-features --features rivet-av1-pending,container --example decode_ivf >> "$L" 2>&1
