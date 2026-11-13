@@ -53,6 +53,22 @@ For the residual path (steps 8 on):
   vectors, which decode with `CoefficientReader::Checked`, on a copy of
   the tree with one planted difference. They are expected to fail.
 
+- `steps-table.sh <runs> <label>...`: rav1d and any number of `iter.sh`
+  builds in one interleaved run, wasm and native: the table of all the
+  steps at the end of the document.
+- `record.sh <clip> [prefix] [frames]`: decodes a clip in a patched copy of
+  the tree and records every symbol the reference symbol decoder reads and
+  every transform block the reference coefficient reader reads, to
+  `$WASM_PERF/trace-symbols.bin` and `trace-blocks.bin`: what the two
+  microbenchmarks below replay.
+- `symbench/bench.sh [rounds]`: variants of the symbol decoder, each
+  derived from `src/symbol.rs`, decoding the recorded symbols (re-encoded
+  with this crate's encoder): ns a symbol natively and in both wasm
+  builds. Steps 8 and 9 were chosen on it; the variants that lost are
+  still in it.
+- `coefbench/bench.sh [rounds]`: variants of the decode-only coefficient
+  reader's level and sign passes replaying the recorded blocks: ns a
+  coefficient. Steps 9 and 10 were chosen on it.
 - `itxbench/bench.sh [tree] [label] [check]`: the 2D inverse transform
   alone, natively and in both wasm builds: the comparison with the scalar
   reference for every size and type (the unit test of `dsp/itx.rs`, run

@@ -288,7 +288,12 @@ are measured directly: in wasm as V8's profile (200 us sampling) of
 `coeffs_decode` with the symbol decoder, and of `itx::*` with
 `reconstruct`, as milliseconds a frame on mandelbrot 720p; natively as
 timers around `coeffs()` and `reconstruct()` in `transform_block`
-(`parts.sh` and `parts-native.sh` in `tools/wasm-perf`).
+(`parts.sh` and `parts-native.sh` in `tools/wasm-perf`). Three
+microbenchmarks there decided between variants before anything went into
+the decoder: `symbench` (the symbol decoder alone, on the symbols of a real
+decode recorded by `record.sh`), `coefbench` (the coefficient reader's two
+passes, on the recorded transform blocks) and `itxbench` (the 2D inverse
+transform). The steps quote them.
 
 Each row is the state after the step: fps, and its ratio to rav1d's in the
 same run. `before` is `829b1e1`. The rows of different steps come from
