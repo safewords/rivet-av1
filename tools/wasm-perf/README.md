@@ -27,6 +27,9 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `bench-node.mjs <runs> <label=pkgdir,...> <variants> <ivf...>`: fps of
   the decode calls, median of the runs, and whether every build's MD5
   agrees (and equals the `.md5` beside the clip).
+- `bench-turns.mjs`: `bench-node.mjs` with the builds taking turns, a run
+  of each in every round, so that other work on the machine falls on all of
+  them alike.
 - `bench-threads.mjs`, `thread-shim.mjs`: a threads build in Node, each
   wasm thread a `worker_threads` Worker.
 - `bench-native.py <runs> <threads> <decode_ivf>...`: the same natively,
@@ -35,6 +38,11 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `lfprof.sh <runs> <clip> <label/variant>...`: the loop filter's
   milliseconds a frame in wasm builds (its share of the profile times the
   frame time of an unprofiled run), the builds taking turns.
+- `wasi-test.sh [filter...]`, `wasi-run.mjs`: this crate's unit tests as a
+  `wasm32-wasip1` test binary in Node, without and with `simd128`: the
+  kernels a wasm build takes, held to their references in V8 (the `dsp::`
+  and `postfilter` tests by default; nothing that starts a thread runs
+  there).
 - `lf-timing.diff`: a clock around the loop filter, for the same figure
   natively. Apply it to the tree, build `decode_ivf`, revert it, and run
   with `AV1_LF_TIME=1`: the last `LFTIME` line is the total.

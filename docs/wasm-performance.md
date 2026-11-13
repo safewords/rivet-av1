@@ -299,6 +299,7 @@ runs with the builds taking turns.
 |---|---|---|---|
 | before (`829b1e1`) | 1.53 | 2.37 | 1.25 |
 | 8. edge decisions | 1.45 | 2.22 | 1.09 |
+| 9. in the plane, eight 16-bit lanes (SIMD128, NEON) | 0.34 | 2.22 | 0.29 |
 
 The state after each step, fps and the ratio to rav1d's (median of 7, load
 average about 10):
@@ -315,7 +316,19 @@ average about 10):
 |  | mandelbrot 720p | 49.5 (0.77x) | 95.0 (0.67x) | 114 |
 |  | mandelbrot 720p 10-bit | 60.8 (0.82x) | 130 (1.61x) | 150 |
 |  | mandelbrot 1080p | 24.3 (0.86x) | 50.6 (0.68x) | 61.9 |
+| 9. the loop filter in the plane, eight 16-bit lanes at a time (SIMD128, NEON) | fixture 320x180 | 754 (0.64x) | 1418 (0.83x) | 1704 |
+|  | testsrc2 720p | 121 (0.69x) | 189 (0.63x) | 220 |
+|  | mandelbrot 720p | 50.0 (0.77x) | 108 (0.74x) | 130 |
+|  | mandelbrot 720p 10-bit | 61.8 (0.82x) | 140 (1.71x) | 169 |
+|  | mandelbrot 1080p | 24.8 (0.77x) | 57.0 (0.75x) | 70.6 |
 
 ### 8. The loop filter's edge decisions: the transform size first, levels from a table
 
 The edge loop of 7.14.2 ran as written for every 4x4 unit of every plane in both passes: the unit's mode info loaded, its block size looked up, and only then the question whether it is on a transform edge, which seven units in eight on this clip are not; for the ones that are, the level derived from the header for each unit (7.14.4: the segment's feature, the reference's and the mode's deltas, three clamps). `edge_unit` makes the same decision in the order that costs least: the transform size, one byte, first; the mode info only on a transform edge; the block size only for a skipped inter block, the one case it matters to. The level is a lookup: for a block with no `delta_lf` it depends on the segment, the first reference frame and the kind of mode alone, so the frame's 576 levels and the limits of each of the 64 level values are worked out once (`LfLevels`), and a block with a `delta_lf` goes through the same function the table was filled with. Units are handed on two at a time along their edge, which is what the kernels of the next steps take; the sample filtering itself is unchanged here. The specification's walk and its strength process stay in the tests as the reference: random frames of every layout, depth and odd size (tilings of blocks and transforms, and mode info that belongs to no tiling) are filtered both ways on one thread and on three and compared sample for sample, and ten planted errors (a wrong neighbour, a missing mode delta, an off-by-one at the frame's edge, ...) each fail them. Worth 5 to 13 % of the loop filter, which is 0 to 4 % of a frame and inside the noise on some rows.
+
+### 9. The loop filter in the plane, eight 16-bit lanes at a time (SIMD128, NEON)
+
+Each unit's edge was gathered into a 14 x 4 array of 32-bit values, a bounds-checked load a sample; every filter its size allows was computed for all four lanes and one result selected per lane; the array was scattered back. `filter_pair` filters two units' worth of an edge, eight samples, where they lie. Across a horizontal edge each row is one load of eight 16-bit lanes and each changed row one store. Across a vertical edge eight rows of eight samples (two such blocks for the 16-sample size) are transposed into vectors of one column each, filtered, and transposed back, as rows of four when only the narrow filter's four columns changed. There is a kernel for each filter length (4, chroma's 6, 8, 16) and direction. The mask of all eight lanes comes first, and the kernel returns if none passes; the narrow filter, the 7-tap (chroma's 5-tap) one and the 13-tap one are each computed only if some lane takes them; and a wide filter's sums run from one output to the next, each the one before plus two samples and less two, instead of being added up afresh. The two units keep their own limits, one value in each half of a vector; a unit that is not filtered, or whose size is another kernel's, gets a `blimit` of -1, which no lane passes. 16 bits hold all of it: with samples of at most 12 bits the mask's sum and the narrow filter's `3 * (q0 - p0)` plus a clamped term stay inside an `i16`, and the 13-tap sum (16 samples and the rounding) inside a `u16`.
+
+The kernels are written once, as a macro over two dozen lane operations, and expanded for SIMD128 and for NEON: the same arithmetic in both by construction, so native aarch64 gains with wasm instead of falling behind it. `in_plane_kernels_match_the_process` holds them to the one-sample process of 7.14.6 on 100,000 random edges (every length, direction and depth, the two halves with limits of their own, either half off, the whole plane compared so that a stray write shows), and `frames_match_the_reference_walk` runs them under the walk of step 8. Both run natively, which is the NEON expansion, and as a `wasm32-wasip1` test binary in Node (`tools/wasm-perf/wasi-test.sh`), which is the SIMD128 one in V8. Fourteen planted errors (a rounding constant, a tap, a threshold, a transposition, a store one sample off, the halves' limits swapped, ...) each fail them, and so did a real one on the way: the right half of the 16-sample block loaded four columns off. The loop filter is 4.2 times faster in the simd build and 3.8 times natively; the frame 3 to 30 % (the fixture, a libaom stream filtered on every frame, gains most). x86-64 and the wasm baseline build keep the lane filter, under the new walk.
+

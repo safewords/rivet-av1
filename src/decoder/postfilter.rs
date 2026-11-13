@@ -37,6 +37,13 @@ impl SharedPlane {
         }
     }
 
+    #[cfg(any(
+        test,
+        not(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))
+    ))]
     #[inline(always)]
     fn get(&self, i: usize) -> u16 {
         assert!(i < self.len);
@@ -44,6 +51,13 @@ impl SharedPlane {
         unsafe { *self.ptr.add(i) }
     }
 
+    #[cfg(any(
+        test,
+        not(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))
+    ))]
     #[inline(always)]
     fn set(&self, i: usize, v: u16) {
         assert!(i < self.len);
@@ -310,6 +324,7 @@ fn filter_band(
     let stride = p.stride;
     let ctx = FilterCtx {
         p,
+        pass,
         limits: &levels.limits,
         chroma: plane != 0,
         bit_depth: f.bit_depth,
@@ -328,7 +343,7 @@ fn filter_band(
                 };
                 if a != NO_EDGE || b != NO_EDGE {
                     let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
-                    ctx.filter_pair(pos, 1, stride, a, b);
+                    ctx.filter_pair(pos, a, b);
                 }
             }
             pr += 2;
@@ -346,7 +361,7 @@ fn filter_band(
                 };
                 if a != NO_EDGE || b != NO_EDGE {
                     let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
-                    ctx.filter_pair(pos, stride, 1, a, b);
+                    ctx.filter_pair(pos, a, b);
                 }
                 pc += 2;
             }
@@ -357,6 +372,7 @@ fn filter_band(
 /// What the sample filtering of a plane's edges needs besides the edge.
 struct FilterCtx<'a> {
     p: SharedPlane,
+    pass: usize,
     limits: &'a [[u8; 3]; 64],
     chroma: bool,
     bit_depth: u32,
@@ -364,11 +380,69 @@ struct FilterCtx<'a> {
 
 impl FilterCtx<'_> {
     /// Filters two units' edges (7.14.6 for each of their samples): `a` at
-    /// sample `pos`, `b` four samples further along the edge. `step` is the
-    /// distance between samples across the edge, `along` between samples
-    /// along it.
+    /// sample `pos`, `b` four samples further along the edge.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     #[inline(always)]
-    fn filter_pair(&self, pos: usize, step: usize, along: usize, a: EdgeUnit, b: EdgeUnit) {
+    fn filter_pair(&self, pos: usize, a: EdgeUnit, b: EdgeUnit) {
+        if a.size == b.size {
+            // The usual case: one kernel call for the eight samples.
+            self.filter_lanes8(pos, a.size, [a.lvl, b.lvl], [true, true]);
+        } else {
+            // A kernel is for one filter size: each unit by itself, the
+            // other one's lanes left as they are.
+            if a != NO_EDGE {
+                self.filter_lanes8(pos, a.size, [a.lvl; 2], [true, false]);
+            }
+            if b != NO_EDGE {
+                self.filter_lanes8(pos, b.size, [b.lvl; 2], [false, true]);
+            }
+        }
+    }
+
+    /// The eight samples along the edge from `pos` through the kernel of
+    /// the filter size, each half with the limits of its level if it is
+    /// `on`.
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    #[inline(always)]
+    fn filter_lanes8(&self, pos: usize, size: u8, lvl: [u8; 2], on: [bool; 2]) {
+        let pair = crate::dsp::lf::Pair {
+            limits: lvl.map(|l| self.limits[l as usize]),
+            on,
+            filter_size: size as usize,
+            chroma: self.chroma,
+            bit_depth: self.bit_depth,
+        };
+        let p = self.p;
+        // SAFETY: `ptr` is the plane's `len` samples. The kernel reads and
+        // writes the eight lanes within eight samples of the edge and
+        // nothing else, and those are this thread's: the pair lies in its
+        // band (see `filter_band`), which is whole rows in pass 0, where
+        // the kernel moves along the rows, and whole columns in pass 1,
+        // where it moves along the columns.
+        unsafe { crate::dsp::lf::filter_pair(p.ptr, p.len, pos, p.stride, self.pass == 0, &pair) };
+    }
+
+    /// Filters two units' edges (7.14.6 for each of their samples): `a` at
+    /// sample `pos`, `b` four samples further along the edge.
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    #[inline(always)]
+    fn filter_pair(&self, pos: usize, a: EdgeUnit, b: EdgeUnit) {
+        // `step` is the distance between samples across the edge, `along`
+        // between samples along it.
+        let (step, along) = if self.pass == 0 {
+            (1, self.p.stride)
+        } else {
+            (self.p.stride, 1)
+        };
         if a != NO_EDGE {
             self.filter_unit_lanes(pos, step, along, a);
         }
@@ -380,6 +454,10 @@ impl FilterCtx<'_> {
     /// One unit's four samples along the edge through the lane filter: the
     /// samples across the edge gathered, filtered together and written
     /// back.
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     fn filter_unit_lanes(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
         let p = self.p;
         let filter_size = e.size as usize;
@@ -1646,7 +1724,13 @@ mod tests {
             want.mi.clone_from(&f.mi);
             want.lf_tx_sizes.clone_from(&f.lf_tx_sizes);
             loop_filter_reference(&mut want);
-            loop_filter_threads(&mut f, if case % 2 == 0 { 1 } else { 3 });
+            // (A wasm test binary has no threads to start.)
+            let threads = if case % 2 == 0 || cfg!(target_arch = "wasm32") {
+                1
+            } else {
+                3
+            };
+            loop_filter_threads(&mut f, threads);
             for plane in 0..num_planes {
                 let (got, want) = (&f.cur.planes[plane], &want.cur.planes[plane]);
                 if let Some(i) = (0..got.data.len()).find(|&i| got.data[i] != want.data[i]) {
