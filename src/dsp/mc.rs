@@ -108,16 +108,32 @@ pub(crate) struct Taps {
 
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 impl Taps {
-    pub(crate) fn new(f: &[i32; 8]) -> Self {
-        let lo = f.iter().position(|&t| t != 0).unwrap_or(0);
-        let hi = f.iter().rposition(|&t| t != 0).unwrap_or(0);
+    pub(crate) const fn new(f: &[i32; 8]) -> Self {
+        // The first and the last tap that are not zero (the first one for
+        // both where every tap is).
+        let (mut lo, mut hi) = (0, 7);
+        while lo < 7 && f[lo] == 0 {
+            lo += 1;
+        }
+        while hi > lo && f[hi] == 0 {
+            hi -= 1;
+        }
         let len = (hi - lo + 2) & !1;
-        let first = lo.min(8 - len);
+        let first = if lo < 8 - len { lo } else { 8 - len };
         let mut taps = [0i16; 8];
-        for (t, v) in taps[..len].iter_mut().enumerate() {
-            *v = f[first + t] as i16;
+        let mut t = 0;
+        while t < len {
+            taps[t] = f[first + t] as i16;
+            t += 1;
         }
         Taps { first, len, taps }
+    }
+
+    /// The taps kept of `Subpel_Filters[set][phase]`, from a table worked
+    /// out when the crate is built: a block looks its two filters up.
+    #[inline]
+    pub(crate) fn of(set: usize, phase: usize) -> &'static Taps {
+        &KEPT[set][phase]
     }
 
     /// The run itself.
@@ -126,6 +142,21 @@ impl Taps {
         &self.taps[..self.len]
     }
 }
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+static KEPT: [[Taps; 16]; 6] = {
+    let mut kept = [[Taps::new(&[0; 8]); 16]; 6];
+    let mut set = 0;
+    while set < 6 {
+        let mut phase = 0;
+        while phase < 16 {
+            kept[set][phase] = Taps::new(&crate::tables::SUBPEL_FILTERS[set][phase]);
+            phase += 1;
+        }
+        set += 1;
+    }
+    kept
+};
 
 /// The horizontal filter of a block's rows into 16-bit intermediates:
 /// `out[r][c] = Round2(sum_t taps[t] * src[r][c + t], round0) - bias`. Row
@@ -1435,17 +1466,19 @@ mod tests {
     /// The run of taps kept holds every tap that is not zero, in place.
     #[test]
     fn kept_taps_are_the_filter() {
-        for f in SUBPEL_FILTERS.iter().flatten() {
-            let t = Taps::new(f);
-            assert!(
-                matches!(t.len, 2 | 4 | 6 | 8) && t.first + t.len <= 8,
-                "{f:?}"
-            );
-            let mut back = [0i32; 8];
-            for (k, &v) in t.taps().iter().enumerate() {
-                back[t.first + k] = v as i32;
+        for (set, filt) in SUBPEL_FILTERS.iter().enumerate() {
+            for (phase, f) in filt.iter().enumerate() {
+                let t = Taps::new(f);
+                assert!(matches!(t.len, 2 | 4 | 6 | 8) && t.first + t.len <= 8);
+                let mut back = [0i32; 8];
+                for (k, &v) in t.taps().iter().enumerate() {
+                    back[t.first + k] = v as i32;
+                }
+                assert_eq!(&back, f);
+                // And the table has it.
+                let of = Taps::of(set, phase);
+                assert_eq!((of.first, of.taps()), (t.first, t.taps()), "{f:?}");
             }
-            assert_eq!(&back, f);
         }
         // The sets for narrow blocks keep four taps, the bilinear one two,
         // the regular and smooth ones six.

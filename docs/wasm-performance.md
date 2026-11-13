@@ -315,6 +315,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 52.1 (0.80x) | 106 (0.73x) | 128 (1.53x) |
 |  | mandelbrot 720p 10-bit | 64.1 (0.86x) | 142 (1.74x) | 170 (1.74x) |
 |  | mandelbrot 1080p | 25.8 (0.80x) | 56.7 (0.76x) | 68.1 (1.66x) |
+| 13. a block's taps looked up, its buffers borrowed once | fixture 320x180 | 753 (0.65x) | 1090 (0.64x) | 1328 (0.86x) |
+|  | testsrc2 720p | 127 (0.72x) | 194 (0.65x) | 222 (0.96x) |
+|  | mandelbrot 720p | 52.6 (0.81x) | 106 (0.72x) | 127 (1.53x) |
+|  | mandelbrot 720p 10-bit | 64.1 (0.87x) | 141 (1.74x) | 173 (1.77x) |
+|  | mandelbrot 1080p | 25.8 (0.80x) | 57.0 (0.75x) | 68.7 (1.67x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -343,5 +348,9 @@ The block warp process (7.11.3.5) read every sample under every tap of its horiz
 ### 12. The averages take a block
 
 The two averages (of two whole-sample references, and of a compound block's two 16-bit predictions) were called a row at a time, each call slicing its three rows and testing the width again. They take the block, with the row loop inside the kernel. Inter prediction on mandelbrot 720p: native 0.92 to 0.86 ms a frame, simd 1.08 to 0.96 over nine turns (1.02 to 1.00 over five before that: within what V8's profile resolves on this machine), baseline within noise. A SIMD128 copy for whole-sample single predictions, in place of the `memory.copy` that `copy_from_slice` compiles to, was written with it and measured to gain nothing (0.93 and 0.95 ms): that time is the reference's and the frame's memory, not the call. It is in `tools/wasm-perf/tried/`.
+
+### 13. A block's taps looked up, its buffers borrowed once
+
+Two costs a block paid before any sample. Its two filters' kept taps were found by scanning the eight taps of each (`Taps::new`, 2 to 4 % of the prediction's time in V8's profile): they come from a table built with the crate (`Taps::of`). And the per-thread buffers (the intermediate array, the 16-bit predictions, the copy of a reference's edge) were three thread-locals, each taken out of its cell and put back around every use: five pairs of those for a compound block, one for every 8x8 of a warped block. They are one structure, borrowed once for a block and handed down. Inter prediction on mandelbrot 720p natively, nine turns: 0.87 to 0.83 ms a frame (0.85 with the table alone). In wasm, where a thread-local is a static, V8's profile does not resolve it (0.94 and 0.97 over seven turns, within its noise here).
 
 `tools/wasm-perf/` has the scripts every number here came from.
