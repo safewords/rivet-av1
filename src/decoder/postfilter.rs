@@ -37,13 +37,7 @@ impl SharedPlane {
         }
     }
 
-    #[cfg(any(
-        test,
-        not(any(
-            target_arch = "aarch64",
-            all(target_arch = "wasm32", target_feature = "simd128")
-        ))
-    ))]
+    #[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
     #[inline(always)]
     fn get(&self, i: usize) -> u16 {
         assert!(i < self.len);
@@ -51,13 +45,7 @@ impl SharedPlane {
         unsafe { *self.ptr.add(i) }
     }
 
-    #[cfg(any(
-        test,
-        not(any(
-            target_arch = "aarch64",
-            all(target_arch = "wasm32", target_feature = "simd128")
-        ))
-    ))]
+    #[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
     #[inline(always)]
     fn set(&self, i: usize, v: u16) {
         assert!(i < self.len);
@@ -444,21 +432,50 @@ impl FilterCtx<'_> {
             (self.p.stride, 1)
         };
         if a != NO_EDGE {
-            self.filter_unit_lanes(pos, step, along, a);
+            self.filter_unit(pos, step, along, a);
         }
         if b != NO_EDGE {
-            self.filter_unit_lanes(pos + 4 * along, step, along, b);
+            self.filter_unit(pos + 4 * along, step, along, b);
         }
+    }
+
+    /// The edge's filter parameters for the one-unit filters.
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    fn params(&self, e: EdgeUnit) -> crate::dsp::lf::Params {
+        let [limit, blimit, thresh] = self.limits[e.lvl as usize];
+        crate::dsp::lf::Params {
+            limit: limit as i32,
+            blimit: blimit as i32,
+            thresh: thresh as i32,
+            filter_size: e.size as usize,
+            chroma: self.chroma,
+            bit_depth: self.bit_depth,
+        }
+    }
+
+    /// One unit's four samples along the edge, a sample at a time on the
+    /// plane.
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
+    #[inline(always)]
+    fn filter_unit(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
+        let p = self.p;
+        // SAFETY: `ptr` is the plane's `len` samples. The filter reads and
+        // writes the unit's four lanes within seven samples of the edge
+        // and nothing else, and those are this thread's: the unit lies in
+        // its band, which is whole rows in pass 0, where the filter moves
+        // along the rows, and whole columns in pass 1, where it moves
+        // along the columns.
+        unsafe { crate::dsp::lf::filter_unit(p.ptr, p.len, pos, step, along, &self.params(e)) };
     }
 
     /// One unit's four samples along the edge through the lane filter: the
     /// samples across the edge gathered, filtered together and written
     /// back.
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
-    fn filter_unit_lanes(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    fn filter_unit(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
         let p = self.p;
         let filter_size = e.size as usize;
         let (base, step, along) = (pos as isize, step as isize, along as isize);
@@ -470,16 +487,7 @@ impl FilterCtx<'_> {
                     p.get((base + l * along + k * step) as usize) as i32;
             }
         }
-        let [limit, blimit, thresh] = self.limits[e.lvl as usize];
-        let params = crate::dsp::lf::Params {
-            limit: limit as i32,
-            blimit: blimit as i32,
-            thresh: thresh as i32,
-            filter_size,
-            chroma: self.chroma,
-            bit_depth: self.bit_depth,
-        };
-        crate::dsp::lf::filter(&mut v, &params);
+        crate::dsp::lf::filter(&mut v, &self.params(e));
         let span: isize = if filter_size >= 16 { 6 } else { 3 };
         for l in 0..4isize {
             for k in -span..span {

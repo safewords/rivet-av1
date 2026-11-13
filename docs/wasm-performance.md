@@ -300,6 +300,7 @@ runs with the builds taking turns.
 | before (`829b1e1`) | 1.53 | 2.37 | 1.25 |
 | 8. edge decisions | 1.45 | 2.22 | 1.09 |
 | 9. in the plane, eight 16-bit lanes (SIMD128, NEON) | 0.34 | 2.22 | 0.29 |
+| 10. the baseline build a sample at a time in the plane | 0.33 | 0.83 | (as step 9) |
 
 The state after each step, fps and the ratio to rav1d's (median of 7, load
 average about 10):
@@ -321,6 +322,11 @@ average about 10):
 |  | mandelbrot 720p | 50.0 (0.77x) | 108 (0.74x) | 130 |
 |  | mandelbrot 720p 10-bit | 61.8 (0.82x) | 140 (1.71x) | 169 |
 |  | mandelbrot 1080p | 24.8 (0.77x) | 57.0 (0.75x) | 70.6 |
+| 10. the wasm baseline build filters a sample at a time in the plane | fixture 320x180 | 861 (0.76x) | 1366 (0.82x) | 1745 |
+|  | testsrc2 720p | 124 (0.71x) | 190 (0.64x) | 233 |
+|  | mandelbrot 720p | 53.3 (0.82x) | 108 (0.74x) | 136 |
+|  | mandelbrot 720p 10-bit | 63.8 (0.85x) | 139 (1.72x) | 167 |
+|  | mandelbrot 1080p | 26.2 (0.81x) | 57.6 (0.76x) | 69.3 |
 
 ### 8. The loop filter's edge decisions: the transform size first, levels from a table
 
@@ -331,4 +337,8 @@ The edge loop of 7.14.2 ran as written for every 4x4 unit of every plane in both
 Each unit's edge was gathered into a 14 x 4 array of 32-bit values, a bounds-checked load a sample; every filter its size allows was computed for all four lanes and one result selected per lane; the array was scattered back. `filter_pair` filters two units' worth of an edge, eight samples, where they lie. Across a horizontal edge each row is one load of eight 16-bit lanes and each changed row one store. Across a vertical edge eight rows of eight samples (two such blocks for the 16-sample size) are transposed into vectors of one column each, filtered, and transposed back, as rows of four when only the narrow filter's four columns changed. There is a kernel for each filter length (4, chroma's 6, 8, 16) and direction. The mask of all eight lanes comes first, and the kernel returns if none passes; the narrow filter, the 7-tap (chroma's 5-tap) one and the 13-tap one are each computed only if some lane takes them; and a wide filter's sums run from one output to the next, each the one before plus two samples and less two, instead of being added up afresh. The two units keep their own limits, one value in each half of a vector; a unit that is not filtered, or whose size is another kernel's, gets a `blimit` of -1, which no lane passes. 16 bits hold all of it: with samples of at most 12 bits the mask's sum and the narrow filter's `3 * (q0 - p0)` plus a clamped term stay inside an `i16`, and the 13-tap sum (16 samples and the rounding) inside a `u16`.
 
 The kernels are written once, as a macro over two dozen lane operations, and expanded for SIMD128 and for NEON: the same arithmetic in both by construction, so native aarch64 gains with wasm instead of falling behind it. `in_plane_kernels_match_the_process` holds them to the one-sample process of 7.14.6 on 100,000 random edges (every length, direction and depth, the two halves with limits of their own, either half off, the whole plane compared so that a stray write shows), and `frames_match_the_reference_walk` runs them under the walk of step 8. Both run natively, which is the NEON expansion, and as a `wasm32-wasip1` test binary in Node (`tools/wasm-perf/wasi-test.sh`), which is the SIMD128 one in V8. Fourteen planted errors (a rounding constant, a tap, a threshold, a transposition, a store one sample off, the halves' limits swapped, ...) each fail them, and so did a real one on the way: the right half of the 16-sample block loaded four columns off. The loop filter is 4.2 times faster in the simd build and 3.8 times natively; the frame 3 to 30 % (the fixture, a libaom stream filtered on every frame, gains most). x86-64 and the wasm baseline build keep the lane filter, under the new walk.
+
+### 10. The wasm baseline build filters a sample at a time, in the plane
+
+A module without `simd128` has no vector lanes, so the lane filter was the worst of both there: every filter the edge's size allows, computed for all four lanes in scalar 32-bit arithmetic, inside the same gather and scatter. `filter_unit` is the one-sample process of 7.14.6 run on the plane. Each of a unit's four samples reads the samples across the edge as its mask asks for them, the nearest four first, which is enough to drop the quarter that fail; it computes the one filter it takes and writes the samples that filter changes, with a wide filter's sums carried from one output to the next as in step 9. Held to the same reference by the same two tests, natively and as a baseline `wasm32-wasip1` binary in Node; eight planted errors in its arithmetic fail them, and one in the walk's call of it fails the frame test in wasm. The baseline build's loop filter goes from 2.20 to 0.83 ms a frame, the frame 3 to 17 % faster. The other builds are untouched (their rows moved by under 2 %, both ways). Only wasm32 without `simd128` takes this path: on x86-64 the lane filter is compiled to SSE2 or AVX2 and which of the two is faster there could not be measured here, so x86-64 keeps it.
 

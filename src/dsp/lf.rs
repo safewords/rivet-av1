@@ -6,6 +6,10 @@
 //! NEON, one kernel for each filter length and edge direction, every lane's
 //! mask first and a filter computed only if a lane takes it.
 //!
+//! `filter_unit` is that for a wasm module without `simd128`: the
+//! one-sample process on the plane, each sample reading what its mask and
+//! its filter ask for and no more.
+//!
 //! `filter` takes the four samples along one unit's edge, gathered across
 //! the edge into an array: the decisions and every filter computed for each
 //! lane without branches, then selected per lane, written lane by lane in
@@ -14,13 +18,7 @@
 
 /// The samples across an edge, four lanes: `v[7 + k]` is the k-th from the
 /// edge (q0 at 7, p0 at 6), `v[k][lane]`.
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 pub(crate) type Edge = [[i32; 4]; 14];
 
 /// The edge's filter parameters (7.14.4, 7.14.3).
@@ -42,13 +40,7 @@ pub(crate) struct Params {
 }
 
 /// Filters the four lanes of `v` in place.
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 #[inline]
 pub(crate) fn filter(v: &mut Edge, p: &Params) {
     #[cfg(target_arch = "x86_64")]
@@ -66,50 +58,26 @@ unsafe fn filter_avx2(v: &mut Edge, p: &Params) {
     filter_lanes(v, p)
 }
 
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 #[inline(always)]
 fn abs4(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
     std::array::from_fn(|l| (a[l] - b[l]).abs())
 }
 
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 #[inline(always)]
 fn gt(a: [i32; 4], t: i32) -> [bool; 4] {
     std::array::from_fn(|l| a[l] > t)
 }
 
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 #[inline(always)]
 fn or(a: [bool; 4], b: [bool; 4]) -> [bool; 4] {
     std::array::from_fn(|l| a[l] | b[l])
 }
 
 /// The lane-by-lane process.
-#[cfg(any(
-    test,
-    not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))
-))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
 #[inline(always)]
 pub(crate) fn filter_lanes(v: &mut Edge, p: &Params) {
     let sh = p.bit_depth - 8;
@@ -269,6 +237,144 @@ pub(crate) fn filter_lanes(v: &mut Edge, p: &Params) {
 // ---------------------------------------------------------------------------
 // Kernels that filter the plane where it lies
 // ---------------------------------------------------------------------------
+
+/// One unit's edge filtered on the plane a sample at a time: the
+/// one-sample process (7.14.6) for each of the four samples along the edge
+/// from index `pos` (`along` apart), reading the samples across it (`step`
+/// apart) as the mask and the filter that the sample takes ask for them,
+/// and writing the ones that filter changes. For a build with no vector
+/// lanes, where computing every filter for every lane, as `filter` does,
+/// is all cost. Bit-exact with it (tested).
+///
+/// # Safety
+///
+/// `p` is valid for reading and writing `len` samples, and while the call
+/// runs nothing else reads or writes the samples of the four lanes within
+/// seven samples of the edge.
+#[cfg(any(test, all(target_arch = "wasm32", not(target_feature = "simd128"))))]
+pub(crate) unsafe fn filter_unit(
+    p: *mut u16,
+    len: usize,
+    pos: usize,
+    step: usize,
+    along: usize,
+    k: &Params,
+) {
+    let filter_len = if k.filter_size == 4 {
+        4
+    } else if k.chroma {
+        6
+    } else if k.filter_size == 8 {
+        8
+    } else {
+        16
+    };
+    // The samples on each side that a lane may read.
+    let reach = [2, 3, 4, 7][filter_len / 5];
+    assert!(pos >= reach * step && pos + 3 * along + (reach - 1) * step < len);
+    let sh = k.bit_depth - 8;
+    let (limit, blimit, thresh) = (k.limit << sh, k.blimit << sh, k.thresh << sh);
+    let one = 1 << sh;
+    let max = (1 << k.bit_depth) - 1;
+    for lane in 0..4 {
+        // SAFETY (both): sample `i` from the edge of this lane, with -reach
+        // <= i < reach: inside the plane by the assertion, and this call's
+        // alone by the caller's guarantee.
+        let at = |i: isize| unsafe { p.add(pos + lane * along).offset(i * step as isize) };
+        let get = |i: isize| unsafe { *at(i) as i32 };
+        let put = |i: isize, v: i32| unsafe { *at(i) = v as u16 };
+        // The filter mask process (7.14.6.2), nearest samples first.
+        let (p1, p0, q0, q1) = (get(-2), get(-1), get(0), get(1));
+        let near = (p1 - p0).abs().max((q1 - q0).abs());
+        if near > limit || (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit {
+            continue;
+        }
+        let mut flat = false;
+        if filter_len >= 6 {
+            let (p2, q2) = (get(-3), get(2));
+            if (p2 - p1).abs() > limit || (q2 - q1).abs() > limit {
+                continue;
+            }
+            flat = near <= one && (p2 - p0).abs() <= one && (q2 - q0).abs() <= one;
+        }
+        if filter_len >= 8 {
+            let (p2, p3, q2, q3) = (get(-3), get(-4), get(2), get(3));
+            if (p3 - p2).abs() > limit || (q3 - q2).abs() > limit {
+                continue;
+            }
+            flat = flat && (p3 - p0).abs() <= one && (q3 - q0).abs() <= one;
+        }
+        if !flat {
+            // The narrow filter (7.14.6.3). Its samples are taken less
+            // `0x80 << (BitDepth - 8)`: the offset cancels in the
+            // differences, and with it added back the last clamp is the
+            // clamp to the sample range.
+            let (lo, hi) = (-(1 << (k.bit_depth - 1)), (1 << (k.bit_depth - 1)) - 1);
+            let hev = near > thresh;
+            let f = if hev { (p1 - q1).clamp(lo, hi) } else { 0 };
+            let f = (f + 3 * (q0 - p0)).clamp(lo, hi);
+            let f1 = (f + 4).min(hi) >> 3;
+            let f2 = (f + 3).min(hi) >> 3;
+            put(0, (q0 - f1).clamp(0, max));
+            put(-1, (p0 + f2).clamp(0, max));
+            if !hev {
+                let f3 = (f1 + 1) >> 1;
+                put(1, (q1 - f3).clamp(0, max));
+                put(-2, (p1 + f3).clamp(0, max));
+            }
+            continue;
+        }
+        // The wide filters (7.14.6.4).
+        let mut v = [0i32; 14];
+        let n = if filter_len == 6 { 3 } else { 4 };
+        for i in -n..n {
+            v[(7 + i) as usize] = get(i);
+        }
+        if filter_len == 16 {
+            for i in 4..7 {
+                v[(7 + i) as usize] = get(i);
+                v[(6 - i) as usize] = get(-1 - i);
+            }
+        }
+        let flat2 = filter_len == 16
+            && (0..3).all(|i| (v[i] - p0).abs() <= one && (v[13 - i] - q0).abs() <= one);
+        let out = if flat2 {
+            wide_one::<6, 1, 4>(&v)
+        } else if filter_len == 6 {
+            wide_one::<2, 1, 3>(&v)
+        } else {
+            wide_one::<3, 0, 3>(&v)
+        };
+        let n = if flat2 { 6 } else { n - 1 };
+        for i in -n..n {
+            put(i, out[(6 + i) as usize]);
+        }
+    }
+}
+
+/// The wide filter (7.14.6.4) of the `2 * N` samples of one lane nearest
+/// the edge, from `v` (`v[7 + k]` is the k-th sample from the edge); sample
+/// `i` of the result is at index `i + 6`. `N2` is 1 where the three middle
+/// taps count twice, 0 where the middle one does, and `LOG2` is the
+/// filter's shift. The first sum is the process's; each one after it is the
+/// sum before plus the two samples whose weight rises as the taps move one
+/// sample on, less the two whose weight falls.
+#[cfg(any(test, all(target_arch = "wasm32", not(target_feature = "simd128"))))]
+#[inline(always)]
+fn wide_one<const N: isize, const N2: isize, const LOG2: u32>(v: &[i32; 14]) -> [i32; 12] {
+    let at = |i: isize| v[(7 + i.clamp(-(N + 1), N)) as usize];
+    let mut sum = 1 << (LOG2 - 1);
+    for j in -N..=N {
+        sum += at(-N + j) * if j.abs() <= N2 { 2 } else { 1 };
+    }
+    let mut out = [0; 12];
+    out[(6 - N) as usize] = sum >> LOG2;
+    for i in 1 - N..N {
+        sum += at(i + N) + at(i + N2) - at(i - 1 - N) - at(i - 1 - N2);
+        out[(i + 6) as usize] = sum >> LOG2;
+    }
+    out
+}
 
 /// The edges of two 4x4 units that follow each other along an edge: eight
 /// samples for one kernel call, the first four filtered with `limits[0]`
@@ -1191,10 +1297,6 @@ mod tests {
     /// both directions at every depth, the two units with limits of their
     /// own, either of them left unfiltered. The whole plane is compared, so
     /// a sample written that should not have been shows too.
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))]
     #[test]
     fn in_plane_kernels_match_the_process() {
         let mut seed = 0x6a09_e667_f3bc_c908u64;
@@ -1301,18 +1403,36 @@ mod tests {
                     );
                 }
             };
-            // Eight lanes at once.
-            let pair = Pair {
-                limits,
-                on,
-                filter_size,
-                chroma,
-                bit_depth: bd,
-            };
+            // A sample at a time, each unit by itself.
             let mut got = plane.clone();
-            // SAFETY: the plane is `got`'s and nothing else has it.
-            unsafe { filter_pair(got.as_mut_ptr(), got.len(), pos, W, vertical, &pair) };
-            check("filter_pair", &got);
+            for unit in 0..2 {
+                if on[unit] {
+                    let pos = pos + 4 * unit * along;
+                    // SAFETY: the plane is `got`'s and nothing else has it.
+                    unsafe {
+                        filter_unit(got.as_mut_ptr(), got.len(), pos, step, along, &params[unit])
+                    };
+                }
+            }
+            check("filter_unit", &got);
+            // Eight lanes at once.
+            #[cfg(any(
+                target_arch = "aarch64",
+                all(target_arch = "wasm32", target_feature = "simd128")
+            ))]
+            {
+                let pair = Pair {
+                    limits,
+                    on,
+                    filter_size,
+                    chroma,
+                    bit_depth: bd,
+                };
+                let mut got = plane.clone();
+                // SAFETY: the plane is `got`'s and nothing else has it.
+                unsafe { filter_pair(got.as_mut_ptr(), got.len(), pos, W, vertical, &pair) };
+                check("filter_pair", &got);
+            }
         }
         // Lanes left alone, and lanes through the narrow filter and each
         // wide one (which change at most 4, 8 and 12 samples).
