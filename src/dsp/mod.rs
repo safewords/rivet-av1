@@ -1,6 +1,9 @@
 //! Signal processing kernels, with SIMD versions (AVX2 on x86-64, NEON on
 //! aarch64) chosen at run time where they pay, each bit-exact with its
-//! scalar version (and tested against it).
+//! scalar version (and tested against it). On wasm32 a module built with
+//! the `simd128` target feature takes the SIMD128 version of the CDEF
+//! filter and the vector lanes of the inverse transforms; the loop filter
+//! and the interpolation filters are loops the compiler vectorises there.
 
 pub(crate) mod cdef;
 pub(crate) mod enc;

@@ -1,5 +1,7 @@
 //! The CDEF filter of one block (7.15.3), on a bordered window of the
-//! deblocked samples: scalar, and AVX2 / NEON versions chosen at run time,
+//! deblocked samples: scalar, AVX2 / NEON versions chosen at run time, and
+//! a WebAssembly SIMD128 version where the module is built with `simd128`
+//! (a wasm module has its features or it does not load: nothing to detect),
 //! all bit-exact.
 
 /// A window sample outside the frame (`CdefAvailable` is 0): not a tap.
@@ -37,6 +39,12 @@ pub(crate) fn filter(win: &[i32; WS * WS], w: usize, h: usize, t: &Taps, res: &m
     {
         // SAFETY: NEON is part of the aarch64 baseline.
         unsafe { filter_neon(win, w, h, t, res) };
+        #[allow(clippy::needless_return)]
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        filter_simd128(win, w, h, t, res);
         #[allow(clippy::needless_return)]
         return;
     }
@@ -237,6 +245,69 @@ unsafe fn filter_neon(win: &[i32; WS * WS], w: usize, h: usize, t: &Taps, res: &
             let packed = vqmovun_s32(v);
             // SAFETY: four samples of row i within the 64-sample result.
             unsafe { vst1_u16(res.as_mut_ptr().add(i * w + half * 4), packed) };
+        }
+    }
+}
+
+/// Four samples of a row at a time in a `v128`, the NEON version's
+/// arithmetic: 32-bit lanes, an unavailable tap's contribution selected
+/// away after it is computed.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn filter_simd128(win: &[i32; WS * WS], w: usize, h: usize, t: &Taps, res: &mut [u16; 64]) {
+    use std::arch::wasm32::*;
+    if w != 8 && w != 4 {
+        return filter_scalar(win, w, h, t, res);
+    }
+    let p = win.as_ptr();
+    let na = i32x4_splat(NA);
+    let zero = i32x4_splat(0);
+    let pri_str = i32x4_splat(t.pri_str);
+    let sec_str = i32x4_splat(t.sec_str);
+    let (pri_adj, sec_adj) = (t.pri_adj as u32, t.sec_adj as u32);
+    for i in 0..h {
+        for half in 0..w / 4 {
+            let base = ((i + 2) * WS + 2 + half * 4) as isize;
+            // SAFETY (all loads): four samples inside the 12x12 window (a
+            // block row starts at column 2, a tap is at most two rows and
+            // two columns away).
+            let x = unsafe { v128_load(p.offset(base) as *const v128) };
+            let mut sum = zero;
+            let mut mx = x;
+            let mut mn = x;
+            let mut tap = |off: isize, strv: v128, adj: u32, k: i32| {
+                let v = unsafe { v128_load(p.offset(base + off) as *const v128) };
+                let invalid = i32x4_eq(v, na);
+                let d = i32x4_sub(v, x);
+                let ad = i32x4_abs(d);
+                let lim = i32x4_max(i32x4_sub(strv, u32x4_shr(ad, adj)), zero);
+                let mag = i32x4_min(ad, lim);
+                let c = v128_bitselect(i32x4_neg(mag), mag, i32x4_lt(d, zero));
+                let c = v128_andnot(c, invalid);
+                sum = i32x4_add(sum, i32x4_mul(c, i32x4_splat(k)));
+                // NA is the least i32: it never raises the maximum.
+                mx = i32x4_max(mx, v);
+                mn = i32x4_min(mn, v128_bitselect(x, v, invalid));
+            };
+            for k in 0..2 {
+                for sign in [-1isize, 1] {
+                    tap(sign * t.pri_off[k], pri_str, pri_adj, t.pri_taps[k]);
+                    for so in t.sec_off[k] {
+                        tap(sign * so, sec_str, sec_adj, t.sec_taps[k]);
+                    }
+                }
+            }
+            // x + ((8 + sum - (sum < 0)) >> 4): the comparison is -1 where
+            // it holds.
+            let r = i32x4_shr(
+                i32x4_add(i32x4_add(sum, i32x4_splat(8)), i32x4_lt(sum, zero)),
+                4,
+            );
+            let v = i32x4_max(i32x4_min(i32x4_add(x, r), mx), mn);
+            let packed = u16x8_narrow_i32x4(v, v);
+            // SAFETY: four samples of row i within the 64-sample result.
+            unsafe {
+                v128_store64_lane::<0>(packed, res.as_mut_ptr().add(i * w + half * 4) as *mut u64)
+            };
         }
     }
 }

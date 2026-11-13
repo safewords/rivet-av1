@@ -104,6 +104,14 @@ impl Lane for i32 {
 /// depths up to 10 (`8 + BitDepth` bits: products of at most 2^17 * 2^13);
 /// [`inverse_transform_2d`] uses it only there.
 #[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct Lanes(pub(crate) [i32; 8]);
 
 impl Lane for Lanes {
@@ -666,7 +674,12 @@ pub(crate) fn inverse_transform_2d(
             unsafe { inverse_transform_2d_avx2(dequant, tx_sz, tx_type, bit_depth, residual) };
             return;
         }
-        #[cfg(target_arch = "aarch64")]
+        // NEON is part of the aarch64 baseline, and a wasm module built
+        // with `simd128` has it: the lanes compile to vectors on both.
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
         {
             inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, residual);
             return;
@@ -691,6 +704,14 @@ unsafe fn inverse_transform_2d_avx2(
 /// (not lossless; bit depth 10 at most). Bit-exact with the scalar
 /// version for the values conformance allows.
 #[inline(always)]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
 fn inverse_transform_2d_lanes(
     dequant: &[i32],
     tx_sz: usize,

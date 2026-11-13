@@ -91,6 +91,17 @@ inverse transforms (eight rows or columns at a time; the 64-bit scalar
 transforms remain for 12-bit and lossless) and the loop filter (the four
 samples along an edge at once). `AV1_NO_SIMD=1` turns them off.
 
+On `wasm32-unknown-unknown` the crate builds as it is. A module built with
+the `simd128` target feature takes a SIMD128 version of the CDEF block
+filter and the vector lanes of the inverse transforms (the loop filter and
+the interpolation filters are loops the compiler vectorises there). There
+is no `std::thread::spawn` on that target — a thread is another instance of
+the module on shared memory, which only the page can create — so an
+embedder that has threads registers them once with
+`av1::parallel::set_runner` (a [`Runner`](src/parallel.rs): typically a
+pool of Workers it keeps), and the decoder runs its tiles and post-filter
+bands through it instead of starting scoped threads.
+
 Throughput (`examples/av1_decbench.rs`, best of three, on the machine this was
 written on — an AMD Ryzen 9 9950X), on 30-frame streams of camera
 footage from this crate's encoder at quantiser 100, one tile column or four:
