@@ -41,14 +41,27 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `wasi-test.sh [filter...]`, `wasi-run.mjs`: this crate's unit tests as a
   `wasm32-wasip1` test binary in Node, without and with `simd128`: the
   kernels a wasm build takes, held to their references in V8 (the `dsp::`
-  and `postfilter` tests by default; nothing that starts a thread runs
+  and `postfilter` tests by default; `dsp:: decoder::predict` for the
+  prediction kernels; nothing that starts a thread runs
   there).
+- `bench-turns.mjs`: `bench-node.mjs` with the builds taking turns (every
+  round decodes the clip once with each build), so that a change in the
+  machine's load during a measurement falls on all of them. The step tables
+  from step 8 on are from this.
 - `steprow.py <title> <label> [<previous label>]`, `final-table.py <before>
   <after>`: the rows of the step tables and the fourteen-stream table of
   the loop filter's section, rav1d beside the builds in the same run.
 - `lf-timing.diff`: a clock around the loop filter, for the same figure
   natively. Apply it to the tree, build `decode_ivf`, revert it, and run
   with `AV1_LF_TIME=1`: the last `LFTIME` line is the total.
+- `prof-inter.sh <label> <variant> <clip>`: V8's profile again, as the
+  time under `predict_inter` (it and everything it calls) in ms per
+  decoded frame; `cmp-inter.sh <variant> <clip> <rounds> <label>...` runs
+  it for several builds in turn and gives the medians.
+- `native-inter.diff`: the measuring patch behind the native figure for
+  the same thing, a timer around `predict_inter` that reports at exit, less
+  what the timer costs (apply, build `decode_ivf`, read `net_ms` on
+  stderr, and take the patch off again; it is not for the branch).
 - `gate.sh <label>`: this crate's gates (fmt, clippy on the host, wasm32
   with and without simd128, and x86-64 with a locally built std under
   Rosetta; doc; the tests), wasm-av1's tests on the tree, bit-exactness of
@@ -60,3 +73,8 @@ to gain nothing, so that nobody measures them again without a reason:
 `direct-to-frame.diff` filters a single-reference prediction straight into
 the frame (within 1 % on every stream; they predict mostly from two
 references).
+`copy-samples.diff` (against step 12) copies a whole-sample single
+prediction with SIMD128 loads and stores instead of the `memory.copy` that
+`copy_from_slice` compiles to (inter prediction 0.93 and 0.95 ms a frame
+with and without: that time is the reference's and the frame's memory, not
+the call).

@@ -266,6 +266,221 @@ Done completely, those would bring the frame to roughly 7.5 to 8 ms: about
 dav1d-shaped (the mode info walk, motion vector prediction, the frame
 buffers), which is not a list of kernels.
 
+## Inter prediction, from the specification's processes
+
+The steps of this section and of "The loop filter" below were made side by
+side on separate branches from `829b1e1`, so both number their steps from 8
+and each section's "before" is that commit, without the other's work.
+
+`090bf70` (after step 7, and not a row above) keeps both predictions of an
+averaging compound block in 16 bits. The steps below go on from `829b1e1`
+and are inter prediction alone (7.11.3): its filters, how a block's rows
+reach them, the blends, the warp. They were written from the
+specification's block inter prediction process and this crate's scalar
+code for it, and every kernel is held to that arithmetic by a unit test on
+random blocks: run natively for the NEON and scalar versions, and for the
+SIMD128 ones with the crate's tests built for `wasm32-wasip1` with
+`simd128` and run in Node's WASI (`cargo test` cannot run
+`wasm32-unknown-unknown`).
+
+Besides fps, each step says what inter prediction costs on mandelbrot
+720p, in milliseconds a decoded frame. In wasm that is V8's profile: the
+time under `predict_inter`, it and everything it calls. Natively it is a
+timer around `predict_inter` (a measuring patch, not on the branch), less
+what the timer itself costs. The builds compared take turns and the
+figure is the median of the turns; other builds were running on the
+machine (load average 8 to 19), so the fps columns move by a few percent
+from one table to the next. The native column has its ratio to rav1d too.
+
+| step | clip | baseline | simd | native |
+|---|---|---|---|---|
+| 8. the horizontal filter a block at a time; 8-bit sums in 16-bit lanes | fixture 320x180 | 746 (0.63x) | 1078 (0.62x) | 1234 (0.81x) |
+|  | testsrc2 720p | 126 (0.69x) | 194 (0.62x) | 211 (0.91x) |
+|  | mandelbrot 720p | 50.6 (0.78x) | 102 (0.70x) | 116 (1.38x) |
+|  | mandelbrot 720p 10-bit | 62.5 (0.83x) | 136 (1.66x) | 162 (1.60x) |
+|  | mandelbrot 1080p | 25.0 (0.77x) | 54.5 (0.72x) | 64.9 (1.53x) |
+| 9. the vertical filter a block at a time, in column strips | fixture 320x180 | 731 (0.64x) | 1061 (0.63x) | 1248 (0.83x) |
+|  | testsrc2 720p | 122 (0.71x) | 188 (0.65x) | 218 (0.94x) |
+|  | mandelbrot 720p | 50.4 (0.79x) | 101 (0.71x) | 122 (1.46x) |
+|  | mandelbrot 720p 10-bit | 63.8 (0.85x) | 138 (1.70x) | 161 (1.66x) |
+|  | mandelbrot 1080p | 25.3 (0.79x) | 54.9 (0.74x) | 65.9 (1.60x) |
+| 10. two whole-sample references averaged from windows of them | fixture 320x180 | 762 (0.64x) | 1104 (0.64x) | 1306 (0.86x) |
+|  | testsrc2 720p | 129 (0.72x) | 198 (0.64x) | 226 (0.96x) |
+|  | mandelbrot 720p | 51.2 (0.80x) | 102 (0.72x) | 131 (1.51x) |
+|  | mandelbrot 720p 10-bit | 64.7 (0.86x) | 145 (1.77x) | 176 (1.73x) |
+|  | mandelbrot 1080p | 25.9 (0.80x) | 56.6 (0.75x) | 68.9 (1.66x) |
+| 11. the block warp reads a window of the reference | fixture 320x180 | 747 (0.64x) | 1082 (0.64x) | 1288 (0.86x) |
+|  | testsrc2 720p | 126 (0.72x) | 191 (0.64x) | 215 (0.94x) |
+|  | mandelbrot 720p | 51.7 (0.80x) | 104 (0.72x) | 123 (1.50x) |
+|  | mandelbrot 720p 10-bit | 63.8 (0.86x) | 139 (1.72x) | 164 (1.70x) |
+|  | mandelbrot 1080p | 24.8 (0.79x) | 54.8 (0.74x) | 66.3 (1.62x) |
+| 12. the averages take a block | fixture 320x180 | 754 (0.65x) | 1093 (0.65x) | 1289 (0.84x) |
+|  | testsrc2 720p | 127 (0.73x) | 195 (0.65x) | 224 (0.96x) |
+|  | mandelbrot 720p | 52.1 (0.80x) | 106 (0.73x) | 128 (1.53x) |
+|  | mandelbrot 720p 10-bit | 64.1 (0.86x) | 142 (1.74x) | 170 (1.74x) |
+|  | mandelbrot 1080p | 25.8 (0.80x) | 56.7 (0.76x) | 68.1 (1.66x) |
+| 13. a block's taps looked up, its buffers borrowed once | fixture 320x180 | 753 (0.65x) | 1090 (0.64x) | 1328 (0.86x) |
+|  | testsrc2 720p | 127 (0.72x) | 194 (0.65x) | 222 (0.96x) |
+|  | mandelbrot 720p | 52.6 (0.81x) | 106 (0.72x) | 127 (1.53x) |
+|  | mandelbrot 720p 10-bit | 64.1 (0.87x) | 141 (1.74x) | 173 (1.77x) |
+|  | mandelbrot 1080p | 25.8 (0.80x) | 57.0 (0.75x) | 68.7 (1.67x) |
+| 14. a warp output as one 16-bit dot product | fixture 320x180 | 754 (0.65x) | 1101 (0.66x) | 1308 (0.87x) |
+|  | testsrc2 720p | 126 (0.73x) | 191 (0.65x) | 226 (0.97x) |
+|  | mandelbrot 720p | 52.0 (0.81x) | 106 (0.74x) | 127 (1.52x) |
+|  | mandelbrot 720p 10-bit | 63.3 (0.86x) | 143 (1.79x) | 171 (1.76x) |
+|  | mandelbrot 1080p | 25.7 (0.81x) | 56.5 (0.75x) | 67.6 (1.66x) |
+| 15. the scalar filter and mean, four samples to a 64-bit word | fixture 320x180 | 799 (0.65x) | 1158 (0.65x) | 1302 (0.86x) |
+|  | testsrc2 720p | 132 (0.75x) | 196 (0.63x) | 225 (0.96x) |
+|  | mandelbrot 720p | 53.6 (0.83x) | 105 (0.74x) | 126 (1.51x) |
+|  | mandelbrot 720p 10-bit | 64.9 (0.87x) | 143 (1.76x) | 172 (1.76x) |
+|  | mandelbrot 1080p | 26.5 (0.83x) | 56.9 (0.76x) | 68.2 (1.66x) |
+
+### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
+
+The horizontal filter was called a row at a time, each row fetched through `source_row` (a clamp of the row number, a test for the block's columns lying inside the reference, a slice), and it multiplied by all eight taps in 32-bit lanes: pairs of taps as 16-bit dot products over interleaved samples, with a test per pair for both taps being zero. Now a block's filter is one call. `source_window` gives the samples under the taps as a slice of the reference and its stride, or, for a block that reaches past the reference's edges, a copy with the edges repeated; the kernel runs over the block's rows. It multiplies by the taps that are not zero (`Taps`: six for the regular and smooth filters, four for the filters of blocks 4 wide, two for the bilinear one), which also narrows what has to lie inside the reference.
+
+For a frame of 8 bits the sum itself fits 16 bits. A filter's taps sum to 128, at most 184 of it positive and 56 negative (tested over the table), so over samples of 0..255 the sum lies in -14280..46920, and with 16384 added it is an unsigned 16-bit value. The 8-bit kernel is then one 16-bit multiply and one add per tap for eight outputs (`i16x8_mul` in SIMD128, `vmlaq_n_u16` in NEON), a logical shift, and the 16384 taken off again. For 10 and 12 bits the SIMD128 kernel takes the taps two by two as dot products straight from the row (a 32-bit lane of the row is two neighbouring samples, so the row from column `c` gives the even outputs' sums and the row from `c + 1` the odd ones': no interleaving), and the NEON one is widening multiply-accumulates.
+
+The kernels were timed against each other in V8 on blocks of 8x8 to 64x64 before being wired in: the kernel that was there 0.63 to 0.82 ns a sample, dot products from the row 0.32 to 0.34, the 16-bit sums 0.12 to 0.18. Inter prediction on mandelbrot 720p: simd 1.99 to 1.47 ms a frame, baseline 4.39 to 4.12, native 1.73 to 1.62 (the vertical filter is the larger part there, and it is the next step). Two native rows of the table's run read flat and down (the fixture and 10-bit mandelbrot); measured again over 15 turns they are 1252 to 1265 and 154.5 to 157.1 fps.
+
+### 9. The vertical filter a block at a time, in column strips
+
+The vertical filter was also a call per row. For each row of the block the SIMD128 version loaded the eight rows of intermediates under the taps and interleaved them pair by pair for its dot products: eight loads and eight shuffles for work that the next row but one mostly repeats (row `r` takes the pairs of rows `r + 2k` and `r + 2k + 1`, and row `r + 2` takes all but one of the same pairs). Natively it was scalar. Now it takes a block, eight columns at a time down the block (four for a block under eight wide). The SIMD128 version keeps the interleaved pairs in two sets, for the even rows and the odd ones, so that a row of the block costs one load, one interleave and a dot product per pair of taps: three pairs for the regular and smooth filters, whose first and last taps are zero. The NEON version keeps the rows under the taps in registers and multiplies by widening multiply-accumulates. The horizontal pass before it computes only the rows under the taps that are not zero (`h + 5` rows for those filters, not `h + 7`). In V8 on the same blocks: 0.92 to 1.13 ns a sample before, 0.28 to 0.33 after (widening multiplies on rows kept in registers, with no interleaving, measured 0.30 to 0.36).
+
+Two things came with it. A block with a vertical phase and no horizontal one used to copy the reference's samples, shifted up, into the intermediate array and filter that. The intermediate is the sample shifted up by `7 - InterRound0`, so the vertical filter now runs on the reference's samples themselves with that much less of a shift (at 8 bits it is the horizontal filter's 16-bit sum, its taps a stride apart). And a single prediction comes out of the same function as a compound one, in 16 bits, which it fits (`Round2` by 11, or 9 at 12 bits, where a compound prediction is rounded by 7), and is widened for the general path's 32-bit blends.
+
+Inter prediction on mandelbrot 720p: simd 1.47 to 1.23 ms a frame, baseline 4.12 to 3.49, native 1.62 to 1.05.
+
+### 10. Two whole-sample references averaged from windows of them
+
+Two thirds of the samples that mandelbrot 720p predicts from two references have whole-sample motion vectors into both, and are the rounded mean of the two blocks (`090bf70`). Those blocks still fetched every row of both references through `source_row`, with its clamp and its test for the columns. They take their two windows once (`source_window`, as the filters do), and `source_row` is gone. Inter prediction on mandelbrot 720p: simd 1.23 to 1.18 ms a frame, native 1.05 to 0.95; baseline within noise (3.55 to 3.51).
+
+### 11. The block warp reads a window of the reference
+
+The block warp process (7.11.3.5) read every sample under every tap of its horizontal filters through a clamp of both coordinates and a bounds-checked `get`: 960 of them for an 8x8 block. It takes the 15 rows of 15 samples it reads as a window, once (`source_window`, on every architecture: the reference itself unless the window reaches past an edge), and its filters run over slices of that. Inter prediction on mandelbrot 720p, where 1 % of the predicted samples are warped: simd 1.13 to 1.10 ms a frame, baseline 3.52 to 3.46, native 0.99 to 0.92.
+
+### 12. The averages take a block
+
+The two averages (of two whole-sample references, and of a compound block's two 16-bit predictions) were called a row at a time, each call slicing its three rows and testing the width again. They take the block, with the row loop inside the kernel. Inter prediction on mandelbrot 720p: native 0.92 to 0.86 ms a frame, simd 1.08 to 0.96 over nine turns (1.02 to 1.00 over five before that: within what V8's profile resolves on this machine), baseline within noise. A SIMD128 copy for whole-sample single predictions, in place of the `memory.copy` that `copy_from_slice` compiles to, was written with it and measured to gain nothing (0.93 and 0.95 ms): that time is the reference's and the frame's memory, not the call. It is in `tools/wasm-perf/tried/`.
+
+### 13. A block's taps looked up, its buffers borrowed once
+
+Two costs a block paid before any sample. Its two filters' kept taps were found by scanning the eight taps of each (`Taps::new`, 2 to 4 % of the prediction's time in V8's profile): they come from a table built with the crate (`Taps::of`). And the per-thread buffers (the intermediate array, the 16-bit predictions, the copy of a reference's edge) were three thread-locals, each taken out of its cell and put back around every use: five pairs of those for a compound block, one for every 8x8 of a warped block. They are one structure, borrowed once for a block and handed down. Inter prediction on mandelbrot 720p natively, nine turns: 0.87 to 0.83 ms a frame (0.85 with the table alone). In wasm, where a thread-local is a static, V8's profile does not resolve it (0.94 and 0.97 over seven turns, within its noise here).
+
+### 14. A warp output as one 16-bit dot product
+
+Each output of the warp's two passes has its own filter, so there is no row of outputs to share a tap between; what an output is, though, is eight 16-bit values times eight taps. `dot8` is that as one 16-bit dot product (`i32x4_dot_i16x8` and two adds across the lanes in SIMD128; `vmull_s16`, `vmlal_high_s16` and `vaddvq_s32` in NEON), over `Warped_Filters` narrowed to 16 bits when the crate is built. The intermediates fit 16 bits (tested over the table) and are kept a column at a time, since the vertical pass reads down a column. Inter prediction on mandelbrot 720p: native 0.83 to 0.79 ms a frame over nine turns, simd 0.97 to 0.89 over seven. The scalar version is what x86-64 takes.
+
+### 15. The scalar 8-bit filter and mean, four samples to a 64-bit word
+
+The baseline wasm build (no SIMD) and any target without a SIMD version take the scalar kernels, and LLVM has nothing to vectorise them with there. Two of them now work four samples at a time in a 64-bit word. Four neighbouring samples of a plane are the four 16-bit lanes of the word at their address (the compiler turns the four loads and shifts into one 64-bit load: checked in the wasm it emits), and a tap times that word is the tap times each sample as long as no lane carries into the next. For 8-bit samples that is the arithmetic of step 8 again: the positive taps are summed in one word with the lift (under 65536 a lane), the negative ones in another (at most 14280 a lane, less than the lift, so subtracting it borrows nothing), then one shift, one mask and the lift taken off with each lane's top bit set against a borrow. And the rounded mean of two whole-sample references is `(a | b) - ((a ^ b) >> 1)` in each lane. Inter prediction on mandelbrot 720p in the baseline build: 3.42 to 2.63 ms a frame (3.02 with the filter alone, 2.85 with one bounds test for the samples under all its taps, 2.63 with the mean). The simd and native builds take these only for blocks under eight wide, and do not move.
+
+## Where inter prediction stands after step 15 (`eb42f3c`)
+
+The fourteen streams again, median of 7, the three builds taking turns on
+each stream, load average 4 to 6. `before` is `829b1e1`; the ratio is to
+rav1d.
+
+| stream | native: rav1d | before | now | wasm baseline: rav1d | before | now | wasm simd: rav1d | before | now |
+|---|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1578 | 1305 | 1369 (0.87x) | 1217 | 766 | 794 (0.65x) | 1771 | 1102 | 1154 (0.65x) |
+| fixture 160x90, 10-bit | 3598 | 3279 | 3430 (0.95x) | 2895 | 2099 | 2151 (0.74x) | 2891 | 2844 | 2990 (1.03x) |
+| fixture 128x72, film grain | 2947 | 2378 | 2448 (0.83x) | 2388 | 1626 | 1648 (0.69x) | 3349 | 2087 | 2133 (0.64x) |
+| fixture 177x99, 8-bit | 2360 | 2675 | 2811 (1.19x) | 1927 | 1429 | 1461 (0.76x) | 3254 | 2287 | 2388 (0.73x) |
+| fixture 96x64, 4:4:4 | 4342 | 3936 | 4210 (0.97x) | 3495 | 2400 | 2457 (0.70x) | 5222 | 3594 | 3747 (0.72x) |
+| fixture 96x64, mono | 10814 | 8807 | 9185 (0.85x) | 9355 | 6505 | 6668 (0.71x) | 12732 | 8471 | 8840 (0.69x) |
+| AOM b8-05-mv 352x288 | 208 | 241 | 277 (1.33x) | 160 | 143 | 153 (0.96x) | 258 | 202 | 230 (0.89x) |
+| AOM b10-00-quantizer-10, 10-bit | 90.9 | 97.2 | 105 (1.15x) | 73.3 | 61.1 | 63.0 (0.86x) | 75.6 | 82.3 | 88.9 (1.18x) |
+| AOM b8-23-film_grain-50 | 428 | 396 | 420 (0.98x) | 354 | 225 | 229 (0.65x) | 514 | 349 | 366 (0.71x) |
+| AOM b8-00-quantizer-20 | 244 | 255 | 270 (1.11x) | 194 | 154 | 158 (0.81x) | 278 | 222 | 235 (0.85x) |
+| SVT testsrc2 720p | 245 | 222 | 242 (0.99x) | 182 | 124 | 136 (0.75x) | 311 | 189 | 202 (0.65x) |
+| SVT mandelbrot 720p | 85.3 | 115 | 131 (1.54x) | 65.1 | 49.8 | 54.3 (0.83x) | 146 | 96.2 | 108 (0.74x) |
+| SVT mandelbrot 720p, 10-bit | 98.4 | 152 | 173 (1.76x) | 77.5 | 63.6 | 67.2 (0.87x) | 84.5 | 135 | 151 (1.79x) |
+| SVT mandelbrot 1080p | 42.2 | 62.5 | 69.4 (1.64x) | 33.8 | 26.0 | 27.9 (0.83x) | 80.3 | 55.3 | 60.9 (0.76x) |
+
+Every row is up in all three builds, and every stream decodes to the same
+MD5 in every build. What the steps were about, inter prediction on
+mandelbrot 720p in milliseconds a decoded frame, `829b1e1` against step 15
+with the two builds taking turns (nine turns; seven for baseline):
+
+| build | before | now |
+|---|---|---|
+| wasm simd | 1.77 | 0.79 |
+| wasm baseline | 4.38 | 2.56 |
+| native aarch64 | 1.66 | 0.70 |
+
+rav1d's was 1.2 ms in the simd build's profile above. On a machine this
+loaded the wasm figure moved between 0.79 and 0.85 from one run of nine
+turns to the next (`829b1e1` between 1.77 and 1.99).
+
+What is left of it in the simd build, from V8's profile with each block
+kernel kept out of line (taken at step 12, total 1.0 ms; steps 13 and 14
+have since taken about 0.1 off the warp and the per-block part): the
+8-bit sums of the horizontal filter and of a vertical filter alone 0.24 ms
+a frame, the vertical filter over intermediates 0.17 to 0.19, the mean of
+two whole-sample references 0.11, the copy of one 0.10, the warp 0.11,
+and 0.25 for everything a block does before and between its kernels. By
+that clip's block counts the horizontal filter costs about 0.3 ns a
+sample there, against 0.12 to 0.14 alone on blocks that sit in the cache.
+The likely reason is memory: a block's rows are some twenty separate
+lines of a reference that was written a frame ago. The mean and the copy
+do nothing but move such rows, and a SIMD128 copy in place of
+`memory.copy` changed nothing (`tools/wasm-perf/tried/`). Samples are 16
+bits whatever the depth here; a plane of bytes for 8-bit frames would
+halve that traffic, and is a change to every stage, not to prediction.
+
+Still on the general path, in 32 bits and scalar: the distance-weighted,
+wedge and difference-weighted compounds, inter-intra, overlapped
+prediction's blend, and prediction from a scaled reference. None of the
+benchmark streams spends time there. x86-64 is as it was but for the warp
+(steps 11 and 14, which are not specific to a target): its other paths
+keep the 32-bit AVX2 filters, which could not be measured here.
+
+### What came from knowing how decoders are built
+
+No other implementation's source was read for these steps, and the two
+earlier attempts at them (the branches `perf-loopfilter` and
+`perf-compound`) were not looked at. Some of the ideas are nevertheless
+common knowledge about how AV1 decoders are built rather than things the
+specification suggests, and were used by deriving them from this crate's
+arithmetic and testing them against it: filtering a block from one window
+of the reference, with a copy that repeats the edges when the block
+reaches past them; multiplying only by the taps that are not zero (the
+regular and smooth filters as six taps, the narrow-block ones as four);
+doing an 8-bit filter in 16-bit lanes; separate paths for the horizontal
+filter alone, the vertical one alone (on the reference's samples) and
+both; a vertical filter that goes down a strip of columns keeping its
+rows (or interleaved pairs of rows) from one output row to the next; the
+warp's outputs as 16-bit dot products over a 16-bit filter table. The
+four-samples-to-a-word scalar kernels, the dot products taken straight
+from the row for even and odd outputs, the taps table and the single
+borrow of the buffers are ordinary programming, not decoder lore.
+
+### What these steps were held to
+
+The list of the first round for every one of them (`tools/wasm-perf/gate.sh`:
+fmt; clippy for the host, wasm32 with and without `simd128`, and x86-64;
+doc; `cargo test --release`, which with the vectors in `tests/vectors/`
+decodes all 244 AOM vectors, natively and for x86-64 under Rosetta; the
+committed vectors and the runner test on 4 threads; the fuzz and encoder
+tests; wasm-av1's tests on the tree; the 15 streams through both wasm
+builds against rav1d and libdav1d; the clips natively on 1 and 4 threads).
+At the end: the 244 vectors natively on 1 and 4 threads (244 of 244, with
+`AV1_REQUIRE_VECTORS=1`), and the 242 that are IVF through both wasm builds
+against rav1d (242 of 242 agree).
+
+Each kernel has a unit test against the specification's arithmetic on
+random blocks with the extreme values among them (`dsp::mc`), run natively
+and, for SIMD128, as a `wasm32-wasip1` module in Node (`wasi-test.sh`);
+bugs were planted in each kernel, 21 in all, to see the tests fail. One
+did not fail them and was not a bug: a mask one bit too wide in the scalar
+word filter, harmless because every tap of `Subpel_Filters` is even. And
+the whole unscaled prediction (the windows, the edges, the zero phases,
+the shifts of each depth) is held to the general process, the one the
+specification writes, on random references of 8, 10 and 12 bits with
+blocks inside, across and beyond every edge (`decoder::predict`); four
+planted bugs in the window and the shifts fail it.
+
 `tools/wasm-perf/` has the scripts every number here came from.
 
 ## The loop filter

@@ -404,8 +404,9 @@ for the MD5s of the benchmark clips in `tools/wasm-perf`. Their source was
 not read for it. Some of its optimisations are techniques commonly known
 from other AV1 decoders (16-bit prediction intermediates, a DC-only
 transform shortcut, a per-frame table of loop filter levels, loop filter
-kernels per filter length that work on 16-bit lanes where the samples lie);
-each was
+kernels per filter length that work on 16-bit lanes where the samples lie,
+subpixel filters that take a block from one window of the reference and
+multiply only by a filter's non-zero taps); each was
 written from this crate's own specification-derived code and held to it
 bit for bit, and what that document says about rav1d's internals comes from
 profiles and general knowledge, not from its code. The

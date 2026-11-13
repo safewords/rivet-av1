@@ -637,23 +637,26 @@ impl TileDecoder<'_, '_> {
                 } else {
                     self.f.hdr.gm_params[ref_frame as usize]
                 };
-                for i8 in 0..=((h - 1) >> 3) {
-                    for j8 in 0..=((w - 1) >> 3) {
-                        self.block_warp(
-                            &params,
-                            plane,
-                            ref_idx,
-                            x,
-                            y,
-                            i8,
-                            j8,
-                            w,
-                            h,
-                            &mut preds[ref_list],
-                            rv,
-                        );
+                BUFFERS.with_borrow_mut(|buffers| {
+                    for i8 in 0..=((h - 1) >> 3) {
+                        for j8 in 0..=((w - 1) >> 3) {
+                            self.block_warp(
+                                &params,
+                                plane,
+                                ref_idx,
+                                x,
+                                y,
+                                i8,
+                                j8,
+                                w,
+                                h,
+                                &mut preds[ref_list],
+                                rv,
+                                &mut buffers.edges[0],
+                            );
+                        }
                     }
-                }
+                });
             } else if self.b.use_intrabc {
                 let (fw, fh, uw) = (
                     self.f.hdr.frame_width as i32,
@@ -908,53 +911,68 @@ impl TileDecoder<'_, '_> {
         let whole = |&(_, _, _, sx, sy): &(usize, i32, i32, i64, i64)| {
             (sx >> 6) & SUBPEL_MASK as i64 == 0 && ((sy & 1023) >> 6) & SUBPEL_MASK as i64 == 0
         };
-        if whole(&from[0]) && whole(&from[1]) {
-            // Both predictions are their references' samples, scaled: the
-            // block is the rounded mean of the two.
-            let mut padded = [[0u16; 128 + 8]; 2];
-            let [pad0, pad1] = &mut padded;
-            let rows = |&(ref_idx, last_x, last_y, sx, sy): &(usize, i32, i32, i64, i64)| {
-                let x0 = (sx >> 10) - 3;
-                let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
-                (plane_of(ref_idx), sy >> 10, x0, inside_x, last_x, last_y)
-            };
-            let (a, b) = (rows(&from[0]), rows(&from[1]));
-            for i in 0..h {
-                let ra = source_row(a.0, a.1 + i as i64, a.2, w, a.3, a.4, a.5, pad0);
-                let rb = source_row(b.0, b.1 + i as i64, b.2, w, b.3, b.4, b.5, pad1);
-                let dst = &mut cur.data[(y + i) * stride + x..][..w];
-                mc::avg_samples(&ra[3..3 + w], &rb[3..3 + w], dst);
+        let whole = whole(&from[0]) && whole(&from[1]);
+        BUFFERS.with_borrow_mut(|buffers| {
+            let Buffers {
+                edges,
+                intermediate,
+                preds,
+            } = buffers;
+            if whole {
+                // Both predictions are their references' samples, scaled:
+                // the block is the rounded mean of the two.
+                let [edge0, edge1] = edges;
+                let (ref0, last_x0, last_y0, sx0, sy0) = from[0];
+                let (ref1, last_x1, last_y1, sx1, sy1) = from[1];
+                let (a, a_stride) = source_window(
+                    plane_of(ref0),
+                    sx0 >> 10,
+                    sy0 >> 10,
+                    w,
+                    h,
+                    last_x0,
+                    last_y0,
+                    edge0,
+                );
+                let (b, b_stride) = source_window(
+                    plane_of(ref1),
+                    sx1 >> 10,
+                    sy1 >> 10,
+                    w,
+                    h,
+                    last_x1,
+                    last_y1,
+                    edge1,
+                );
+                let dst = &mut cur.data[y * stride + x..];
+                mc::avg_samples(a, a_stride, b, b_stride, w, h, dst, stride);
+                return;
             }
-            return true;
-        }
-        let c = mc::Compound::new(f.bit_depth, rv.post_round as u32);
-        let filters = filter_kinds(cand.interp_filter, w, h);
-        let mut preds = COMPOUND_PREDS.take();
-        for (pred, &(ref_idx, last_x, last_y, sx, sy)) in preds.iter_mut().zip(&from) {
-            if pred.len() < w * h {
-                pred.resize(w * h, 0);
+            let c = mc::Compound::new(f.bit_depth, rv.post_round as u32);
+            let filters = filter_kinds(cand.interp_filter, w, h);
+            for (pred, &(ref_idx, last_x, last_y, sx, sy)) in preds.iter_mut().zip(&from) {
+                if pred.len() < w * h {
+                    pred.resize(w * h, 0);
+                }
+                block_inter_prediction16(
+                    plane_of(ref_idx),
+                    last_x,
+                    last_y,
+                    sx,
+                    sy,
+                    w,
+                    h,
+                    filters,
+                    rv,
+                    c.bias,
+                    &mut pred[..w * h],
+                    &mut edges[0],
+                    intermediate,
+                );
             }
-            block_inter_prediction_compound(
-                plane_of(ref_idx),
-                last_x,
-                last_y,
-                sx,
-                sy,
-                w,
-                h,
-                filters,
-                rv,
-                c.bias,
-                &mut pred[..w * h],
-            );
-        }
-        let rows = preds[0][..w * h]
-            .chunks_exact(w)
-            .zip(preds[1][..w * h].chunks_exact(w));
-        for (i, (p0, p1)) in rows.enumerate() {
-            mc::compound_avg(p0, p1, c, &mut cur.data[(y + i) * stride + x..][..w]);
-        }
-        COMPOUND_PREDS.set(preds);
+            let dst = &mut cur.data[y * stride + x..];
+            mc::compound_avg(&preds[0], &preds[1], c, w, h, dst, stride);
+        });
         true
     }
 
@@ -1265,7 +1283,9 @@ impl TileDecoder<'_, '_> {
         h: usize,
         pred: &mut [i32],
         rv: RoundingVars,
+        edge: &mut Vec<u16>,
     ) {
+        use crate::dsp::mc;
         let r = self.f.refs[ref_idx]
             .as_ref()
             .expect("reference checked at header");
@@ -1285,19 +1305,32 @@ impl TileDecoder<'_, '_> {
         let sx4 = x4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
         let iy4 = y4 >> WARPEDMODEL_PREC_BITS;
         let sy4 = y4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
-        let mut intermediate = [[0i32; 8]; 15];
-        for i1 in -7i64..8 {
-            for i2 in -4i64..4 {
+        // The 15 rows and 15 columns the horizontal filters read, their
+        // coordinates clamped to the reference: from the reference itself
+        // unless they reach past its edges.
+        let (src, stride) = source_window(
+            refp,
+            ix4 - 7,
+            iy4 - 7,
+            15,
+            15,
+            last_x as i32,
+            last_y as i32,
+            edge,
+        );
+        // The intermediates, a column at a time (the vertical filter reads
+        // down a column) and in 16 bits, which they fit.
+        let mut columns = [[0i16; 16]; 8];
+        for r in 0..15 {
+            let row = &src[r * stride..][..15];
+            let i1 = r as i64 - 7;
+            for (c, column) in columns.iter_mut().enumerate() {
+                let i2 = c as i64 - 4;
                 let sx = sx4 + alpha as i64 * i2 + beta as i64 * i1;
                 let offs = (round2_64(sx, WARPEDDIFF_PREC_BITS as u32)
                     + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
-                let mut s = 0i32;
-                let yy = (iy4 + i1).clamp(0, last_y) as usize;
-                for i3 in 0..8 {
-                    let xx = (ix4 + i2 - 3 + i3).clamp(0, last_x) as usize;
-                    s += WARPED_FILTERS[offs][i3 as usize] * refp.get(xx, yy) as i32;
-                }
-                intermediate[(i1 + 7) as usize][(i2 + 4) as usize] = round2(s, rv.round0);
+                let s = mc::dot8(&row[c..], &mc::WARPED_FILTERS16[offs]);
+                column[r] = round2(s, rv.round0) as i16;
             }
         }
         let lim_i = 4.min(h as i64 - i8 as i64 * 8 - 4);
@@ -1307,11 +1340,8 @@ impl TileDecoder<'_, '_> {
                 let sy = sy4 + gamma as i64 * i2 + delta as i64 * i1;
                 let offs = (round2_64(sy, WARPEDDIFF_PREC_BITS as u32)
                     + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
-                let mut s = 0i32;
-                for i3 in 0..8 {
-                    s += WARPED_FILTERS[offs][i3]
-                        * intermediate[(i1 + i3 as i64 + 4) as usize][(i2 + 4) as usize];
-                }
+                let column = &columns[(i2 + 4) as usize];
+                let s = mc::dot8(&column[(i1 + 4) as usize..], &mc::WARPED_FILTERS16[offs]);
                 let py = (i8 as i64 * 8 + i1 + 4) as usize;
                 let px = (j8 as i64 * 8 + i2 + 4) as usize;
                 pred[py * w + px] = round2(s, rv.round1);
@@ -1326,6 +1356,9 @@ pub(crate) struct RoundingVars {
     pub(crate) round0: u32,
     pub(crate) round1: u32,
     pub(crate) post_round: i32,
+    /// `BitDepth`, which they were derived from.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub(crate) bit_depth: u32,
 }
 
 impl crate::decoder::FrameCtx {
@@ -1343,6 +1376,7 @@ impl crate::decoder::FrameCtx {
             round0,
             round1,
             post_round: 2 * FILTER_BITS - (round0 + round1) as i32,
+            bit_depth: self.bit_depth,
         }
     }
 
@@ -1480,40 +1514,45 @@ pub(crate) fn block_inter_prediction(
     })
 }
 
-/// `w + 7` samples of row `yy` of a reference from column `x0`, the row
-/// and the columns clamped to the reference (its edges repeated): the row
-/// itself when it holds them all, else gathered into `padded`.
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
+/// The samples of a reference at rows `y0..y0 + rows` and columns `x0..x0 +
+/// cols`, the rows and columns outside it clamped to it (its edges
+/// repeated), and the stride they have: the plane itself where it holds
+/// them all, else a copy gathered into `edge`.
 #[allow(clippy::too_many_arguments)]
-fn source_row<'a>(
+fn source_window<'a>(
     refp: &'a PlaneBuf,
-    yy: i64,
     x0: i64,
-    w: usize,
-    inside_x: bool,
+    y0: i64,
+    cols: usize,
+    rows: usize,
     last_x: i32,
     last_y: i32,
-    padded: &'a mut [u16; 128 + 8],
-) -> &'a [u16] {
-    let row = refp.row(clip3(0, last_y, yy as i32) as usize);
-    if inside_x {
-        &row[x0 as usize..x0 as usize + w + 7]
-    } else {
-        for (c, v) in padded[..w + 7].iter_mut().enumerate() {
-            *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
-        }
-        &padded[..w + 7]
+    edge: &'a mut Vec<u16>,
+) -> (&'a [u16], usize) {
+    let inside_x = x0 >= 0 && x0 + cols as i64 <= last_x as i64 + 1;
+    if inside_x && y0 >= 0 && y0 + rows as i64 <= last_y as i64 + 1 {
+        let at = y0 as usize * refp.stride + x0 as usize;
+        return (&refp.data[at..], refp.stride);
     }
+    if edge.len() < rows * cols {
+        edge.resize(rows * cols, 0);
+    }
+    for (r, out) in edge[..rows * cols].chunks_exact_mut(cols).enumerate() {
+        let row = refp.row((y0 + r as i64).clamp(0, last_y as i64) as usize);
+        if inside_x {
+            out.copy_from_slice(&row[x0 as usize..][..cols]);
+        } else {
+            for (c, v) in out.iter_mut().enumerate() {
+                *v = row[(x0 + c as i64).clamp(0, last_x as i64) as usize];
+            }
+        }
+    }
+    (&edge[..rows * cols], cols)
 }
 
-/// Block inter prediction from a reference of the frame's own size: the
-/// same arithmetic as the general process, with what a filter phase of
-/// zero makes of it taken directly. A phase of zero is the filter `128 *
-/// sample`, so its pass is a shift (`128 * s` is a multiple of `1 <<
-/// round0`, and the intermediate times 128 of `1 << round1`); and with a
-/// vertical phase of zero only the `h` rows that filter reads are computed,
-/// not the seven around them.
+/// Block inter prediction from a reference of the frame's own size, for
+/// the general path's 32-bit predictions: [`block_inter_prediction16`]'s,
+/// widened.
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn block_inter_prediction_unscaled(
@@ -1524,110 +1563,96 @@ fn block_inter_prediction_unscaled(
     y: i64,
     w: usize,
     h: usize,
-    [filt_y, filt_x]: [usize; 2],
+    filters: [usize; 2],
     rv: RoundingVars,
     pred: &mut [i32],
 ) {
-    let phase_x = ((x >> 6) & SUBPEL_MASK as i64) as usize;
-    let phase_y = (((y & 1023) >> 6) & SUBPEL_MASK as i64) as usize;
-    let fx = &SUBPEL_FILTERS[filt_x][phase_x];
-    let fy = &SUBPEL_FILTERS[filt_y][phase_y];
-    let x0 = (x >> 10) - 3;
-    let y0 = (y >> 10) - 3;
-    let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
-    let mut padded = [0u16; 128 + 8];
-    let (round0, round1) = (rv.round0, rv.round1);
-    if phase_y == 0 {
-        if phase_x == 0 {
-            let shift = 14 - round0 - round1;
-            for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-                let src = source_row(
-                    refp,
-                    y0 + r as i64 + 3,
-                    x0,
-                    w,
-                    inside_x,
-                    last_x,
-                    last_y,
-                    &mut padded,
-                );
-                for (o, &s) in out.iter_mut().zip(&src[3..]) {
-                    *o = (s as i32) << shift;
-                }
-            }
-        } else {
-            let add = (1 << round1) >> 1;
-            let mut line = [0i16; 128];
-            for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-                let src = source_row(
-                    refp,
-                    y0 + r as i64 + 3,
-                    x0,
-                    w,
-                    inside_x,
-                    last_x,
-                    last_y,
-                    &mut padded,
-                );
-                crate::dsp::mc::filter_row16(src, fx, round0, 0, &mut line[..w]);
-                for (o, &v) in out.iter_mut().zip(&line[..w]) {
-                    *o = (128 * v as i32 + add) >> round1;
-                }
-            }
+    BUFFERS.with_borrow_mut(|buffers| {
+        let Buffers {
+            edges,
+            intermediate,
+            preds,
+        } = buffers;
+        let pred16 = &mut preds[0];
+        if pred16.len() < w * h {
+            pred16.resize(w * h, 0);
         }
-        return;
-    }
-    let inter_h = h + 7;
-    let mut buf = INTERMEDIATE.take();
-    if buf.len() < inter_h * w {
-        buf.resize(inter_h * w, 0);
-    }
-    let intermediate = &mut buf[..inter_h * w];
-    for (r, out) in intermediate.chunks_exact_mut(w).enumerate() {
-        let src = source_row(
+        block_inter_prediction16(
             refp,
-            y0 + r as i64,
-            x0,
-            w,
-            inside_x,
             last_x,
             last_y,
-            &mut padded,
+            x,
+            y,
+            w,
+            h,
+            filters,
+            rv,
+            0,
+            &mut pred16[..w * h],
+            &mut edges[0],
+            intermediate,
         );
-        if phase_x == 0 {
-            let shift = 7 - round0;
-            for (o, &s) in out.iter_mut().zip(&src[3..]) {
-                *o = (s << shift) as i16;
-            }
-        } else {
-            crate::dsp::mc::filter_row16(src, fx, round0, 0, out);
+        for (o, &v) in pred[..w * h].iter_mut().zip(&pred16[..w * h]) {
+            *o = v as i32;
         }
-    }
-    for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-        crate::dsp::mc::filter_col16(&intermediate[r * w..], w, fy, round1, out);
-    }
-    INTERMEDIATE.set(buf);
+    });
 }
 
-// Per-thread buffers, reused from block to block (they only grow, and
-// every use writes what it reads): the intermediate array of an unscaled
-// prediction, and a compound block's two predictions.
-#[cfg(not(target_arch = "x86_64"))]
+/// A thread's buffers for inter prediction, reused from block to block
+/// (they only grow, and every use writes what it reads). One borrow of
+/// them serves a block, however many of them it uses.
+struct Buffers {
+    /// The samples of a block's references where it reaches past their
+    /// edges.
+    edges: [Vec<u16>; 2],
+    /// The intermediate array of an unscaled prediction.
+    #[cfg(not(target_arch = "x86_64"))]
+    intermediate: Vec<i16>,
+    /// A block's predictions in 16 bits.
+    #[cfg(not(target_arch = "x86_64"))]
+    preds: [Vec<i16>; 2],
+}
+
 thread_local! {
-    static INTERMEDIATE: std::cell::RefCell<Vec<i16>> = const { std::cell::RefCell::new(Vec::new()) };
-    static COMPOUND_PREDS: std::cell::RefCell<[Vec<i16>; 2]> =
-        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+    static BUFFERS: std::cell::RefCell<Buffers> = const {
+        std::cell::RefCell::new(Buffers {
+            edges: [Vec::new(), Vec::new()],
+            #[cfg(not(target_arch = "x86_64"))]
+            intermediate: Vec::new(),
+            #[cfg(not(target_arch = "x86_64"))]
+            preds: [Vec::new(), Vec::new()],
+        })
+    };
 }
 
-/// One list of a compound block predicted from a reference of the frame's
-/// own size, in 16 bits: `block_inter_prediction_unscaled` with `bias`
-/// taken off every value (see [`Compound`](crate::dsp::mc::Compound)).
-/// `InterRound1` is 7 for a compound block at every bit depth, so a
-/// vertical phase of zero, `Round2(128 * v, 7)`, leaves the horizontal
-/// filter's output as it is.
+/// Block inter prediction (7.11.3.4) from a reference of the frame's own
+/// size, in 16 bits: the general process's values less `bias`, which is
+/// zero unless the block is a compound one (see
+/// [`Compound`](crate::dsp::mc::Compound); a single prediction,
+/// `Round2(.., InterRound1)` with `InterRound1` of 11 or 9, is a sample's
+/// worth and its overshoot).
+///
+/// The same arithmetic as the general process, with what a filter phase
+/// of zero makes of it taken directly. A phase of zero is the filter `128
+/// * sample`, so:
+///
+/// - with none in either direction the prediction is the sample shifted
+///   up by `14 - InterRound0 - InterRound1`;
+/// - with a horizontal one alone only the block's own rows are filtered,
+///   and the vertical pass is `Round2(128 * v, InterRound1)`: nothing for a
+///   compound block (`InterRound1` is 7), a rounding shift by `InterRound1
+///   - 7` otherwise;
+/// - with a vertical one alone the intermediates are the samples shifted
+///   up by `7 - InterRound0`, so the vertical filter runs over the
+///   reference's samples themselves with that much less of a shift.
+///
+/// A filter multiplies by the taps that are not zero
+/// ([`Taps`](crate::dsp::mc::Taps)) and reads the rows and columns under
+/// those alone, each pass a block at a time, from the reference itself
+/// unless the block reaches past its edges.
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
-fn block_inter_prediction_compound(
+fn block_inter_prediction16(
     refp: &PlaneBuf,
     last_x: i32,
     last_y: i32,
@@ -1639,71 +1664,65 @@ fn block_inter_prediction_compound(
     rv: RoundingVars,
     bias: i32,
     pred: &mut [i16],
+    edge: &mut Vec<u16>,
+    intermediate: &mut Vec<i16>,
 ) {
     use crate::dsp::mc;
     let phase_x = ((x >> 6) & SUBPEL_MASK as i64) as usize;
     let phase_y = (((y & 1023) >> 6) & SUBPEL_MASK as i64) as usize;
-    let fx = &SUBPEL_FILTERS[filt_x][phase_x];
-    let fy = &SUBPEL_FILTERS[filt_y][phase_y];
-    let x0 = (x >> 10) - 3;
-    let y0 = (y >> 10) - 3;
-    let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
-    let mut padded = [0u16; 128 + 8];
+    let fx = mc::Taps::of(filt_x, phase_x);
+    let fy = mc::Taps::of(filt_y, phase_y);
     let (round0, round1) = (rv.round0, rv.round1);
-    debug_assert_eq!(round1, 7);
-    if phase_y == 0 {
-        let shift = 14 - round0 - round1;
-        for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-            let src = source_row(
-                refp,
-                y0 + r as i64 + 3,
-                x0,
-                w,
-                inside_x,
-                last_x,
-                last_y,
-                &mut padded,
-            );
-            if phase_x == 0 {
-                for (o, &s) in out.iter_mut().zip(&src[3..]) {
+    debug_assert!(bias == 0 || round1 == 7);
+    let eight_bit = rv.bit_depth == 8;
+    let pred = &mut pred[..w * h];
+    // The block's own first column and row in the reference, and the
+    // columns and rows under the taps of each filter.
+    let (bx, by) = (x >> 10, y >> 10);
+    let (left, cols) = (bx - 3 + fx.first as i64, w + fx.len - 1);
+    let (top, rows) = (by - 3 + fy.first as i64, h + fy.len - 1);
+    match (phase_x != 0, phase_y != 0) {
+        (false, false) => {
+            let (src, stride) = source_window(refp, bx, by, w, h, last_x, last_y, edge);
+            let shift = 14 - round0 - round1;
+            for (r, out) in pred.chunks_exact_mut(w).enumerate() {
+                for (o, &s) in out.iter_mut().zip(&src[r * stride..][..w]) {
                     *o = (((s as i32) << shift) - bias) as i16;
                 }
+            }
+        }
+        (true, false) => {
+            let (src, stride) = source_window(refp, left, by, cols, h, last_x, last_y, edge);
+            mc::filter_rows16(src, stride, w, h, fx, round0, bias, eight_bit, pred);
+            let down = round1 - 7;
+            if down != 0 {
+                let add = (1 << down) >> 1;
+                for v in pred.iter_mut() {
+                    *v = (*v + add) >> down;
+                }
+            }
+        }
+        (false, true) => {
+            let (src, stride) = source_window(refp, bx, top, w, rows, last_x, last_y, edge);
+            let shift = round1 - (7 - round0);
+            if eight_bit && bias == 0 {
+                mc::taps8(src, stride, stride, w, h, fy.taps(), shift, pred);
             } else {
-                mc::filter_row16(src, fx, round0, bias, out);
+                let add = ((1 << shift) >> 1) - (bias << shift);
+                mc::filter_cols16(src, stride, w, h, fy.taps(), add, shift, pred);
             }
         }
-        return;
-    }
-    let inter_h = h + 7;
-    let mut buf = INTERMEDIATE.take();
-    if buf.len() < inter_h * w {
-        buf.resize(inter_h * w, 0);
-    }
-    let intermediate = &mut buf[..inter_h * w];
-    for (r, out) in intermediate.chunks_exact_mut(w).enumerate() {
-        let src = source_row(
-            refp,
-            y0 + r as i64,
-            x0,
-            w,
-            inside_x,
-            last_x,
-            last_y,
-            &mut padded,
-        );
-        if phase_x == 0 {
-            let shift = 7 - round0;
-            for (o, &s) in out.iter_mut().zip(&src[3..]) {
-                *o = (s << shift) as i16;
+        (true, true) => {
+            let (src, stride) = source_window(refp, left, top, cols, rows, last_x, last_y, edge);
+            if intermediate.len() < rows * w {
+                intermediate.resize(rows * w, 0);
             }
-        } else {
-            mc::filter_row16(src, fx, round0, 0, out);
+            let intermediate = &mut intermediate[..rows * w];
+            mc::filter_rows16(src, stride, w, rows, fx, round0, 0, eight_bit, intermediate);
+            let add = ((1 << round1) >> 1) - (bias << round1);
+            mc::filter_cols16(intermediate, w, w, h, fy.taps(), add, round1, pred);
         }
     }
-    for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-        mc::filter_col16_compound(&intermediate[r * w..], w, fy, round1, bias, out);
-    }
-    INTERMEDIATE.set(buf);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2048,4 +2067,129 @@ fn wedge_masks() -> &'static WedgeMasks {
 /// `WedgeMasks[ bsize ][ sign ][ index ]`, row-major `Block_Width` wide.
 pub(crate) fn wedge_mask(bsize: usize, sign: usize, index: usize) -> &'static [u8] {
     &wedge_masks().masks[(bsize * 2 + sign) * 16 + index]
+}
+
+#[cfg(all(test, not(target_arch = "x86_64")))]
+mod tests {
+    use super::*;
+
+    /// The prediction from an unscaled reference, whole, against the
+    /// general process as the specification writes it (32-bit
+    /// intermediates, all eight taps, every coordinate clamped): references
+    /// of 8, 10 and 12 bits whose planes are larger than the frame, blocks
+    /// of every size inside it, across each edge and wholly outside, every
+    /// filter and phase with the zero phases as often as not, as a single
+    /// prediction and as a compound one less its bias.
+    #[test]
+    fn unscaled_prediction_matches_the_general_process() {
+        let mut seed = 0x510e_527f_ade6_82d1u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (last_x, last_y) = (69i32, 57i32);
+        for bit_depth in [8u32, 10, 12] {
+            // The samples past the frame's last column and row are not the
+            // frame's: over the largest value, so that reading one shows.
+            let mut plane = PlaneBuf::new(96, 80, 0);
+            for (i, v) in plane.data.iter_mut().enumerate() {
+                let inside = i % 96 <= last_x as usize && i / 96 <= last_y as usize;
+                *v = match (inside, rnd(8)) {
+                    (false, _) => 0x7000,
+                    (true, 0) => (1 << bit_depth) - 1,
+                    (true, 1) => 0,
+                    _ => rnd(1 << bit_depth) as u16,
+                };
+            }
+            for compound in [false, true] {
+                let round0 = if bit_depth == 12 { 5 } else { 3 };
+                let round1 = match (compound, bit_depth) {
+                    (true, _) => 7,
+                    (false, 12) => 9,
+                    _ => 11,
+                };
+                let rv = RoundingVars {
+                    round0,
+                    round1,
+                    post_round: 14 - (round0 + round1) as i32,
+                    bit_depth,
+                };
+                let bias = if compound {
+                    crate::dsp::mc::Compound::new(bit_depth, 0).bias
+                } else {
+                    0
+                };
+                for (w, h) in [
+                    (2usize, 2usize),
+                    (4, 4),
+                    (4, 8),
+                    (8, 4),
+                    (8, 8),
+                    (16, 8),
+                    (8, 16),
+                    (16, 16),
+                    (32, 16),
+                    (16, 32),
+                    (32, 32),
+                    (64, 64),
+                ] {
+                    for _ in 0..120 {
+                        let filters = filter_kinds([rnd(4) as u8, rnd(4) as u8], w, h);
+                        // Where the block starts: anywhere from wholly
+                        // before the frame to wholly after it, at any
+                        // phase (the bits under the phase are not used).
+                        let mut at = |last: i32, size: usize| {
+                            let whole =
+                                rnd((last + 2 * size as i32 + 20) as u64) as i64 - size as i64 - 10;
+                            let phase = if rnd(2) == 0 { 0 } else { rnd(16) as i64 };
+                            (whole << 10) + (phase << 6) + rnd(64) as i64
+                        };
+                        let (x, y) = (at(last_x, w), at(last_y, h));
+                        let mut want = vec![0i32; w * h];
+                        let mut intermediate = vec![0i32; (h + 7) * w];
+                        block_inter_prediction_with(
+                            &plane,
+                            last_x,
+                            last_y,
+                            x,
+                            y,
+                            1 << SCALE_SUBPEL_BITS,
+                            1 << SCALE_SUBPEL_BITS,
+                            w,
+                            h,
+                            filters,
+                            h + 7,
+                            rv,
+                            &mut want,
+                            &mut intermediate,
+                        );
+                        let mut got = vec![0i16; w * h];
+                        let (mut edge, mut intermediate) = (Vec::new(), Vec::new());
+                        block_inter_prediction16(
+                            &plane,
+                            last_x,
+                            last_y,
+                            x,
+                            y,
+                            w,
+                            h,
+                            filters,
+                            rv,
+                            bias,
+                            &mut got,
+                            &mut edge,
+                            &mut intermediate,
+                        );
+                        let got: Vec<i32> = got.iter().map(|&v| v as i32 + bias).collect();
+                        assert_eq!(
+                            want, got,
+                            "{bit_depth}-bit compound {compound} {w}x{h} at {x},{y} {filters:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
