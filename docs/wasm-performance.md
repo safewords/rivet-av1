@@ -202,8 +202,16 @@ As above: the state after each step, fps and the ratio to rav1d's.
 |  | mandelbrot 720p | 48.7 (0.74x) | 95.9 (0.66x) | 114 |
 |  | mandelbrot 720p 10-bit | 62.0 (0.80x) | 130 (1.55x) | 152 |
 |  | mandelbrot 1080p | 24.4 (0.73x) | 50.2 (0.65x) | 61.2 |
-
+| 7. inter prediction: no buffer clearing per block, no closure call per row | fixture 320x180 | 772 (0.62x) | 1107 (0.60x) | 1286 |
+|  | testsrc2 720p | 125 (0.66x) | 189 (0.58x) | 223 |
+|  | mandelbrot 720p | 50.5 (0.74x) | 98.8 (0.65x) | 120 |
+|  | mandelbrot 720p 10-bit | 60.6 (0.79x) | 135 (1.62x) | 160 |
+|  | mandelbrot 1080p | 25.3 (0.75x) | 49.9 (0.62x) | 60.5 |
 
 ### 6. A decode-only coefficient reader, held to the shared walker by a test
 
 The coefficient reader was the tile walker's, which the encoder runs too: every symbol through `Coder` with the value the encoder would write, every context from the 32-bit `Quant` array with an edge test per neighbour. `coeffs_decode` reads the same syntax for a decoder alone: the levels in a padded byte map so that a context is a sum of five loads, the level symbols read with their CDF size known so that the search and the adaptation are fixed-length loops, an equiprobable bit as the two comparisons it is. The shared reader stays, untouched, as the reference the encoder uses. `CoefficientReader::Checked` runs both on every transform block from the same state and panics unless the coefficients, the end-of-block position, every CDF, the symbol decoder's state and the neighbour contexts are identical; the committed vectors, the 244 AOM vectors, the fuzz tests and the encoder round trips all decode in that mode, and a planted difference (a context clamp of 2 for 3) fails them. Worth 3 to 5 %.
+
+### 7. Inter prediction: no buffer clearing per block, no closure call per row
+
+Two costs around the prediction filters. `predict_inter` cleared and zero-filled its 32-bit prediction buffers for every block and every list, up to 64 KB each, before the filters overwrote all of it; the buffers now only grow. And the unscaled path fetched each reference row through a `&mut dyn FnMut`, a call the compiler cannot see through, once per row; it is a function returning the row. Worth 1 to 3 %, the same in two interleaved runs of each build on a quiet machine. Filtering a single-reference block straight into the frame, with no prediction buffer at all, was written and measured first: bit-exact, and no faster on any stream here (within 1 %), because these streams predict mostly from two references; it is not on the branch.

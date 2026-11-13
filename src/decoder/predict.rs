@@ -585,9 +585,13 @@ impl TileDecoder<'_, '_> {
         // The prediction buffers, reused from block to block.
         let mut preds = std::mem::take(&mut self.pred_bufs);
         let lists = if is_compound { 2 } else { 1 };
+        // Every way of predicting a list writes all `w * h` values of its
+        // buffer, and nothing below reads past them: the buffers only ever
+        // grow, and are not cleared between blocks.
         for p in preds.iter_mut().take(lists) {
-            p.clear();
-            p.resize(w * h, 0);
+            if p.len() < w * h {
+                p.resize(w * h, 0);
+            }
         }
         // Set when the prediction went straight into the frame.
         let mut written = false;
@@ -1339,6 +1343,33 @@ pub(crate) fn block_inter_prediction(
     })
 }
 
+/// `w + 7` samples of row `yy` of a reference from column `x0`, the row
+/// and the columns clamped to the reference (its edges repeated): the row
+/// itself when it holds them all, else gathered into `padded`.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn source_row<'a>(
+    refp: &'a PlaneBuf,
+    yy: i64,
+    x0: i64,
+    w: usize,
+    inside_x: bool,
+    last_x: i32,
+    last_y: i32,
+    padded: &'a mut [u16; 128 + 8],
+) -> &'a [u16] {
+    let row = refp.row(clip3(0, last_y, yy as i32) as usize);
+    if inside_x {
+        &row[x0 as usize..x0 as usize + w + 7]
+    } else {
+        for (c, v) in padded[..w + 7].iter_mut().enumerate() {
+            *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
+        }
+        &padded[..w + 7]
+    }
+}
+
 /// Block inter prediction from a reference of the frame's own size: the
 /// same arithmetic as the general process, with what a filter phase of
 /// zero makes of it taken directly. A phase of zero is the filter `128 *
@@ -1368,38 +1399,40 @@ fn block_inter_prediction_unscaled(
     let y0 = (y >> 10) - 3;
     let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
     let mut padded = [0u16; 128 + 8];
-    // Row `r` of the intermediate array reads this row of the reference:
-    // `w + 7` samples from `x0`, the edges repeated.
-    let source = |r: usize, padded: &mut [u16; 128 + 8], out: &mut dyn FnMut(&[u16])| {
-        let yy = clip3(0, last_y, (y0 + r as i64) as i32) as usize;
-        let row = refp.row(yy);
-        if inside_x {
-            out(&row[x0 as usize..x0 as usize + w + 7])
-        } else {
-            for (c, v) in padded[..w + 7].iter_mut().enumerate() {
-                *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
-            }
-            out(&padded[..w + 7])
-        }
-    };
     let (round0, round1) = (rv.round0, rv.round1);
     if phase_y == 0 {
         if phase_x == 0 {
             let shift = 14 - round0 - round1;
             for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-                source(r + 3, &mut padded, &mut |src| {
-                    for (o, &s) in out.iter_mut().zip(&src[3..]) {
-                        *o = (s as i32) << shift;
-                    }
-                });
+                let src = source_row(
+                    refp,
+                    y0 + r as i64 + 3,
+                    x0,
+                    w,
+                    inside_x,
+                    last_x,
+                    last_y,
+                    &mut padded,
+                );
+                for (o, &s) in out.iter_mut().zip(&src[3..]) {
+                    *o = (s as i32) << shift;
+                }
             }
         } else {
             let add = (1 << round1) >> 1;
             let mut line = [0i16; 128];
             for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
-                source(r + 3, &mut padded, &mut |src| {
-                    crate::dsp::mc::filter_row16(src, fx, round0, &mut line[..w]);
-                });
+                let src = source_row(
+                    refp,
+                    y0 + r as i64 + 3,
+                    x0,
+                    w,
+                    inside_x,
+                    last_x,
+                    last_y,
+                    &mut padded,
+                );
+                crate::dsp::mc::filter_row16(src, fx, round0, &mut line[..w]);
                 for (o, &v) in out.iter_mut().zip(&line[..w]) {
                     *o = (128 * v as i32 + add) >> round1;
                 }
@@ -1419,16 +1452,24 @@ fn block_inter_prediction_unscaled(
         }
         let intermediate = &mut buf[..inter_h * w];
         for (r, out) in intermediate.chunks_exact_mut(w).enumerate() {
-            source(r, &mut padded, &mut |src| {
-                if phase_x == 0 {
-                    let shift = 7 - round0;
-                    for (o, &s) in out.iter_mut().zip(&src[3..]) {
-                        *o = (s << shift) as i16;
-                    }
-                } else {
-                    crate::dsp::mc::filter_row16(src, fx, round0, out);
+            let src = source_row(
+                refp,
+                y0 + r as i64,
+                x0,
+                w,
+                inside_x,
+                last_x,
+                last_y,
+                &mut padded,
+            );
+            if phase_x == 0 {
+                let shift = 7 - round0;
+                for (o, &s) in out.iter_mut().zip(&src[3..]) {
+                    *o = (s << shift) as i16;
                 }
-            });
+            } else {
+                crate::dsp::mc::filter_row16(src, fx, round0, out);
+            }
         }
         for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
             crate::dsp::mc::filter_col16(&intermediate[r * w..], w, fy, round1, out);
