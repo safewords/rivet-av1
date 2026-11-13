@@ -924,7 +924,7 @@ impl TileDecoder<'_, '_> {
         }
         let filt = self.f.hdr.interpolation_filter.min(BILINEAR) as u8;
         block_inter_prediction(
-            &r.frame.planes[plane],
+            &r.frame().planes[plane],
             last_x,
             last_y,
             sx,
@@ -985,7 +985,7 @@ impl TileDecoder<'_, '_> {
         let y0 = (self.b.mi_row * MI_SIZE) as i32;
         let ref_idx = self.f.hdr.ref_frame_idx[(ref_frame - LAST_FRAME) as usize];
         let r = self.f.refs[ref_idx].as_ref().expect("a reference");
-        let rp = &r.frame.planes[0];
+        let rp = &r.frame().planes[0];
         let last_x = r.upscaled_width as i32 - 1;
         let last_y = r.frame_height as i32 - 1;
         let e = self.enc.as_ref().expect("encode mode");

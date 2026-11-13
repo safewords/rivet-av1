@@ -7,11 +7,15 @@
 //! then the loop filter, CDEF, super-resolution, loop restoration, the
 //! reference update and, on output, film grain synthesis.
 
+mod flight;
 pub(crate) mod grain;
 pub(crate) mod mvpred;
+pub(crate) mod pipeline;
 pub(crate) mod postfilter;
 pub(crate) mod predict;
+pub(crate) mod record;
 pub(crate) mod residual;
+pub(crate) mod shared;
 pub(crate) mod state;
 pub(crate) mod tile;
 
@@ -25,6 +29,7 @@ use crate::header::{FrameHeader, RefHeaderState, RefState, get_relative_dist};
 use crate::obu::{Metadata, SequenceHeader, split_obus};
 use crate::tables::*;
 use crate::{Error, Result};
+use shared::Shared;
 use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
 use tile::TileDecoder;
 
@@ -54,9 +59,9 @@ pub(crate) struct FrameCtx {
     /// which blocks overhanging the frame write into as the specification's
     /// unbounded arrays allow (and later reads may see).
     pub(crate) ms: usize,
-    pub(crate) mi: Vec<Mi>,
+    pub(crate) mi: Shared<Mi>,
     pub(crate) tx_types: Vec<u8>,
-    pub(crate) lf_tx_sizes: [Vec<u8>; 3],
+    pub(crate) lf_tx_sizes: [Shared<u8>; 3],
     pub(crate) palette_colors: [Vec<[u16; 8]>; 2],
     pub(crate) segment_ids: Vec<u8>,
     pub(crate) prev_segment_ids: Arc<Vec<u8>>,
@@ -77,6 +82,9 @@ pub(crate) struct FrameCtx {
     pub(crate) tile_num: usize,
     /// Every tile's padding checked out (see `SymbolDecoder::trailing_ok`).
     pub(crate) tiles_ok: bool,
+    /// `LrFrame`, when the post-filters ran with the tile's rows
+    /// (`pipeline.rs`) and are not left to the decode frame wrapup.
+    pub(crate) filtered: Option<FrameBuf>,
 }
 
 impl FrameCtx {
@@ -96,9 +104,9 @@ impl FrameCtx {
             mi_rows: self.mi_rows,
             mi_cols: self.mi_cols,
             ms: self.ms,
-            mi: vec![Mi::default(); n],
+            mi: vec![Mi::default(); n].into(),
             tx_types: vec![0; n],
-            lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
+            lf_tx_sizes: std::array::from_fn(|_| vec![0; n].into()),
             palette_colors: [
                 vec![[0; 8]; self.palette_colors[0].len()],
                 vec![[0; 8]; self.palette_colors[1].len()],
@@ -123,6 +131,7 @@ impl FrameCtx {
             mask: Box::new([0; 128 * 128]),
             tile_num: self.tile_num,
             tiles_ok: true,
+            filtered: None,
         }
     }
 
@@ -300,11 +309,30 @@ pub struct Decoder {
     max_pixels: u64,
     /// The HDR metadata OBUs seen so far in this coded video sequence.
     hdr: HdrMetadata,
-    /// Worker threads for tiles and the post-filters (1: none).
+    /// Threads for rows, tiles and the post-filters (1: the caller's).
     threads: usize,
     /// Whether output frames get the film grain their stream asks for.
     apply_grain: bool,
     coeff_reader: CoefficientReader,
+    /// The frames whose rows are decoded as tasks (`pipeline.rs`). (Before
+    /// the threads: dropped first, it sends them home.)
+    engine: pipeline::Engine,
+    /// The threads, kept from one frame to the next.
+    pool: crate::parallel::Pool,
+    /// The headers of such a frame, between its frame header and its tile
+    /// group (when `frame` is `None`).
+    pending: Option<(Arc<SequenceHeader>, FrameHeader)>,
+    /// How many frames may be decoded at once (`flight.rs`), the units
+    /// queued, and the one being flown, if one is.
+    frames_in_flight: usize,
+    samples_in_flight: u64,
+    units: flight::Units,
+    flying: Option<flight::Flight>,
+    /// How many units are decoded in place before one is flown again:
+    /// counted down, and what the unit being flown asks for when it meets
+    /// a frame that is not a job or finds no thread to fly on.
+    grounded: usize,
+    ground_for: usize,
 }
 
 impl Default for Decoder {
@@ -330,6 +358,15 @@ impl Decoder {
             threads: 1,
             apply_grain: true,
             coeff_reader: CoefficientReader::Fast,
+            pool: Default::default(),
+            engine: Default::default(),
+            pending: None,
+            frames_in_flight: 1,
+            samples_in_flight: u64::MAX,
+            units: Default::default(),
+            flying: None,
+            grounded: 0,
+            ground_for: 0,
         }
     }
 
@@ -346,9 +383,12 @@ impl Decoder {
         self.max_pixels = max;
     }
 
-    /// Decodes with up to `n` threads: the tiles of a frame in parallel
-    /// (when it has several) and the post-filters by rows. 1, the default,
-    /// decodes on the caller's thread alone; 0 means one per core.
+    /// Decodes with up to `n` threads: a frame of one tile has its
+    /// superblock rows reconstructed behind the parsing of the tile, a
+    /// frame of several its tiles in parallel, and the post-filters run by
+    /// rows (see `docs/threading.md`). The frames are the same whatever
+    /// `n`. 1, the default, decodes on the caller's thread alone; 0 means
+    /// one per core.
     pub fn set_threads(&mut self, n: usize) {
         self.threads = if n == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -398,6 +438,7 @@ impl Decoder {
     /// (without its leading `temporal_unit_size`; see
     /// [`annexb_temporal_units`]) and returns every frame it shows.
     pub fn decode_annexb(&mut self, tu: &[u8]) -> Result<Vec<Frame>> {
+        self.nothing_queued()?;
         self.shown.clear();
         let mut pos = 0;
         while pos < tu.len() {
@@ -437,8 +478,37 @@ impl Decoder {
 
     /// Decodes one temporal unit and returns every frame it shows, in
     /// order (more than one only with spatial layers).
+    ///
+    /// # Errors
+    ///
+    /// Besides the unit's own: `Error::InvalidInput` while units given to
+    /// [`Decoder::queue`] are waiting for their results to be taken.
     pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<Frame>> {
+        self.nothing_queued()?;
+        self.decode_unit(data)
+    }
+
+    /// What decoding a unit in place asks first: that no queued unit is
+    /// waiting, and that the threads are not out on a session for those.
+    fn nothing_queued(&self) -> Result<()> {
+        if self.queued() != 0 {
+            return Err(Error::InvalidInput(
+                "units are queued: take their results (poll, wait) before decoding in place".into(),
+            ));
+        }
+        self.engine.end_session();
+        Ok(())
+    }
+
+    /// Decodes one temporal unit before it returns: every frame it shows.
+    fn decode_unit(&mut self, data: &[u8]) -> Result<Vec<Frame>> {
         self.shown.clear();
+        self.decode_obus(data)?;
+        Ok(std::mem::take(&mut self.shown))
+    }
+
+    /// The OBUs of a temporal unit, in order.
+    fn decode_obus(&mut self, data: &[u8]) -> Result<()> {
         for obu in split_obus(data)? {
             self.decode_obu(
                 obu.obu_type,
@@ -448,10 +518,23 @@ impl Decoder {
                 obu.payload,
             )?;
         }
-        Ok(std::mem::take(&mut self.shown))
+        Ok(())
     }
 
     fn decode_obu(
+        &mut self,
+        obu_type: u32,
+        temporal_id: u32,
+        spatial_id: u32,
+        ext: bool,
+        payload: &[u8],
+    ) -> Result<()> {
+        // Parallel work started below runs on this decoder's threads.
+        let _entered = self.pool.enter();
+        self.decode_obu_entered(obu_type, temporal_id, spatial_id, ext, payload)
+    }
+
+    fn decode_obu_entered(
         &mut self,
         obu_type: u32,
         temporal_id: u32,
@@ -507,7 +590,24 @@ impl Decoder {
                     return Ok(());
                 }
                 self.seen_frame_header = true;
-                self.frame = Some(self.setup_frame(seq, hdr)?);
+                if self.threads > 1 && pipeline::applies(&hdr) {
+                    // A frame of one tile on several threads: its state is
+                    // set up by the task that parses it.
+                    self.check_frame(&seq, &hdr)?;
+                    self.frame = None;
+                    self.pending = Some((seq, hdr));
+                } else {
+                    if self.flying.is_some() {
+                        // Not a frame that flies: the unit is decoded in
+                        // place (`flight.rs`), and this error goes no
+                        // further.
+                        self.ground_for = flight::AFTER_A_FRAME_THAT_IS_NOT_A_JOB;
+                        return Err(Error::unsupported("a frame that is decoded in place"));
+                    }
+                    let f = self.setup_frame(seq, hdr)?;
+                    self.pending = None;
+                    self.frame = Some(f);
+                }
                 if obu_type == OBU_FRAME {
                     r.byte_align()?;
                     let pos = r.position() / 8;
@@ -515,7 +615,7 @@ impl Decoder {
                 }
             }
             OBU_TILE_GROUP => {
-                if !self.seen_frame_header || self.frame.is_none() {
+                if !self.seen_frame_header || (self.frame.is_none() && self.pending.is_none()) {
                     return Err(Error::bitstream("tile group without a frame header"));
                 }
                 self.tile_group(payload)?;
@@ -542,14 +642,20 @@ impl Decoder {
         seq: Arc<SequenceHeader>,
         hdr: FrameHeader,
     ) -> Result<FrameCtx> {
+        self.check_frame(&seq, &hdr)?;
+        Ok(build_frame(&self.refs, seq, hdr))
+    }
+
+    /// What can be wrong with a frame once its header is parsed: its size,
+    /// and the references it names. Their header state alone says, so
+    /// this does not wait for a reference that is still being decoded.
+    fn check_frame(&self, seq: &SequenceHeader, hdr: &FrameHeader) -> Result<()> {
         let c = &seq.color;
         if hdr.upscaled_width as u64 * hdr.frame_height as u64 > self.max_pixels {
             return Err(Error::bitstream(
                 "frame larger than the decoder's pixel limit",
             ));
         }
-        let mi_rows = hdr.mi_rows;
-        let mi_cols = hdr.mi_cols;
         if !hdr.frame_is_intra {
             for i in 0..REFS_PER_FRAME {
                 let idx = hdr.ref_frame_idx[i];
@@ -572,103 +678,80 @@ impl Decoder {
                 }
             }
         }
-        let cdfs = if hdr.primary_ref_frame == PRIMARY_REF_NONE {
-            CdfContext::new(hdr.base_q_idx)
-        } else {
-            let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
-            let r = self.refs[idx]
-                .as_ref()
-                .ok_or_else(|| Error::bitstream("primary_ref_frame refers to an empty slot"))?;
-            let mut c = Box::new((*r.cdfs).clone());
-            c.clear_counts();
-            c
-        };
-        let ms = mi_cols + 32;
-        let n = (mi_rows + 32) * ms;
-        let mut prev_segment_ids = vec![0u8; n];
-        if hdr.primary_ref_frame != PRIMARY_REF_NONE && hdr.segmentation_enabled {
-            let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
-            if let Some(r) = &self.refs[idx]
-                && r.mi_rows == mi_rows
-                && r.mi_cols == mi_cols
-            {
-                prev_segment_ids.copy_from_slice(&r.saved_segment_ids);
-            }
+        if hdr.primary_ref_frame != PRIMARY_REF_NONE
+            && self.refs[hdr.ref_frame_idx[hdr.primary_ref_frame]].is_none()
+        {
+            return Err(Error::bitstream(
+                "primary_ref_frame refers to an empty slot",
+            ));
         }
-        let ssx = c.subsampling_x as usize;
-        let ssy = c.subsampling_y as usize;
-        let num_planes = c.num_planes;
-        let aw = (mi_cols * MI_SIZE + 127) & !127;
-        let ah = (mi_rows * MI_SIZE + 127) & !127;
-        let mut planes = vec![PlaneBuf::new(aw + 32, ah + 32, 0)];
-        for _ in 1..num_planes {
-            planes.push(PlaneBuf::new((aw >> ssx) + 32, (ah >> ssy) + 32, 0));
-        }
-        let cdef_stride = (mi_cols >> 4) + 2;
-        let screen_content = hdr.allow_screen_content_tools;
-        let mut lr: [LrPlane; 3] = Default::default();
-        for (plane, l) in lr.iter_mut().enumerate().take(num_planes) {
-            if hdr.frame_restoration_type[plane] != RESTORE_NONE {
-                let (sx, sy) = if plane == 0 {
-                    (0, 0)
-                } else {
-                    (ssx as u32, ssy as u32)
-                };
-                let unit_size = hdr.loop_restoration_size[plane];
-                l.unit_rows =
-                    count_units_in_frame(unit_size, round2(hdr.frame_height as i32, sy) as usize);
-                l.unit_cols =
-                    count_units_in_frame(unit_size, round2(hdr.upscaled_width as i32, sx) as usize);
-                let units = l.unit_rows * l.unit_cols;
-                l.lr_type = vec![RESTORE_NONE; units];
-                l.wiener = vec![[[0; 3]; 2]; units];
-                l.sgr_set = vec![0; units];
-                l.sgr_xqd = vec![[0; 2]; units];
-            }
-        }
-        let mut f = FrameCtx {
+        Ok(())
+    }
+
+    /// `tile_group_obu( sz )` (5.11.1) for a frame of one tile that is
+    /// decoded as tasks: the tile is the whole of `data` (no tile start
+    /// and end, no tile size), and with it the frame is complete.
+    fn tile_group_tasks(
+        &mut self,
+        seq: Arc<SequenceHeader>,
+        hdr: FrameHeader,
+        data: &[u8],
+    ) -> Result<()> {
+        let out = Arc::new(ref_data(&seq, &hdr));
+        let input = pipeline::Input {
             seq: seq.clone(),
-            hdr,
-            bit_depth: c.bit_depth,
-            ssx,
-            ssy,
-            num_planes,
-            mi_rows,
-            mi_cols,
-            ms,
-            mi: vec![Mi::default(); n],
-            tx_types: vec![0; n],
-            lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
-            // Palettes need screen content tools.
-            palette_colors: if screen_content {
-                [vec![[0; 8]; n], vec![[0; 8]; n]]
-            } else {
-                [Vec::new(), Vec::new()]
-            },
-            segment_ids: vec![0; n],
-            prev_segment_ids: Arc::new(prev_segment_ids),
-            cdef_idx: vec![-1; cdef_stride * ((mi_rows >> 4) + 2)],
-            cdef_stride,
-            lr,
-            motion_field: Arc::new(Vec::new()),
-            cur: FrameBuf { planes },
-            refs: self.refs.clone(),
-            cdfs,
-            saved_cdfs: None,
-            mask: Box::new([0; 128 * 128]),
-            tile_num: 0,
-            tiles_ok: true,
+            hdr: hdr.clone(),
+            data: data.to_vec(),
+            coeff_reader: self.coeff_reader,
+            ref_order_hints: self.ref_state.order_hint,
+            threads: self.threads,
         };
-        if f.hdr.use_ref_frame_mvs {
-            self.motion_field_estimation(&mut f);
-        } else {
-            f.motion_field = Arc::new(vec![Vec::new(); 8]);
+        let job = pipeline::Job::new(&self.refs, out.clone(), input);
+        if self.flying.is_some() {
+            // In flight: the frame is in its slots as of now (7.20), and
+            // decoded when its turn comes, by the threads of a session.
+            if !self.engine.session(self.threads) {
+                // No thread to be had (not yet, perhaps): in place, then,
+                // this unit and the next few (the error goes no further).
+                self.ground_for = flight::WITHOUT_THREADS;
+                return Err(Error::unsupported("no threads for frames in flight"));
+            }
+            self.engine.wait_for_room(
+                self.frames_in_flight,
+                self.samples_in_flight,
+                hdr.upscaled_width as u64 * hdr.frame_height as u64,
+            );
+            let id = self.engine.submit(job);
+            self.flying
+                .as_mut()
+                .expect("a unit in flight")
+                .jobs
+                .push(id);
+            self.reference_update(&seq, &hdr, out);
+            self.seen_frame_header = false;
+            return Ok(());
         }
-        Ok(f)
+        match self.engine.decode(job, self.threads) {
+            Some(padding_ok) if padding_ok || !self.strict => {
+                self.reference_update(&seq, &hdr, out);
+                self.seen_frame_header = false;
+                Ok(())
+            }
+            // A tile that does not parse (or, for a strict decoder, does
+            // not end as it should): decoded again as one thread decodes
+            // it, for the same error and the same state after it.
+            _ => {
+                self.frame = Some(build_frame(&self.refs, seq, hdr));
+                self.tile_group(data)
+            }
+        }
     }
 
     /// `tile_group_obu( sz )` (5.11.1).
     fn tile_group(&mut self, data: &[u8]) -> Result<()> {
+        if let Some((seq, hdr)) = self.pending.take() {
+            return self.tile_group_tasks(seq, hdr, data);
+        }
         let f = self.frame.as_mut().expect("checked by the caller");
         let ti = f.hdr.tile_info.clone();
         let num_tiles = ti.cols * ti.rows;
@@ -786,45 +869,19 @@ impl Decoder {
 
     /// The decode frame wrapup process (7.4) for a decoded frame.
     fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
-        if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
-            postfilter::loop_filter_threads(&mut f, self.threads);
-        }
-        let cdef = postfilter::cdef(&f, self.threads);
-        let up_cdef = match postfilter::upscale(&f, &cdef) {
-            Some(u) => u,
-            None => cdef,
-        };
-        let up_cur_owned = postfilter::upscale(&f, &f.cur);
-        let up_cur = up_cur_owned.as_ref().unwrap_or(&f.cur);
-        let lr = postfilter::loop_restoration(&f, up_cur, up_cdef, self.threads);
-        drop(up_cur_owned);
-        let (mf_ref_frames, mf_mvs) = self.motion_vector_storage(&f);
-        if f.hdr.segmentation_enabled && !f.hdr.segmentation_update_map {
-            let prev = f.prev_segment_ids.clone();
-            f.segment_ids.copy_from_slice(&prev);
-        }
-        let seq = f.seq.clone();
-        let h = &f.hdr;
-        let film_grain = h.film_grain.clone();
-        let data = Arc::new(RefData {
-            frame: lr,
-            frame_type: h.frame_type,
-            upscaled_width: h.upscaled_width as usize,
-            frame_height: h.frame_height as usize,
-            render_width: h.render_width,
-            render_height: h.render_height,
-            mi_rows: f.mi_rows,
-            mi_cols: f.mi_cols,
-            bit_depth: f.bit_depth,
-            subsampling_x: f.ssx as u32,
-            subsampling_y: f.ssy as u32,
-            order_hint: h.order_hint,
-            saved_order_hints: h.order_hints,
-            saved_ref_frames: Arc::new(mf_ref_frames),
-            saved_mvs: Arc::new(mf_mvs),
-            saved_segment_ids: Arc::new(std::mem::take(&mut f.segment_ids)),
-            cdfs: Arc::new(*f.cdfs),
-        });
+        let lr = filter_frame(&mut f, self.threads);
+        let data = ref_data(&f.seq, &f.hdr);
+        let _ = data
+            .syntax
+            .set(frame_syntax(&mut f, &self.ref_state.order_hint));
+        let _ = data.frame.set(lr);
+        self.reference_update(&f.seq, &f.hdr, Arc::new(data));
+        Ok(())
+    }
+
+    /// The reference frame update process (7.20) for a frame whose slot
+    /// contents are `data`, and the output process if it is shown.
+    fn reference_update(&mut self, seq: &Arc<SequenceHeader>, h: &FrameHeader, data: Arc<RefData>) {
         let hs = Arc::new(RefHeaderState {
             frame_id: h.current_frame_id,
             frame_type: h.frame_type,
@@ -837,9 +894,8 @@ impl Decoder {
             feature_enabled: h.feature_enabled,
             feature_data: h.feature_data,
             gm_params: h.gm_params,
-            film_grain,
+            film_grain: h.film_grain.clone(),
         });
-        // The reference frame update process (7.20).
         for i in 0..NUM_REF_FRAMES {
             if (h.refresh_frame_flags >> i) & 1 != 0 {
                 self.refs[i] = Some(data.clone());
@@ -850,10 +906,30 @@ impl Decoder {
         }
         self.ref_state.current_frame_id = h.current_frame_id;
         if h.show_frame {
-            let out = self.output(&seq, &data, &h.film_grain);
-            self.shown.push(out);
+            self.show(seq, &data, &h.film_grain);
         }
-        Ok(())
+    }
+
+    /// Shows a frame: the output process (7.18), now, or when the unit
+    /// being flown has landed.
+    fn show(
+        &mut self,
+        seq: &Arc<SequenceHeader>,
+        data: &Arc<RefData>,
+        grain: &crate::header::FilmGrainParams,
+    ) {
+        match &mut self.flying {
+            Some(flight) => flight.shown.push(flight::Shown {
+                seq: seq.clone(),
+                data: data.clone(),
+                grain: grain.clone(),
+                hdr: self.hdr,
+            }),
+            None => {
+                let out = self.output(seq, data, grain);
+                self.shown.push(out);
+            }
+        }
     }
 
     /// `show_existing_frame` (7.4, 7.21).
@@ -878,8 +954,7 @@ impl Decoder {
                 }
             }
         }
-        let out = self.output(&seq, &data, &hdr.film_grain);
-        self.shown.push(out);
+        self.show(&seq, &data, &hdr.film_grain);
         Ok(())
     }
 
@@ -889,6 +964,18 @@ impl Decoder {
         seq: &SequenceHeader,
         data: &RefData,
         grain: &crate::header::FilmGrainParams,
+    ) -> Frame {
+        self.output_with(seq, data, grain, self.hdr)
+    }
+
+    /// [`Self::output`] with the HDR metadata `hdr` (the stream's when the
+    /// frame was shown).
+    fn output_with(
+        &self,
+        seq: &SequenceHeader,
+        data: &RefData,
+        grain: &crate::header::FilmGrainParams,
+        hdr: HdrMetadata,
     ) -> Frame {
         let w = data.upscaled_width;
         let h = data.frame_height;
@@ -902,11 +989,11 @@ impl Decoder {
         frame.render_width = data.render_width;
         frame.render_height = data.render_height;
         frame.color = color_info(&seq.color);
-        frame.hdr = self.hdr;
+        frame.hdr = hdr;
         let grain_on = self.apply_grain && seq.film_grain_params_present && grain.apply_grain;
         let mut planes: Vec<Vec<u16>> = Vec::new();
         if grain_on {
-            for (p, pl) in data.frame.planes.iter().enumerate() {
+            for (p, pl) in data.frame().planes.iter().enumerate() {
                 let (sx, sy) = if p == 0 {
                     (0, 0)
                 } else {
@@ -940,7 +1027,7 @@ impl Decoder {
                 let src: &[u16] = if grain_on {
                     &planes[p][y * pw..(y + 1) * pw]
                 } else {
-                    &data.frame.planes[p].row(y)[..pw]
+                    &data.frame().planes[p].row(y)[..pw]
                 };
                 if wide {
                     let row = out[y * pw * 2..(y + 1) * pw * 2].as_chunks_mut::<2>().0;
@@ -956,136 +1043,299 @@ impl Decoder {
         }
         frame
     }
+}
 
-    /// The motion field estimation process (7.9).
-    fn motion_field_estimation(&self, f: &mut FrameCtx) {
-        let w8 = f.mi_cols >> 1;
-        let h8 = f.mi_rows >> 1;
-        let invalid: Mv = [-1 << 15, -1 << 15];
-        f.motion_field = Arc::new(vec![vec![invalid; w8 * h8]; 8]);
-        let seq = f.seq.clone();
-        let h = f.hdr.clone();
-        let last_idx = h.ref_frame_idx[0];
-        let cur_gold_order_hint = h.order_hints[GOLDEN_FRAME as usize];
-        let last_alt_order_hint = self.refs[last_idx]
-            .as_ref()
-            .map_or(0, |r| r.saved_order_hints[ALTREF_FRAME as usize]);
-        let use_last = last_alt_order_hint != cur_gold_order_hint;
-        if use_last {
-            self.project(f, LAST_FRAME, -1);
-        }
-        let mut ref_stamp = MFMV_STACK_SIZE - 2;
-        let dist = |a: u32, b: u32| get_relative_dist(&seq, a, b);
-        if dist(h.order_hints[BWDREF_FRAME as usize], h.order_hint) > 0
-            && self.project(f, BWDREF_FRAME, 1)
-        {
-            ref_stamp -= 1;
-        }
-        if dist(h.order_hints[ALTREF2_FRAME as usize], h.order_hint) > 0
-            && self.project(f, ALTREF2_FRAME, 1)
-        {
-            ref_stamp -= 1;
-        }
-        if dist(h.order_hints[ALTREF_FRAME as usize], h.order_hint) > 0
-            && ref_stamp >= 0
-            && self.project(f, ALTREF_FRAME, 1)
-        {
-            ref_stamp -= 1;
-        }
-        if ref_stamp >= 0 {
-            self.project(f, LAST2_FRAME, -1);
-        }
+/// The motion field estimation process (7.9).
+fn motion_field_estimation(f: &mut FrameCtx) {
+    let w8 = f.mi_cols >> 1;
+    let h8 = f.mi_rows >> 1;
+    let invalid: Mv = [-1 << 15, -1 << 15];
+    f.motion_field = Arc::new(vec![vec![invalid; w8 * h8]; 8]);
+    let seq = f.seq.clone();
+    let h = f.hdr.clone();
+    let last_idx = h.ref_frame_idx[0];
+    let cur_gold_order_hint = h.order_hints[GOLDEN_FRAME as usize];
+    let last_alt_order_hint = f.refs[last_idx]
+        .as_ref()
+        .map_or(0, |r| r.saved_order_hints[ALTREF_FRAME as usize]);
+    let use_last = last_alt_order_hint != cur_gold_order_hint;
+    if use_last {
+        project(f, LAST_FRAME, -1);
     }
+    let mut ref_stamp = MFMV_STACK_SIZE - 2;
+    let dist = |a: u32, b: u32| get_relative_dist(&seq, a, b);
+    if dist(h.order_hints[BWDREF_FRAME as usize], h.order_hint) > 0 && project(f, BWDREF_FRAME, 1) {
+        ref_stamp -= 1;
+    }
+    if dist(h.order_hints[ALTREF2_FRAME as usize], h.order_hint) > 0 && project(f, ALTREF2_FRAME, 1)
+    {
+        ref_stamp -= 1;
+    }
+    if dist(h.order_hints[ALTREF_FRAME as usize], h.order_hint) > 0
+        && ref_stamp >= 0
+        && project(f, ALTREF_FRAME, 1)
+    {
+        ref_stamp -= 1;
+    }
+    if ref_stamp >= 0 {
+        project(f, LAST2_FRAME, -1);
+    }
+}
 
-    /// The projection process (7.9.2).
-    fn project(&self, f: &mut FrameCtx, src: i32, dst_sign: i32) -> bool {
-        let src_idx = f.hdr.ref_frame_idx[(src - LAST_FRAME) as usize];
-        let w8 = (f.mi_cols >> 1) as i32;
-        let h8 = (f.mi_rows >> 1) as i32;
-        let Some(r) = self.refs[src_idx].clone() else {
-            return false;
-        };
-        if r.mi_rows != f.mi_rows
-            || r.mi_cols != f.mi_cols
-            || r.frame_type == INTRA_ONLY_FRAME
-            || r.frame_type == KEY_FRAME
-        {
-            return false;
-        }
-        let seq = f.seq.clone();
-        let dist = |a: u32, b: u32| get_relative_dist(&seq, a, b);
-        let order_hint = f.hdr.order_hint;
-        let order_hints = f.hdr.order_hints;
-        for y8 in 0..h8 {
-            for x8 in 0..w8 {
-                let i = (y8 * w8 + x8) as usize;
-                let src_ref = r.saved_ref_frames[i] as i32;
-                if src_ref <= INTRA_FRAME {
-                    continue;
-                }
-                let ref_to_cur = dist(order_hints[src as usize], order_hint);
-                let ref_offset = dist(
-                    order_hints[src as usize],
-                    r.saved_order_hints[src_ref as usize],
-                );
-                let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset > 0;
-                if !pos_valid {
-                    continue;
-                }
-                let mv = r.saved_mvs[i];
-                let proj_mv = get_mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
-                let (pos_y8, vy) = project_pos(y8, proj_mv[0], dst_sign, h8, MAX_OFFSET_HEIGHT);
-                let (pos_x8, vx) = project_pos(x8, proj_mv[1], dst_sign, w8, MAX_OFFSET_WIDTH);
-                if vy && vx {
-                    for dst in LAST_FRAME..=ALTREF_FRAME {
-                        let ref_to_dst = dist(order_hint, order_hints[dst as usize]);
-                        let p = get_mv_projection(mv, ref_to_dst, ref_offset);
-                        Arc::make_mut(&mut f.motion_field)[dst as usize]
-                            [(pos_y8 * w8 + pos_x8) as usize] = p;
-                    }
+/// The projection process (7.9.2).
+fn project(f: &mut FrameCtx, src: i32, dst_sign: i32) -> bool {
+    let src_idx = f.hdr.ref_frame_idx[(src - LAST_FRAME) as usize];
+    let w8 = (f.mi_cols >> 1) as i32;
+    let h8 = (f.mi_rows >> 1) as i32;
+    let Some(r) = f.refs[src_idx].clone() else {
+        return false;
+    };
+    if r.mi_rows != f.mi_rows
+        || r.mi_cols != f.mi_cols
+        || r.frame_type == INTRA_ONLY_FRAME
+        || r.frame_type == KEY_FRAME
+    {
+        return false;
+    }
+    let saved = r.syntax();
+    let seq = f.seq.clone();
+    let dist = |a: u32, b: u32| get_relative_dist(&seq, a, b);
+    let order_hint = f.hdr.order_hint;
+    let order_hints = f.hdr.order_hints;
+    for y8 in 0..h8 {
+        for x8 in 0..w8 {
+            let i = (y8 * w8 + x8) as usize;
+            let src_ref = saved.saved_ref_frames[i] as i32;
+            if src_ref <= INTRA_FRAME {
+                continue;
+            }
+            let ref_to_cur = dist(order_hints[src as usize], order_hint);
+            let ref_offset = dist(
+                order_hints[src as usize],
+                r.saved_order_hints[src_ref as usize],
+            );
+            let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
+                && ref_offset.abs() <= MAX_FRAME_DISTANCE
+                && ref_offset > 0;
+            if !pos_valid {
+                continue;
+            }
+            let mv = saved.saved_mvs[i];
+            let proj_mv = get_mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
+            let (pos_y8, vy) = project_pos(y8, proj_mv[0], dst_sign, h8, MAX_OFFSET_HEIGHT);
+            let (pos_x8, vx) = project_pos(x8, proj_mv[1], dst_sign, w8, MAX_OFFSET_WIDTH);
+            if vy && vx {
+                for dst in LAST_FRAME..=ALTREF_FRAME {
+                    let ref_to_dst = dist(order_hint, order_hints[dst as usize]);
+                    let p = get_mv_projection(mv, ref_to_dst, ref_offset);
+                    Arc::make_mut(&mut f.motion_field)[dst as usize]
+                        [(pos_y8 * w8 + pos_x8) as usize] = p;
                 }
             }
         }
-        true
     }
+    true
+}
 
-    /// The motion field motion vector storage process (7.19), kept on the
-    /// 8x8 grid (row and col odd).
-    fn motion_vector_storage(&self, f: &FrameCtx) -> (Vec<i8>, Vec<Mv>) {
-        let w8 = f.mi_cols >> 1;
-        let h8 = f.mi_rows >> 1;
-        let mut refs = vec![NONE as i8; w8 * h8];
-        let mut mvs = vec![[0i32; 2]; w8 * h8];
-        let seq = &f.seq;
-        for y8 in 0..h8 {
-            for x8 in 0..w8 {
-                let row = 2 * y8 + 1;
-                let col = 2 * x8 + 1;
-                let m = &f.mi[row * f.ms + col];
-                for list in 0..2 {
-                    let r = m.ref_frame[list] as i32;
-                    if r > INTRA_FRAME {
-                        let ref_idx = f.hdr.ref_frame_idx[(r - LAST_FRAME) as usize];
-                        let dist = get_relative_dist(
-                            seq,
-                            self.ref_state.order_hint[ref_idx],
-                            f.hdr.order_hint,
-                        );
-                        if dist < 0 {
-                            let mv = m.mv[list];
-                            if mv[0].abs() <= REFMVS_LIMIT && mv[1].abs() <= REFMVS_LIMIT {
-                                refs[y8 * w8 + x8] = r as i8;
-                                mvs[y8 * w8 + x8] = mv;
-                            }
+/// The motion field motion vector storage process (7.19), kept on the
+/// 8x8 grid (row and col odd). `ref_order_hints` is `RefOrderHint` as the
+/// frame's header found it.
+fn motion_vector_storage(f: &FrameCtx, ref_order_hints: &[u32; 8]) -> (Vec<i8>, Vec<Mv>) {
+    let w8 = f.mi_cols >> 1;
+    let h8 = f.mi_rows >> 1;
+    let mut refs = vec![NONE as i8; w8 * h8];
+    let mut mvs = vec![[0i32; 2]; w8 * h8];
+    let seq = &f.seq;
+    for y8 in 0..h8 {
+        for x8 in 0..w8 {
+            let row = 2 * y8 + 1;
+            let col = 2 * x8 + 1;
+            let m = &f.mi[row * f.ms + col];
+            for list in 0..2 {
+                let r = m.ref_frame[list] as i32;
+                if r > INTRA_FRAME {
+                    let ref_idx = f.hdr.ref_frame_idx[(r - LAST_FRAME) as usize];
+                    let dist = get_relative_dist(seq, ref_order_hints[ref_idx], f.hdr.order_hint);
+                    if dist < 0 {
+                        let mv = m.mv[list];
+                        if mv[0].abs() <= REFMVS_LIMIT && mv[1].abs() <= REFMVS_LIMIT {
+                            refs[y8 * w8 + x8] = r as i8;
+                            mvs[y8 * w8 + x8] = mv;
                         }
                     }
                 }
             }
         }
-        (refs, mvs)
     }
+    (refs, mvs)
+}
+
+/// The post-filters of the decode frame wrapup (7.14 to 7.17) on a frame
+/// whose tiles are decoded: `LrFrame`. (A frame whose rows were filtered
+/// as they were reconstructed brings it along.)
+pub(crate) fn filter_frame(f: &mut FrameCtx, threads: usize) -> FrameBuf {
+    if let Some(lr) = f.filtered.take() {
+        return lr;
+    }
+    if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
+        postfilter::loop_filter_threads(f, threads);
+    }
+    let cdef = postfilter::cdef(f, threads);
+    let up_cdef = match postfilter::upscale(f, &cdef) {
+        Some(u) => u,
+        None => cdef,
+    };
+    let up_cur_owned = postfilter::upscale(f, &f.cur);
+    let up_cur = up_cur_owned.as_ref().unwrap_or(&f.cur);
+    postfilter::loop_restoration(f, up_cur, up_cdef, threads)
+}
+
+/// What a frame's header says of it as a reference (7.20): a slot's
+/// contents before anything of the frame is decoded.
+pub(crate) fn ref_data(seq: &SequenceHeader, h: &FrameHeader) -> RefData {
+    let c = &seq.color;
+    RefData {
+        frame_type: h.frame_type,
+        upscaled_width: h.upscaled_width as usize,
+        frame_height: h.frame_height as usize,
+        render_width: h.render_width,
+        render_height: h.render_height,
+        mi_rows: h.mi_rows,
+        mi_cols: h.mi_cols,
+        bit_depth: c.bit_depth,
+        subsampling_x: c.subsampling_x,
+        subsampling_y: c.subsampling_y,
+        order_hint: h.order_hint,
+        saved_order_hints: h.order_hints,
+        syntax: Default::default(),
+        frame: Default::default(),
+    }
+}
+
+/// What a frame's parsing leaves for the frames that refer to it (7.19,
+/// 7.20), once its tiles are parsed and `frame_end_update_cdf()` is done:
+/// the saved motion vectors, segment map and CDFs. Takes the frame's
+/// segment map and CDFs.
+pub(crate) fn frame_syntax(f: &mut FrameCtx, ref_order_hints: &[u32; 8]) -> state::RefSyntax {
+    let (saved_ref_frames, saved_mvs) = motion_vector_storage(f, ref_order_hints);
+    if f.hdr.segmentation_enabled && !f.hdr.segmentation_update_map {
+        let prev = f.prev_segment_ids.clone();
+        f.segment_ids.copy_from_slice(&prev);
+    }
+    state::RefSyntax {
+        saved_ref_frames,
+        saved_mvs,
+        saved_segment_ids: std::mem::take(&mut f.segment_ids),
+        cdfs: (*f.cdfs).clone(),
+    }
+}
+
+/// The frame state of a frame whose header checked out
+/// (`Decoder::check_frame`): its CDFs and previous segment map from
+/// `primary_ref_frame` (`load_cdfs`, `load_previous_segment_ids`), its
+/// motion field (7.9), its arrays and sample buffers. `refs` are the
+/// reference slots as they were when the header was parsed; the ones the
+/// frame names must be parsed (`RefData::syntax`).
+pub(crate) fn build_frame(
+    refs: &[Option<Arc<RefData>>; 8],
+    seq: Arc<SequenceHeader>,
+    hdr: FrameHeader,
+) -> FrameCtx {
+    let c = &seq.color;
+    let mi_rows = hdr.mi_rows;
+    let mi_cols = hdr.mi_cols;
+    let cdfs = if hdr.primary_ref_frame == PRIMARY_REF_NONE {
+        CdfContext::new(hdr.base_q_idx)
+    } else {
+        let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
+        let r = refs[idx].as_ref().expect("checked with the header");
+        let mut c = Box::new(r.syntax().cdfs.clone());
+        c.clear_counts();
+        c
+    };
+    let ms = mi_cols + 32;
+    let n = (mi_rows + 32) * ms;
+    let mut prev_segment_ids = vec![0u8; n];
+    if hdr.primary_ref_frame != PRIMARY_REF_NONE && hdr.segmentation_enabled {
+        let idx = hdr.ref_frame_idx[hdr.primary_ref_frame];
+        if let Some(r) = &refs[idx]
+            && r.mi_rows == mi_rows
+            && r.mi_cols == mi_cols
+        {
+            prev_segment_ids.copy_from_slice(&r.syntax().saved_segment_ids);
+        }
+    }
+    let ssx = c.subsampling_x as usize;
+    let ssy = c.subsampling_y as usize;
+    let num_planes = c.num_planes;
+    let aw = (mi_cols * MI_SIZE + 127) & !127;
+    let ah = (mi_rows * MI_SIZE + 127) & !127;
+    let mut planes = vec![PlaneBuf::new(aw + 32, ah + 32, 0)];
+    for _ in 1..num_planes {
+        planes.push(PlaneBuf::new((aw >> ssx) + 32, (ah >> ssy) + 32, 0));
+    }
+    let cdef_stride = (mi_cols >> 4) + 2;
+    let screen_content = hdr.allow_screen_content_tools;
+    let mut lr: [LrPlane; 3] = Default::default();
+    for (plane, l) in lr.iter_mut().enumerate().take(num_planes) {
+        if hdr.frame_restoration_type[plane] != RESTORE_NONE {
+            let (sx, sy) = if plane == 0 {
+                (0, 0)
+            } else {
+                (ssx as u32, ssy as u32)
+            };
+            let unit_size = hdr.loop_restoration_size[plane];
+            l.unit_rows =
+                count_units_in_frame(unit_size, round2(hdr.frame_height as i32, sy) as usize);
+            l.unit_cols =
+                count_units_in_frame(unit_size, round2(hdr.upscaled_width as i32, sx) as usize);
+            let units = l.unit_rows * l.unit_cols;
+            l.lr_type = vec![RESTORE_NONE; units];
+            l.wiener = vec![[[0; 3]; 2]; units];
+            l.sgr_set = vec![0; units];
+            l.sgr_xqd = vec![[0; 2]; units];
+        }
+    }
+    let mut f = FrameCtx {
+        seq: seq.clone(),
+        hdr,
+        bit_depth: c.bit_depth,
+        ssx,
+        ssy,
+        num_planes,
+        mi_rows,
+        mi_cols,
+        ms,
+        mi: vec![Mi::default(); n].into(),
+        tx_types: vec![0; n],
+        lf_tx_sizes: std::array::from_fn(|_| vec![0; n].into()),
+        // Palettes need screen content tools.
+        palette_colors: if screen_content {
+            [vec![[0; 8]; n], vec![[0; 8]; n]]
+        } else {
+            [Vec::new(), Vec::new()]
+        },
+        segment_ids: vec![0; n],
+        prev_segment_ids: Arc::new(prev_segment_ids),
+        cdef_idx: vec![-1; cdef_stride * ((mi_rows >> 4) + 2)],
+        cdef_stride,
+        lr,
+        motion_field: Arc::new(Vec::new()),
+        cur: FrameBuf { planes },
+        refs: refs.clone(),
+        cdfs,
+        saved_cdfs: None,
+        mask: Box::new([0; 128 * 128]),
+        tile_num: 0,
+        tiles_ok: true,
+        filtered: None,
+    };
+    if f.hdr.use_ref_frame_mvs {
+        motion_field_estimation(&mut f);
+    } else {
+        f.motion_field = Arc::new(vec![Vec::new(); 8]);
+    }
+    f
 }
 
 /// The public colour description of a `color_config()`.

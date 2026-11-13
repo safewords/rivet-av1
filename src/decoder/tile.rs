@@ -7,6 +7,7 @@ use crate::Result;
 use crate::cdf::{CdfContext, palette_color_cdf};
 use crate::consts::*;
 use crate::decoder::FrameCtx;
+use crate::decoder::record::Pass;
 use crate::decoder::state::{Mi, Mv};
 use crate::symbol::{Coder, SymbolDecoder};
 use crate::tables::*;
@@ -164,6 +165,21 @@ pub(crate) struct TileDecoder<'a, 'b> {
     pub(crate) plane_tx_type: usize,
     /// Inter prediction's `preds`, kept between blocks.
     pub(crate) pred_bufs: [Vec<i32>; 2],
+    /// Which part of decoding a block this walker does (see `record.rs`).
+    pub(crate) pass: crate::decoder::record::Pass,
+    /// The superblock row's record: written by a parsing walk, replayed by
+    /// a reconstructing one.
+    pub(crate) rec: crate::decoder::record::RowRecord,
+    /// Where the replay of `rec` has got to.
+    pub(crate) cursor: crate::decoder::record::Cursor,
+    /// For a reconstructing walk of one superblock row whose planes hold
+    /// that row's samples alone: each plane's first row of the superblock
+    /// row, and the row of samples above it (a copy the walk was handed:
+    /// the row itself belongs to whoever works on the superblock row
+    /// above). Intra prediction's edge is all that reads above the
+    /// superblock row. Zero and empty otherwise: every row is in the plane.
+    pub(crate) band_top: [usize; 3],
+    pub(crate) above_line: [Vec<u16>; 3],
 }
 
 impl<'a, 'b> TileDecoder<'a, 'b> {
@@ -234,6 +250,11 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             residual: Box::new([0; 64 * 64]),
             plane_tx_type: 0,
             pred_bufs: [Vec::new(), Vec::new()],
+            pass: crate::decoder::record::Pass::Both,
+            rec: Default::default(),
+            cursor: Default::default(),
+            band_top: [0; 3],
+            above_line: Default::default(),
         }
     }
 
@@ -273,6 +294,24 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             }
             r += sb4;
         }
+        Ok(())
+    }
+
+    /// One superblock row of `decode_tile()`, parsed alone (see
+    /// `record.rs`): the superblocks of the row at `r` (in 4x4 units),
+    /// into the row's record. `begin_tile` comes before the first row.
+    pub(crate) fn parse_sb_row(&mut self, r: usize) -> Result<()> {
+        debug_assert!(self.pass == Pass::Parse);
+        self.rec.clear();
+        self.begin_sb_row();
+        let sb4 = self.sb_size4();
+        let mut c = self.mi_col_start;
+        while c < self.mi_col_end {
+            self.rec.begin_sb();
+            self.decode_sb(r, c)?;
+            c += sb4;
+        }
+        self.rec.finish();
         Ok(())
     }
 
@@ -329,7 +368,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         self.decode_partition(r, c, sb_size)
     }
 
-    fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb_size4: usize) {
+    pub(crate) fn clear_block_decoded_flags(&mut self, r: usize, c: usize, sb_size4: usize) {
         for plane in 0..self.f.num_planes {
             let sub_x = if plane > 0 { self.ssx() } else { 0 };
             let sub_y = if plane > 0 { self.ssy() } else { 0 };
@@ -772,7 +811,12 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 }
             }
         }
-        self.compute_prediction();
+        if self.pass == Pass::Parse {
+            // The prediction is the reconstructing walk's.
+            self.record_block();
+        } else {
+            self.compute_prediction();
+        }
         self.residual()?;
         for y in 0..bh4 {
             if r + y >= rows {

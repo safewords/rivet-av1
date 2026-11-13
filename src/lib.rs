@@ -19,6 +19,26 @@
 //! # Ok::<(), av1::Error>(())
 //! ```
 //!
+//! On several threads, with several frames decoded at once (their output
+//! a few units behind their input; `docs/threading.md`):
+//!
+//! ```no_run
+//! let mut dec = av1::Decoder::new();
+//! dec.set_threads(8);
+//! dec.set_frames_in_flight(8);
+//! # let temporal_units: Vec<Vec<u8>> = Vec::new();
+//! for tu in &temporal_units {
+//!     dec.queue(tu);
+//!     while let Some(frames) = dec.poll() {
+//!         for frame in frames? { /* in order */ }
+//!     }
+//! }
+//! while let Some(frames) = dec.wait() {
+//!     for frame in frames? { /* the last ones */ }
+//! }
+//! # Ok::<(), av1::Error>(())
+//! ```
+//!
 //! # Layout
 //!
 //! - `obu` — OBUs and the sequence header (5.3, 5.5).
@@ -26,7 +46,8 @@
 //! - `symbol`, `cdf` — the symbol decoder and the adaptive CDFs (8.2, 8.3).
 //! - [`decoder`] — tiles, mode info, motion vector prediction, prediction,
 //!   residual, the loop filter, CDEF, super-resolution, loop restoration,
-//!   film grain, reference management.
+//!   film grain, reference management; and the rows of a frame, and the
+//!   frames of a stream, as tasks for several threads.
 //! - `dsp` — inverse transforms.
 //! - [`ivf`] — the IVF container.
 //! - [`parallel`] — where the decoder's threads come from.

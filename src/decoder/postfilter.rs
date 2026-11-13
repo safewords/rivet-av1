@@ -15,10 +15,15 @@ use crate::tables::*;
 
 /// A plane's samples written by several threads at once, each to a part
 /// no other thread reads or writes (rows or columns, as the caller
-/// arranges).
+/// arranges). It reaches the samples the plane's `data` may write, and no
+/// others: all of them for a whole plane, the rows lent to a task for a
+/// plane whose rows are worked on in parallel.
 #[derive(Clone, Copy)]
 pub(crate) struct SharedPlane {
+    /// The first sample that may be written, sample `lo` of the plane.
     ptr: *mut u16,
+    lo: usize,
+    /// How many may be, from `ptr` on.
     len: usize,
     pub(crate) stride: usize,
 }
@@ -30,9 +35,12 @@ unsafe impl Sync for SharedPlane {}
 
 impl SharedPlane {
     pub(crate) fn new(p: &mut PlaneBuf) -> Self {
+        let (ptr, range) = p.data.as_mut_ptr_range();
         SharedPlane {
-            ptr: p.data.as_mut_ptr(),
-            len: p.data.len(),
+            // SAFETY: `range` lies inside the plane `ptr` points to.
+            ptr: unsafe { ptr.add(range.start) },
+            lo: range.start,
+            len: range.len(),
             stride: p.stride,
         }
     }
@@ -40,6 +48,7 @@ impl SharedPlane {
     #[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
     #[inline(always)]
     fn get(&self, i: usize) -> u16 {
+        let i = i.wrapping_sub(self.lo);
         assert!(i < self.len);
         // SAFETY: in bounds; no other thread writes this sample.
         unsafe { *self.ptr.add(i) }
@@ -48,6 +57,7 @@ impl SharedPlane {
     #[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "wasm32"))))]
     #[inline(always)]
     fn set(&self, i: usize, v: u16) {
+        let i = i.wrapping_sub(self.lo);
         assert!(i < self.len);
         // SAFETY: in bounds; no other thread reads or writes this sample.
         unsafe { *self.ptr.add(i) = v }
@@ -56,8 +66,8 @@ impl SharedPlane {
     /// Row `y`, `x0..x0 + n`, written from `src`.
     #[inline]
     pub(crate) fn write_row(&self, x0: usize, y: usize, src: &[u16]) {
-        let o = y * self.stride + x0;
-        assert!(o + src.len() <= self.len);
+        let o = (y * self.stride + x0).wrapping_sub(self.lo);
+        assert!(o <= self.len && src.len() <= self.len - o);
         // SAFETY: in bounds; no other thread reads or writes these samples.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(o), src.len()) }
     }
@@ -97,6 +107,29 @@ pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
                 } else {
                     (0..bands).for_each(band);
                 }
+            }
+            f.cur.planes[plane] = pb;
+        }
+    }
+}
+
+/// The loop filter process (7.14.1) for the mode info rows `r0..r1` of
+/// every plane, a superblock row: its vertical edges, then its horizontal
+/// edges (the one along its top among them). `f.cur` holds the rows the
+/// filters read and write: these, and the last rows of the superblock row
+/// above, whose vertical edges were filtered before.
+///
+/// That is the frame's filter as long as the rows are taken in order: an
+/// edge's filter touches only the samples of the two transform blocks it
+/// lies between, so the horizontal edges of a row leave the rows after it
+/// as their own vertical edges need them, unfiltered.
+pub(crate) fn loop_filter_rows(f: &mut FrameCtx, levels: &LfLevels, r0: usize, r1: usize) {
+    for plane in 0..f.num_planes {
+        if plane == 0 || f.hdr.loop_filter_level[1 + plane] != 0 {
+            let mut pb = std::mem::take(&mut f.cur.planes[plane]);
+            let sp = SharedPlane::new(&mut pb);
+            for pass in 0..2 {
+                filter_band(f, levels, sp, plane, pass, [r0, r1, 0, f.mi_cols]);
             }
             f.cur.planes[plane] = pb;
         }
@@ -335,7 +368,7 @@ fn filter_band(
     // alone says: a row of sizes is scanned for the ones that are, and only
     // those go through `edge_unit`.
     let ms = f.ms;
-    let txs = &f.lf_tx_sizes[plane][..];
+    let txs = &f.lf_tx_sizes[plane];
     let tx_units = &levels.tx_units[pass];
     let on_tx_edge = |at: usize, tx_sz: u8| at & tx_units[(tx_sz & 31) as usize] as usize == 0;
     let unit = |on: bool, pr: usize, pc: usize| {
@@ -439,12 +472,17 @@ impl FilterCtx<'_> {
             bit_depth: self.bit_depth,
         };
         let p = self.p;
-        // SAFETY: `ptr` is the plane's `len` samples. The kernel reads and
-        // writes the eight lanes within eight samples of the edge and
-        // nothing else, and those are this thread's: the pair lies in its
-        // band (see `filter_band`), which is whole rows in pass 0, where
-        // the kernel moves along the rows, and whole columns in pass 1,
-        // where it moves along the columns.
+        // The kernel checks `pos` against `len` for the samples after the
+        // edge; an edge before the samples `p` reaches is refused here.
+        assert!(pos >= p.lo);
+        let pos = pos - p.lo;
+        // SAFETY: `ptr` is `len` of the plane's samples (all of them, or
+        // the rows lent to this task). The kernel reads and writes the
+        // eight lanes within eight samples of the edge and nothing else,
+        // and those are this thread's: the pair lies in its band (see
+        // `filter_band`), which is whole rows in pass 0, where the kernel
+        // moves along the rows, and whole columns in pass 1, where it
+        // moves along the columns.
         unsafe { crate::dsp::lf::filter_pair(p.ptr, p.len, pos, p.stride, self.pass == 0, &pair) };
     }
 
@@ -494,12 +532,17 @@ impl FilterCtx<'_> {
     #[inline(always)]
     fn filter_unit(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
         let p = self.p;
-        // SAFETY: `ptr` is the plane's `len` samples. The filter reads and
-        // writes the unit's four lanes within seven samples of the edge
-        // and nothing else, and those are this thread's: the unit lies in
-        // its band, which is whole rows in pass 0, where the filter moves
-        // along the rows, and whole columns in pass 1, where it moves
-        // along the columns.
+        // The filter checks `pos` against `len` for the samples after the
+        // edge; an edge before the samples `p` reaches is refused here.
+        assert!(pos >= p.lo);
+        let pos = pos - p.lo;
+        // SAFETY: `ptr` is `len` of the plane's samples (all of them, or
+        // the rows lent to this task). The filter reads and writes the
+        // unit's four lanes within seven samples of the edge and nothing
+        // else, and those are this thread's: the unit lies in its band,
+        // which is whole rows in pass 0, where the filter moves along the
+        // rows, and whole columns in pass 1, where it moves along the
+        // columns.
         unsafe { crate::dsp::lf::filter_unit(p.ptr, p.len, pos, step, along, &self.params(e)) };
     }
 
@@ -727,25 +770,11 @@ fn filter_strength(
 /// own samples).
 pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
     let mut out = f.cur.clone();
-    let h = &f.hdr;
-    if h.coded_lossless || h.allow_intrabc || !f.seq.enable_cdef {
+    if !cdef_applies(f) {
         return out;
     }
     let planes: Vec<SharedPlane> = out.planes.iter_mut().map(SharedPlane::new).collect();
-    let band = |b: usize| {
-        let mut r = b * 16;
-        while r < ((b + 1) * 16).min(f.mi_rows) {
-            let mut c = 0;
-            while c < f.mi_cols {
-                let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
-                if idx >= 0 {
-                    cdef_block(f, &planes, r, c, idx as usize);
-                }
-                c += 2;
-            }
-            r += 2;
-        }
-    };
+    let band = |b: usize| cdef_rows(f, &planes, b * 16, ((b + 1) * 16).min(f.mi_rows));
     let bands = f.mi_rows.div_ceil(16);
     if threads > 1 {
         crate::decoder::parallel_map(bands, threads, band);
@@ -753,6 +782,30 @@ pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
         (0..bands).for_each(band);
     }
     out
+}
+
+/// Whether the frame has CDEF at all (5.9.19).
+pub(crate) fn cdef_applies(f: &FrameCtx) -> bool {
+    let h = &f.hdr;
+    !(h.coded_lossless || h.allow_intrabc || !f.seq.enable_cdef)
+}
+
+/// The CDEF process for the 8x8 blocks of the mode info rows `r0..r1`,
+/// into `out`, which starts as a copy of `CurrFrame`: each block writes
+/// its own samples and reads `CurrFrame`'s up to two beyond them.
+pub(crate) fn cdef_rows(f: &FrameCtx, out: &[SharedPlane], r0: usize, r1: usize) {
+    let mut r = r0;
+    while r < r1 {
+        let mut c = 0;
+        while c < f.mi_cols {
+            let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
+            if idx >= 0 {
+                cdef_block(f, out, r, c, idx as usize);
+            }
+            c += 2;
+        }
+        r += 2;
+    }
 }
 
 /// The CDEF block process (7.15.1) for a block whose parameters are set.
@@ -970,8 +1023,12 @@ pub(crate) fn cdef_filter_block(
     {
         // Every sample the filter reads is available: filter the plane
         // where it lies.
+        // The block with its border of 2, where it lies in the plane.
         let pos = y0 * src.stride + x0;
-        crate::dsp::cdef::filter_plane(&src.data, src.stride, pos, w, h, &taps(src.stride), res);
+        let lo = pos - (B * src.stride + B);
+        let hi = pos + (h + 1) * src.stride + w + B;
+        let around = &src.data[lo..hi];
+        crate::dsp::cdef::filter_plane(around, src.stride, pos - lo, w, h, &taps(src.stride), res);
         return;
     }
     // The block with a border of 2, unavailable samples marked.
@@ -1162,7 +1219,9 @@ pub(crate) fn lr_unit_cols(f: &FrameCtx, plane: usize, uc: usize) -> (i32, i32) 
     (x0, x1)
 }
 
-fn restore_stripe(
+/// Loop restoration of stripe `s` of a plane into `out`, which starts as
+/// a copy of `cdef`: each unit's rectangle of the stripe.
+pub(crate) fn restore_stripe(
     f: &FrameCtx,
     cur: &FrameBuf,
     cdef: &FrameBuf,
@@ -1677,9 +1736,9 @@ mod tests {
             mi_rows,
             mi_cols,
             ms,
-            mi,
+            mi: mi.into(),
             tx_types: Vec::new(),
-            lf_tx_sizes,
+            lf_tx_sizes: lf_tx_sizes.map(Into::into),
             palette_colors: [Vec::new(), Vec::new()],
             segment_ids: Vec::new(),
             prev_segment_ids: Arc::new(Vec::new()),
@@ -1694,6 +1753,7 @@ mod tests {
             mask: Box::new([0; 128 * 128]),
             tile_num: 0,
             tiles_ok: true,
+            filtered: None,
         }
     }
 

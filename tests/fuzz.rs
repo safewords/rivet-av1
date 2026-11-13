@@ -17,10 +17,39 @@ fn streams() -> Vec<Vec<Vec<u8>>> {
     v.iter().map(|p| common::packets(p)).collect()
 }
 
-fn decode_all(packets: &[Vec<u8>]) {
+/// A decoder for malformed input: both coefficient readers held to each
+/// other, a frame size limit, and `AV1_DECODE_THREADS` threads if that is
+/// set (the threaded decoder must take the same input as calmly).
+fn decoder() -> av1::Decoder {
     let mut d = av1::Decoder::new();
     d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
     d.set_max_pixels(1 << 20);
+    if let Some(n) = std::env::var("AV1_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        d.set_threads(n);
+    }
+    d
+}
+
+fn decode_all(packets: &[Vec<u8>]) {
+    let mut d = decoder();
+    // `AV1_FRAMES_IN_FLIGHT`: the units are queued, with that many frames
+    // in flight, and their results taken as they come.
+    let flight: usize = std::env::var("AV1_FRAMES_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if flight > 1 {
+        d.set_frames_in_flight(flight);
+        for p in packets {
+            d.queue(p);
+            while d.poll().is_some() {}
+        }
+        while d.wait().is_some() {}
+        return;
+    }
     for p in packets {
         let _ = d.decode(p);
     }
@@ -31,15 +60,11 @@ proptest! {
 
     #[test]
     fn arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
-        let mut d = av1::Decoder::new();
-        d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
-        d.set_max_pixels(1 << 20);
+        let mut d = decoder();
         let _ = d.decode(&data);
         // Also as the second frame of a stream, after a valid key frame.
         let s = &streams()[0];
-        let mut d = av1::Decoder::new();
-        d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
-        d.set_max_pixels(1 << 20);
+        let mut d = decoder();
         let _ = d.decode(&s[0]);
         let _ = d.decode(&data);
     }

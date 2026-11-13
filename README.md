@@ -65,9 +65,7 @@ Not there yet:
 
 - **Large-scale tile decoding** (tile list OBUs, 7.3). Optional for
   conformance; reported as `Error::Unsupported`.
-- **Frame threading.** Frames are decoded one after another (tiles and
-  post-filters in parallel within each, see [Speed](#speed)); no frame-buffer
-  pool.
+- **A frame-buffer pool.** Every frame allocates its buffers.
 - **Error recovery.** A corrupt frame returns `Error::Bitstream`; there is
   no concealment, so decoding should resume at the next key frame.
   Malformed input has not made it panic under the property tests below,
@@ -79,12 +77,25 @@ Not there yet:
 
 ### Speed
 
-`Decoder::set_threads(n)` decodes the tiles of a tile group on up to `n`
-threads (each worker into a frame state of its own, whose tile region is
-copied back: the tiles of a frame read nothing another tile writes), runs
-the loop filter's vertical-edge pass in bands of rows and its
-horizontal-edge pass in bands of columns, and CDEF and loop restoration in
-bands of rows. The hottest kernels have SIMD versions chosen at run time —
+`Decoder::set_threads(n)` decodes on up to `n` threads, and the frames
+are the same whatever `n` ([docs/threading.md](docs/threading.md) derives
+what may run at the same time from the specification, and says how it is
+kept safe):
+
+- A frame of one tile, what video sites serve: one thread parses the
+  tile, the others reconstruct its superblock rows behind the parsing
+  and deblock, CDEF and restore them behind the reconstruction.
+- A frame of several tiles: the tiles in parallel (each worker into a
+  frame state of its own, whose tile region is copied back), then each
+  post-filter over the frame in bands.
+- `Decoder::set_frames_in_flight(n)` with `queue`, `poll` and `wait`:
+  up to `n` frames decoded at once, each waiting for the frames it
+  refers to, their output a few units behind their input. A one-tile
+  stream needs this to use more than two or three threads (a frame's
+  parsing is one thread's); every unit's frames or error are those of
+  decoding it in place.
+
+The hottest kernels have SIMD versions chosen at run time —
 AVX2 on x86-64, NEON on aarch64 — each tested bit-exact against its scalar
 version: the CDEF block filter, the 8-tap interpolation filters, the
 inverse transforms (eight rows or columns at a time; the 64-bit scalar
@@ -99,8 +110,9 @@ is no `std::thread::spawn` on that target — a thread is another instance of
 the module on shared memory, which only the page can create — so an
 embedder that has threads registers them once with
 `av1::parallel::set_runner` (a [`Runner`](src/parallel.rs): typically a
-pool of Workers it keeps), and the decoder runs its tiles and post-filter
-bands through it instead of starting scoped threads.
+pool of Workers it keeps), and the decoder runs its parallel work through
+it instead of on threads of its own (`Runner::start`, optional, is what
+frames in flight need of it).
 
 Throughput (`examples/av1_decbench.rs`, best of three, on the machine this was
 written on — an AMD Ryzen 9 9950X), on 30-frame streams of camera
@@ -409,9 +421,13 @@ subpixel filters that take a block from one window of the reference and
 multiply only by a filter's non-zero taps, an arithmetic decoder on a wide
 bit window with branch-free reads of small CDFs, a padded level map for
 coefficient contexts, a transform compiled per size and bounded by the end
-of block); each was
+of block; for the threads: entropy decoding apart from reconstruction,
+superblock rows in a wavefront, post-filters following reconstruction by
+rows, several frames decoded at once with the output delayed); each was
 written from this crate's own specification-derived code and held to it
-bit for bit, and what that document says about rav1d's internals comes from
+bit for bit (the threading from the dependencies the specification's
+processes have on each other, [`docs/threading.md`](docs/threading.md)),
+and what that document says about rav1d's internals comes from
 profiles and general knowledge, not from its code. The
 specification's tables (default CDFs, scans, quantiser lookups and
 matrices, filter taps) are data and were transcribed by

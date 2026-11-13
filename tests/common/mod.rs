@@ -148,13 +148,46 @@ pub fn run_vector(path: &Path) -> Outcome {
     {
         dec.set_threads(n);
     }
+    // AV1_FRAMES_IN_FLIGHT decodes with that many frames in flight: units
+    // are queued and their results waited for a few units later.
+    let flight: usize = std::env::var("AV1_FRAMES_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    dec.set_frames_in_flight(flight);
     let mut frames = 0usize;
     let mut matched = 0usize;
     let mut failure = None;
-    for (i, p) in packets(path).iter().enumerate() {
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dec.decode(p)));
-        let out = match out {
-            Ok(Ok(v)) => v.into_iter().collect::<Vec<_>>(),
+    let packets = packets(path);
+    // With frames in flight a unit's frames come out when the units after
+    // it have been queued, or at the end.
+    let steps = if flight > 1 {
+        packets.len() + flight
+    } else {
+        packets.len()
+    };
+    for i in 0..steps {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if flight <= 1 {
+                return dec.decode(&packets[i]).map(|f| f.into_iter().collect());
+            }
+            if let Some(p) = packets.get(i) {
+                dec.queue(p);
+            }
+            // At the end, and when units pile up, the oldest is waited
+            // for; otherwise it is taken if it is ready.
+            let ready = if i + 1 >= packets.len() || dec.queued() > flight {
+                dec.wait()
+            } else {
+                dec.poll()
+            };
+            // (`decode` gives a unit's last frame: so here.)
+            ready.map_or(Ok(Vec::new()), |r| {
+                r.map(|mut f| f.pop().into_iter().collect())
+            })
+        }));
+        let out: Vec<av1::Frame> = match out {
+            Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 failure = Some(format!("packet {i}: {e}"));
                 break;
