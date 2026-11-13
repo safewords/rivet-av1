@@ -9,7 +9,8 @@ cd "$S/nt/$label" || exit 1
 python3 -I - <<'PY'
 p='src/decoder/residual.rs'
 s=open(p).read()
-a="let eob = self.coeffs(plane, start_x, start_y, tx_sz);"
+a="let (eob, dequantised) = self.coeffs_dequantised(plane, start_x, start_y, tx_sz);"
+if a not in s: a="let eob = self.coeffs(plane, start_x, start_y, tx_sz);"
 assert a in s
 s=s.replace(a,"let t0 = std::time::Instant::now();\n            "+a+"\n            crate::TIMERS[0].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);\n            let t0 = std::time::Instant::now();",1)
 i=s.index("crate::TIMERS[0]"); j=s.index("\n            }\n", i)+len("\n            }\n")

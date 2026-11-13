@@ -333,6 +333,11 @@ step before and after from one run.
 | | mandelbrot 720p | 59.0 (0.87x) | 128 (0.84x) | 143 |
 | | mandelbrot 720p 10-bit | 67.2 (0.85x) | 157 (1.84x) | 189 |
 | | mandelbrot 1080p | 27.4 (0.85x) | 64.3 (0.83x) | 76.0 |
+| 14. a coefficient is dequantised where its sign is read | fixture 320x180 | 801 (0.64x) | 1179 (0.65x) | 1401 |
+| | testsrc2 720p | 152 (0.81x) | 244 (0.77x) | 282 |
+| | mandelbrot 720p | 60.4 (0.88x) | 133 (0.87x) | 157 |
+| | mandelbrot 720p 10-bit | 72.8 (0.91x) | 174 (2.02x) | 202 |
+| | mandelbrot 1080p | 28.9 (0.85x) | 68.4 (0.87x) | 80.9 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -345,6 +350,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 | 11 | 1.46 | 1.45 | 1.06 | 1.45 | 2.04 | 0.84 |
 | 12 | 1.44 | 1.49 | 1.05 | 1.19 | 2.00 | 0.83 |
 | 13 | 1.44 | 1.48 | 1.05 | 0.90 | 1.83 | 0.66 |
+| 14 | 1.49 | 1.57 | 1.09 | 0.61 | 1.48 | 0.46 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -402,3 +408,9 @@ Tests: the bounded transform against the scalar reference for every size and typ
 The part, from one run: 1.20 to 0.90 ms in wasm simd, 1.98 to 1.83 in baseline, 0.84 to 0.66 natively; mandelbrot 720p 123.1 to 128.3 fps simd, natively 137.5 to 142.7; testsrc2 720p 230 to 241 simd. The part is below the 1.1 ms measured for rav1d's in the first round.
 
 Two things were written for this step, verified, measured and left out (`tools/wasm-perf/tried/`). Transforms that know how many of their inputs are zero (the network run on a copy whose zero entries the compiler can see, so that what they feed folds away, with the network's loops expanded so that it can): a 32-point DCT of 8 inputs takes 80 ns for eight lanes against 231, but on these streams the reconstruction got 3 % slower, their blocks being mostly full, and the crate took five times as long to compile. And a 32-bit single-lane path for the baseline build, which has only the scalar transforms: no faster than the 64-bit one (6.4 against 6.1 us for a 32x32 block), since what the baseline build lacks is lanes, not narrower arithmetic.
+
+### 14. A coefficient is dequantised where its sign is read
+
+After step 13 dequantisation was the scan walked once more: 124 000 positions a frame loaded, dequantised and stored for the 34 000 that hold something, 0.27 ms of the simd frame. The coefficient reader's sign pass already visits exactly those 34 000, each with its position and its value in hand as it completes it. It now dequantises each there (`Dequantiser::put`: the same arithmetic as step 13's, one function shared by both) and keeps count of the rows and columns they reach, and `coeffs_decode` hands that to `reconstruct_decode`, which then has only the transform and the sum left to do. A block read by the reference reader alone (`CoefficientReader::Reference`) is dequantised by the walk of step 13, as before. The test of the dequantiser now builds `Dequant` both ways and requires the same array and the same reach (the position split by the wrong dimension, planted, fails it; the DC coefficient dequantised as an AC one fails the committed vectors).
+
+This moves work from one column of the table of parts to the other, so the two are to be read together: from one run, 1.41 + 0.87 = 2.28 to 1.49 + 0.61 = 2.10 ms in wasm simd, 1.47 + 1.79 to 1.57 + 1.48 in baseline, 1.04 + 0.65 = 1.69 to 1.09 + 0.46 = 1.54 natively. Mandelbrot 720p 129.4 to 132.5 fps simd, 59.7 to 60.4 baseline, 153.3 to 157.0 natively; testsrc2 720p 239 to 244 simd, 276 to 282 natively.

@@ -18,7 +18,8 @@
 //! it; the levels' `coeff_base` symbols kept in a padded byte map so that
 //! a context is a sum without edge tests; the level symbols read without a
 //! branch on what they are; the signs read for the coefficients that have
-//! one, found by a bit each. Decoding uses it.
+//! one, found by a bit each, and each of those dequantised there and
+//! then. Decoding uses it.
 //!
 //! They must never differ, and a test holds them to that:
 //! `CoefficientReader::Checked` runs both on every transform block from
@@ -183,12 +184,12 @@ impl TileDecoder<'_, '_> {
             }
         }
         if !self.b.skip {
-            let eob = self.coeffs(plane, start_x, start_y, tx_sz);
+            let (eob, dequantised) = self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
             if eob > 0 {
                 if self.sd.encoding() {
                     self.reconstruct(plane, start_x, start_y, tx_sz);
                 } else {
-                    self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob);
+                    self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob, dequantised);
                 }
             }
         }
@@ -399,8 +400,21 @@ impl TileDecoder<'_, '_> {
         start_y: usize,
         tx_sz: usize,
     ) -> usize {
+        self.coeffs_dequantised(plane, start_x, start_y, tx_sz).0
+    }
+
+    /// [`Self::coeffs`], and, when the decode-only reader read the block
+    /// and dequantised it into `Dequant` as it went, the rows and columns
+    /// its coefficients reach (see [`Dequantiser::scan`]).
+    fn coeffs_dequantised(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> (usize, Option<(usize, usize)>) {
         if self.sd.encoding() || self.coeff_reader == CoefficientReader::Reference {
-            return self.coeffs_shared(plane, start_x, start_y, tx_sz);
+            return (self.coeffs_shared(plane, start_x, start_y, tx_sz), None);
         }
         if self.coeff_reader == CoefficientReader::Fast {
             return self.coeffs_decode(plane, start_x, start_y, tx_sz);
@@ -435,7 +449,7 @@ impl TileDecoder<'_, '_> {
         self.above_dc_ctx[plane][x4..x4 + w4].copy_from_slice(&ctx0[1]);
         self.left_level_ctx[plane][y4..y4 + h4].copy_from_slice(&ctx0[2]);
         self.left_dc_ctx[plane][y4..y4 + h4].copy_from_slice(&ctx0[3]);
-        let eob = self.coeffs_decode(plane, start_x, start_y, tx_sz);
+        let (eob, dequantised) = self.coeffs_decode(plane, start_x, start_y, tx_sz);
         let same = eob == eob_ref
             && self.quant == quant_ref
             && *self.sd.dec() == sd_ref
@@ -448,7 +462,7 @@ impl TileDecoder<'_, '_> {
              block at ({start_x}, {start_y}), transform size {tx_sz}, eob {eob} against {eob_ref}"
         );
         self.sd.rejoin(sd_reference);
-        eob
+        (eob, dequantised)
     }
 
     /// The decode-only reader (see the module documentation): `coeffs()`
@@ -459,7 +473,7 @@ impl TileDecoder<'_, '_> {
         start_x: usize,
         start_y: usize,
         tx_sz: usize,
-    ) -> usize {
+    ) -> (usize, Option<(usize, usize)>) {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
         let w4 = TX_WIDTH[tx_sz] >> 2;
@@ -475,6 +489,7 @@ impl TileDecoder<'_, '_> {
         let mut eob = 0usize;
         let mut cul_level: u32 = 0;
         let mut dc_category = 0u8;
+        let mut dequantised = None;
         let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
         let all_zero = self
             .sd
@@ -496,6 +511,11 @@ impl TileDecoder<'_, '_> {
             // The context of the DC sign looks at the neighbouring blocks,
             // not at this one: taken before the decoder is borrowed.
             let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+            // What `reconstruct_decode` dequantises itself, this dequantises
+            // as it reads the signs: the coefficients that are not zero are
+            // in hand there, one at a time.
+            let dequantiser = (!self.b.lossless && self.f.bit_depth <= 10)
+                .then(|| self.dequantiser(plane, tx_sz));
             let d = self.sd.dec();
             let cdf = &mut *self.cdf;
             let eob_pt = 1 + match eob_multisize {
@@ -580,7 +600,12 @@ impl TileDecoder<'_, '_> {
             let LevelPass { mut d, quant, .. } = pass;
             // The signs and the Golomb parts, in scan order: only a
             // coefficient that is not zero has either, and `Quant` holds
-            // its level.
+            // its level. Each is dequantised as it is completed.
+            let dq = &mut self.dequant;
+            if let Some(dequantiser) = &dequantiser {
+                dequantiser.clear(dq);
+            }
+            let mut reach = (1, 1);
             if nonzero[0] & 1 != 0 {
                 let sign = d.read_symbol_fixed(&mut cdf.dc_sign[ptype][dc_ctx]);
                 let level = level_golomb(&mut d, quant[0] as u32);
@@ -592,6 +617,9 @@ impl TileDecoder<'_, '_> {
                 } else {
                     level as i32
                 };
+                if let Some(dequantiser) = &dequantiser {
+                    dequantiser.put(dq, 0, quant[0], &mut reach);
+                }
                 nonzero[0] &= !1;
             }
             for (i, word) in nonzero[..=(eob - 1) >> 6].iter().enumerate() {
@@ -608,8 +636,12 @@ impl TileDecoder<'_, '_> {
                     } else {
                         level as i32
                     };
+                    if let Some(dequantiser) = &dequantiser {
+                        dequantiser.put(dq, pos, quant[pos], &mut reach);
+                    }
                 }
             }
+            dequantised = dequantiser.is_some().then_some(reach);
             *self.sd.dec() = d;
             cul_level = cul_level.min(63);
         }
@@ -617,7 +649,7 @@ impl TileDecoder<'_, '_> {
         self.above_dc_ctx[plane][x4..x4 + w4].fill(dc_category);
         self.left_level_ctx[plane][y4..y4 + h4].fill(cul_level as u8);
         self.left_dc_ctx[plane][y4..y4 + h4].fill(dc_category);
-        eob
+        (eob, dequantised)
     }
 
     /// The tile walker's reader, shared with the encoder: the reference
@@ -1114,12 +1146,48 @@ impl TileDecoder<'_, '_> {
         }
     }
 
+    /// The dequantisation of the current block's plane `plane`, whose
+    /// transform type `plane_tx_type` holds.
+    fn dequantiser(&self, plane: usize, tx_sz: usize) -> Dequantiser<'static> {
+        let bd = self.f.bit_depth;
+        let t = self.plane_tx_type;
+        let qindex = self.qindex();
+        let (dc_delta, ac_delta) = match plane {
+            0 => (self.f.hdr.delta_q_y_dc, 0),
+            1 => (self.f.hdr.delta_q_u_dc, self.f.hdr.delta_q_u_ac),
+            _ => (self.f.hdr.delta_q_v_dc, self.f.hdr.delta_q_v_ac),
+        };
+        let bdi = ((bd - 8) >> 1) as usize;
+        let qm_level = if self.f.hdr.using_qmatrix {
+            self.f.hdr.seg_qm_level[plane][self.b.segment_id]
+        } else {
+            15
+        };
+        Dequantiser {
+            dc_q: DC_QLOOKUP[bdi][clip3(0, 255, qindex + dc_delta) as usize] as u32,
+            ac_q: AC_QLOOKUP[bdi][clip3(0, 255, qindex + ac_delta) as usize] as u32,
+            qm: (self.f.hdr.using_qmatrix && t < IDTX && qm_level < 15).then(|| {
+                &QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz]..]
+            }),
+            shift: match tx_sz {
+                TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 1,
+                TX_64X64 | TX_32X64 | TX_64X32 => 2,
+                _ => 0,
+            },
+            lim: 1i32 << (7 + bd),
+            tw: TX_WIDTH[tx_sz].min(32),
+            th: TX_HEIGHT[tx_sz].min(32),
+        }
+    }
+
     /// The reconstruct process (7.12.3) for a decoder, which knows `eob`:
     /// what [`Self::reconstruct`] (the reference, which the encoder runs)
     /// does, without the work for coefficients known to be zero. Only the
     /// first `eob` positions of the scan can hold one, so only they are
-    /// dequantised, and the rows and columns they reach are all the
-    /// inverse transform is given to transform.
+    /// dequantised (by the decode-only coefficient reader as it read
+    /// them, which `dequantised` then says, or here), and the rows and
+    /// columns they reach are all the inverse transform is given to
+    /// transform.
     #[inline(never)]
     pub(crate) fn reconstruct_decode(
         &mut self,
@@ -1128,6 +1196,7 @@ impl TileDecoder<'_, '_> {
         y: usize,
         tx_sz: usize,
         eob: usize,
+        dequantised: Option<(usize, usize)>,
     ) {
         let bd = self.f.bit_depth;
         if self.b.lossless || bd > 10 {
@@ -1135,15 +1204,8 @@ impl TileDecoder<'_, '_> {
             // intermediates need 64 bits: the reference, as it is.
             return self.reconstruct(plane, x, y, tx_sz);
         }
-        let dq_shift: u32 = match tx_sz {
-            TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 1,
-            TX_64X64 | TX_32X64 | TX_64X32 => 2,
-            _ => 0,
-        };
         let w = 1usize << TX_WIDTH_LOG2[tx_sz];
         let h = 1usize << TX_HEIGHT_LOG2[tx_sz];
-        let tw = w.min(32);
-        let th = h.min(32);
         let t = self.plane_tx_type;
         let flip_ud = matches!(
             t,
@@ -1153,36 +1215,15 @@ impl TileDecoder<'_, '_> {
             t,
             DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST
         );
-        let qindex = self.qindex();
-        let (dc_delta, ac_delta) = match plane {
-            0 => (self.f.hdr.delta_q_y_dc, 0),
-            1 => (self.f.hdr.delta_q_u_dc, self.f.hdr.delta_q_u_ac),
-            _ => (self.f.hdr.delta_q_v_dc, self.f.hdr.delta_q_v_ac),
+        // `Dequant`, unless the coefficient reader left it.
+        let (rows, cols) = match dequantised {
+            Some(reach) => reach,
+            None => {
+                let scan = &scan_for(tx_sz, t)[..eob];
+                self.dequantiser(plane, tx_sz)
+                    .scan(&self.quant, scan, &mut self.dequant)
+            }
         };
-        let bdi = ((bd - 8) >> 1) as usize;
-        let dc_q = DC_QLOOKUP[bdi][clip3(0, 255, qindex + dc_delta) as usize] as u32;
-        let ac_q = AC_QLOOKUP[bdi][clip3(0, 255, qindex + ac_delta) as usize] as u32;
-        let qm_level = if self.f.hdr.using_qmatrix {
-            self.f.hdr.seg_qm_level[plane][self.b.segment_id]
-        } else {
-            15
-        };
-        let qm = if self.f.hdr.using_qmatrix && t < IDTX && qm_level < 15 {
-            Some(&QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz]..])
-        } else {
-            None
-        };
-        let dequantiser = Dequantiser {
-            dc_q,
-            ac_q,
-            qm,
-            shift: dq_shift,
-            lim: 1i32 << (7 + bd),
-            tw,
-            th,
-        };
-        let scan = &scan_for(tx_sz, t)[..eob];
-        let (rows, cols) = dequantiser.scan(&self.quant, scan, &mut self.dequant);
         let maxv = (1i32 << bd) - 1;
         let cur = &mut self.f.cur.planes[plane];
         let stride = cur.stride;
@@ -1241,11 +1282,44 @@ struct Dequantiser<'a> {
 }
 
 impl Dequantiser<'_> {
-    /// `Dequant` (rows of 64) from the coefficients `quant` holds at the
-    /// positions of `scan`, the only ones that can be other than zero:
-    /// zeros where the inverse transform may read (it takes whole groups
-    /// of eight rows), then each of those coefficients. Returns how many
-    /// rows and columns the non-zero ones reach (at least 1 each).
+    /// Zeros in `Dequant` (rows of 64) where the block can hold a
+    /// coefficient and where the inverse transform may read, which takes
+    /// whole groups of eight rows.
+    fn clear(&self, dq: &mut [i32; 64 * 64]) {
+        for row in dq.as_chunks_mut::<64>().0[..self.th.next_multiple_of(8)].iter_mut() {
+            row[..self.tw].fill(0);
+        }
+    }
+
+    /// The dequantised value of the coefficient `coef` at position `pos`
+    /// of the block.
+    #[inline(always)]
+    fn value(&self, pos: usize, coef: i32) -> i32 {
+        use core::hint::select_unpredictable as select;
+        let q = select(pos == 0, self.dc_q, self.ac_q);
+        let q = match self.qm {
+            Some(m) => (q * m[pos] as u32 + 16) >> 5,
+            None => q,
+        };
+        // `( Abs( coef * q ) & 0xFFFFFF ) / dqDenom` with the sign back:
+        // the low 24 bits of the product are those of its low 32.
+        let mag = ((coef.unsigned_abs().wrapping_mul(q) & 0xFFFFFF) >> self.shift) as i32;
+        select(coef < 0, -mag, mag).clamp(-self.lim, self.lim - 1)
+    }
+
+    /// Dequantises one coefficient into `Dequant` and widens `reach`, the
+    /// rows and columns the block's coefficients reach, to hold it.
+    #[inline(always)]
+    fn put(&self, dq: &mut [i32; 64 * 64], pos: usize, coef: i32, reach: &mut (usize, usize)) {
+        let (i, j) = (pos >> self.tw.trailing_zeros(), pos & (self.tw - 1));
+        dq[i * 64 + j] = self.value(pos, coef);
+        *reach = (reach.0.max(i + 1), reach.1.max(j + 1));
+    }
+
+    /// `Dequant` from the coefficients `quant` holds at the positions of
+    /// `scan`, the only ones that can be other than zero. Returns how many
+    /// rows and columns the non-zero ones reach (at least 1 each). For a
+    /// block the decode-only reader did not dequantise as it read it.
     ///
     /// Every coefficient of the scan is dequantised, zero or not, and the
     /// rows and columns are found by selects: whether a coefficient is
@@ -1253,27 +1327,15 @@ impl Dequantiser<'_> {
     #[inline(never)]
     fn scan(&self, quant: &[i32; 1024], scan: &[u16], dq: &mut [i32; 64 * 64]) -> (usize, usize) {
         use core::hint::select_unpredictable as select;
-        let (tw, lim) = (self.tw, self.lim);
+        let tw = self.tw;
         let bwl = tw.trailing_zeros();
-        for row in dq.as_chunks_mut::<64>().0[..self.th.next_multiple_of(8)].iter_mut() {
-            row[..tw].fill(0);
-        }
+        self.clear(dq);
         let (mut rows, mut cols) = (1, 1);
         for &pos in scan {
             let pos = pos as usize;
             let coef = quant[pos];
             let (i, j) = (pos >> bwl, pos & (tw - 1));
-            let q = select(pos == 0, self.dc_q, self.ac_q);
-            let q = match self.qm {
-                Some(m) => (q * m[pos] as u32 + 16) >> 5,
-                None => q,
-            };
-            // `( Abs( coef * q ) & 0xFFFFFF ) / dqDenom` with the sign
-            // back: the low 24 bits of the product are those of its low
-            // 32.
-            let mag = ((coef.unsigned_abs().wrapping_mul(q) & 0xFFFFFF) >> self.shift) as i32;
-            let v = select(coef < 0, -mag, mag);
-            dq[i * 64 + j] = v.clamp(-lim, lim - 1);
+            dq[i * 64 + j] = self.value(pos, coef);
             rows = rows.max(select(coef != 0, i + 1, 0));
             cols = cols.max(select(coef != 0, j + 1, 0));
         }
@@ -1761,6 +1823,21 @@ mod tests {
                     for i in th..th.next_multiple_of(8) {
                         assert!(dq[i * 64..i * 64 + tw].iter().all(|&v| v == 0));
                     }
+                    // The same `Dequant` a coefficient at a time, as the
+                    // coefficient reader does it for those not zero.
+                    let mut one = Box::new([0x0bad_cafei32; 64 * 64]);
+                    let mut reach = (1, 1);
+                    d.clear(&mut one);
+                    for &pos in &scan[..eob] {
+                        if quant[pos as usize] != 0 {
+                            d.put(&mut one, pos as usize, quant[pos as usize], &mut reach);
+                        }
+                    }
+                    for i in 0..th.next_multiple_of(8) {
+                        let row = i * 64..i * 64 + tw;
+                        assert_eq!(one[row.clone()], dq[row], "size {tx_sz} row {i}");
+                    }
+                    assert_eq!(reach, (rows, cols), "size {tx_sz} type {t} case {case}");
                 }
             }
         }
