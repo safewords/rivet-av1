@@ -43,6 +43,9 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
   kernels a wasm build takes, held to their references in V8 (the `dsp::`
   and `postfilter` tests by default; nothing that starts a thread runs
   there).
+- `steprow.py <title> <label> [<previous label>]`, `final-table.py <before>
+  <after>`: the rows of the step tables and the fourteen-stream table of
+  the loop filter's section, rav1d beside the builds in the same run.
 - `lf-timing.diff`: a clock around the loop filter, for the same figure
   natively. Apply it to the tree, build `decode_ivf`, revert it, and run
   with `AV1_LF_TIME=1`: the last `LFTIME` line is the total.

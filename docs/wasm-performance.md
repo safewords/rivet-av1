@@ -292,19 +292,25 @@ filter.
 The loop filter's own time is in milliseconds a shown frame of mandelbrot
 720p: in wasm, its share of V8's profile times the frame time of an
 unprofiled run (`tools/wasm-perf/lfprof.sh`); natively, a clock around the
-call (`tools/wasm-perf/lf-timing.diff`, not part of the crate), median of 5
-runs with the builds taking turns.
+call (`tools/wasm-perf/lf-timing.diff`, not part of the crate). This table
+is one run of all the builds after step 11, taking turns (median of 5 in
+wasm, of 7 natively); the figures in each step's text are from that step's
+own run against the step before, and differ from these by what two runs on
+this machine differ by.
 
 | step | loop filter, ms a frame: wasm simd | wasm baseline | native |
 |---|---|---|---|
-| before (`829b1e1`) | 1.53 | 2.37 | 1.25 |
-| 8. edge decisions | 1.45 | 2.22 | 1.09 |
-| 9. in the plane, eight 16-bit lanes (SIMD128, NEON) | 0.34 | 2.22 | 0.29 |
-| 10. the baseline build a sample at a time in the plane | 0.33 | 0.83 | (as step 9) |
-| 11. the walk scans the transform sizes | 0.27 | 0.77 | 0.22 |
+| before (`829b1e1`) | 1.44 | 2.30 | 1.26 |
+| 8. edge decisions | 1.31 | 2.19 | 1.10 |
+| 9. in the plane, eight 16-bit lanes (SIMD128, NEON) | 0.34 | (as step 8) | 0.26 |
+| 10. the baseline build a sample at a time in the plane | (as step 9) | 0.77 | (as step 9) |
+| 11. the walk scans the transform sizes | 0.32 | 0.77 | 0.23 |
+
+rav1d's loop filter in the simd build was 0.59 ms a frame in the profile
+above.
 
 The state after each step, fps and the ratio to rav1d's (median of 7, load
-average about 10):
+average 5 to 12, the builds taking turns from step 9 on):
 
 | step | clip | baseline | simd | native |
 |---|---|---|---|---|
@@ -328,6 +334,11 @@ average about 10):
 |  | mandelbrot 720p | 53.3 (0.82x) | 108 (0.74x) | 136 |
 |  | mandelbrot 720p 10-bit | 63.8 (0.85x) | 139 (1.72x) | 167 |
 |  | mandelbrot 1080p | 26.2 (0.81x) | 57.6 (0.76x) | 69.3 |
+| 11. the walk scans the transform sizes for the units on a transform edge | fixture 320x180 | 885 (0.77x) | 1404 (0.82x) | 1685 |
+|  | testsrc2 720p | 124 (0.71x) | 189 (0.63x) | 216 |
+|  | mandelbrot 720p | 53.0 (0.82x) | 107 (0.74x) | 129 |
+|  | mandelbrot 720p 10-bit | 63.7 (0.85x) | 139 (1.71x) | 164 |
+|  | mandelbrot 1080p | 26.1 (0.81x) | 57.1 (0.76x) | 68.5 |
 
 ### 8. The loop filter's edge decisions: the transform size first, levels from a table
 
@@ -345,5 +356,83 @@ A module without `simd128` has no vector lanes, so the lane filter was the worst
 
 ### 11. The walk scans a row of transform sizes for the units on a transform edge
 
-With the kernels in, the walk was half of the loop filter natively (0.12 of 0.25 ms a frame, measured with the kernel call taken out) and the largest single function of it in the simd build's profile. Seven units in eight are not on a transform edge, and `edge_unit` said so only after indexing the transform sizes through their vector, looking the width up in a table of machine words, and being called twice a pair. `filter_band` now takes the row of sizes as a slice (two rows for the vertical edges, whose pairs are one unit above the other) and tests each byte against a 32-entry byte table of the frame's `LfLevels`, a transform's width or height in units less one: a unit is on a transform edge where its column or row has none of those bits. Only the units that pass go through `edge_unit`, which still makes the whole decision, so the scan can only save work, not change a result. Six planted errors in it (the other pass's table, a unit of the pair tested with its neighbour's size or row, ...) fail the frame test. Measured in a run of its own against step 10, median of 7 natively and of 5 in wasm, builds taking turns: the loop filter 0.255 -> 0.224 ms a frame natively, 0.35 -> 0.27 in the simd build, 0.76 -> 0.77 in the baseline build (no change: there the sample filtering is four fifths of it).
+With the kernels in, the walk was half of the loop filter natively (0.12 of 0.25 ms a frame, measured with the kernel call taken out) and the largest single function of it in the simd build's profile. Seven units in eight are not on a transform edge, and `edge_unit` said so only after indexing the transform sizes through their vector, looking the width up in a table of machine words, and being called twice a pair. `filter_band` now takes the row of sizes as a slice (two rows for the vertical edges, whose pairs are one unit above the other) and tests each byte against a 32-entry byte table of the frame's `LfLevels`, a transform's width or height in units less one: a unit is on a transform edge where its column or row has none of those bits. Only the units that pass go through `edge_unit`, which still makes the whole decision, so the scan can only save work, not change a result. Six planted errors in it (the other pass's table, a unit of the pair tested with its neighbour's size or row, ...) fail the frame test. Measured in a run of its own against step 10, median of 7 natively and of 5 in wasm, builds taking turns: the loop filter 0.255 -> 0.224 ms a frame natively, 0.35 -> 0.27 in the simd build, 0.76 -> 0.77 in the baseline build (no change: there the sample filtering is four fifths of it). The run of the table above has 0.256 -> 0.233 natively and 0.34 -> 0.32 in the simd build: a tenth of the loop filter, which is 0.3 % of a frame and does not show in the fps (the step's rows were measured against step 10 in one run: 883 / 1402 / 1667, 124 / 189 / 218, 53.3 / 106 / 128, 63.7 / 138 / 164, 26.2 / 56.9 / 68.6).
 
+## Where the loop filter stands after step 11 (`1dbf90e`)
+
+The fourteen streams, median of 7, the builds taking turns (wasm) and the
+three binaries taking turns (native), load average 5 to 8. `before` is
+`829b1e1`; the ratio is to rav1d.
+
+| stream | native: rav1d | before | after | wasm baseline: rav1d | before | after | wasm simd: rav1d | before | after |
+|---|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1486 | 1207 | 1626 (1.09x) | 1158 | 732 | 882 (0.76x) | 1688 | 1055 | 1409 (0.83x) |
+| fixture 160x90, 10-bit | 3428 | 3058 | 4129 (1.20x) | 2744 | 1997 | 2348 (0.86x) | 2786 | 2752 | 3568 (1.28x) |
+| fixture 128x72, film grain | 2837 | 2273 | 2560 (0.90x) | 2298 | 1555 | 1672 (0.73x) | 3169 | 1997 | 2233 (0.70x) |
+| fixture 177x99, 8-bit | 2269 | 2565 | 3290 (1.45x) | 1850 | 1376 | 1551 (0.84x) | 3121 | 2201 | 2776 (0.89x) |
+| fixture 96x64, 4:4:4 | 4148 | 3826 | 4690 (1.13x) | 3341 | 2322 | 2525 (0.76x) | 4970 | 3381 | 4327 (0.87x) |
+| fixture 96x64, mono | 10365 | 8358 | 9604 (0.93x) | 8938 | 6176 | 6792 (0.76x) | 11598 | 8044 | 8832 (0.76x) |
+| AOM b8-05-mv 352x288 | 195 | 228 | 243 (1.25x) | 154 | 139 | 141 (0.92x) | 248 | 195 | 204 (0.82x) |
+| AOM b10-00-quantizer-10, 10-bit | 89.0 | 95.5 | 106 (1.19x) | 70.1 | 59.0 | 62.5 (0.89x) | 72.3 | 78.9 | 88.4 (1.22x) |
+| AOM b8-23-film_grain-50 | 410 | 379 | 443 (1.08x) | 338 | 214 | 236 (0.70x) | 501 | 332 | 386 (0.77x) |
+| AOM b8-00-quantizer-20 | 234 | 250 | 283 (1.21x) | 189 | 150 | 157 (0.83x) | 272 | 217 | 241 (0.89x) |
+| SVT testsrc2 720p | 228 | 202 | 212 (0.93x) | 172 | 119 | 122 (0.71x) | 293 | 179 | 186 (0.64x) |
+| SVT mandelbrot 720p | 83.4 | 114 | 130 (1.56x) | 64.6 | 49.1 | 53.1 (0.82x) | 143 | 95.1 | 107 (0.75x) |
+| SVT mandelbrot 720p, 10-bit | 97.5 | 151 | 165 (1.69x) | 73.2 | 58.8 | 61.9 (0.85x) | 80.0 | 125 | 135 (1.69x) |
+| SVT mandelbrot 1080p | 41.1 | 61.7 | 68.4 (1.66x) | 32.0 | 24.5 | 26.0 (0.81x) | 74.8 | 51.7 | 56.7 (0.76x) |
+
+The loop filter is 4.5 times faster in the simd build (1.44 to 0.32 ms a
+frame of mandelbrot 720p, where rav1d's takes 0.59), 3 times in the baseline
+build (2.30 to 0.77) and 5.4 times natively on aarch64 (1.26 to 0.23). No
+row of any column got slower. The streams that gain most are wasm-av1's
+small libaom fixtures, 10 to 34 % faster in the simd build and 13 to 35 %
+natively; the AOM vectors gain 5 to 16 % and 7 to 17 %, and SVT-AV1's clips
+4 to 13 % and 5 to 14 % (on mandelbrot 720p the loop filter runs on 30 of
+the 60 frames). One thread, against rav1d: the
+baseline build is at 0.70 to 0.92 (0.63 to 0.90 before, in the same run),
+the simd build at 0.64 to 0.89 on 8-bit streams (0.61 to 0.80) and 1.22 to
+1.69 on 10-bit ones, native aarch64 at 0.90 to 1.69 (0.80 to 1.55).
+
+**What it was held to.** Every step went through `tools/wasm-perf/gate.sh`
+(the list under "What every step was held to", x86-64 included). The
+loop filter has three tests of its own, each against code that is the
+specification as written: the level tables against the adaptive filter
+strength process, whole random frames against the specification's walk
+with the lane filter, and the in-plane kernels against the one-sample
+process; a fourth pins the kernels' bounds checks from both sides. They run
+natively (the NEON kernels), on x86-64 under Rosetta (the lane filter under
+the new walk), and, as a `wasm32-wasip1` test binary in Node, in V8 without
+and with `simd128` (the one-sample kernel and the SIMD128 ones:
+`tools/wasm-perf/wasi-test.sh`; the bounds test natively only, since a
+panic cannot be caught in that binary). Forty-five errors were planted
+across the walk, the tables and the kernels, one at a time; all but one
+failed a test, and that one, a bound in an assertion that no arithmetic
+test can see, is
+what the bounds test was then written for (it found that the one-sample
+kernel's own check was a sample short for the 8-sample length; fixed, and
+never reachable from the walk). At the end, on `1dbf90e`: all 244 AOM
+vectors natively on 1 thread and on 4 (244 of 244 both times), and the 242
+that are IVF through both wasm builds against rav1d (242 of 242 agree).
+
+**x86-64** has the new walk and its old arithmetic. It could be measured
+only under Rosetta, which has no AVX2, so that is the lane filter as SSE2:
+the loop filter on mandelbrot 720p went from 2.43 to 1.30 ms a frame there,
+the decode from 39.7 to 41.6 fps. Nothing was measured on an AVX2 host.
+
+**What is left in the loop filter**, in the order of what it would buy:
+
+1. x86-64 still gathers each edge into the 32-bit lane filter. The in-plane
+   kernels are a macro over some two dozen lane operations; a third set of
+   them (SSE2, which every x86-64 has, or AVX2) would give x86-64 the same
+   kernels, and Rosetta can hold them to the same tests. Whether they beat
+   the AVX2 lane filter on a real AVX2 host has to be measured on one.
+2. The walk was half of the loop filter natively before step 11 and is
+   still a large part of it. What it costs is per filtered unit: the block's mode info read to find a level that is
+   the same for the whole block, a `Pair` built for the kernel, the kernel
+   found by a match. A byte per unit written when the block is decoded (the
+   level's index, and whether the block is a skipped inter block) would
+   take the mode info out of it; that is a change to the tile decoder.
+3. The baseline build's 0.77 ms is four fifths scalar arithmetic, most of
+   it the 13-tap filter a sample at a time. Four 16-bit lanes in a 64-bit
+   word would do a unit's sums at once; the masks and, for vertical edges,
+   the transposition eat much of that, and it was not tried.
