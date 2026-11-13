@@ -589,6 +589,8 @@ impl TileDecoder<'_, '_> {
             p.clear();
             p.resize(w * h, 0);
         }
+        // Set when the prediction went straight into the frame.
+        let mut written = false;
         for ref_list in 0..lists {
             let ref_frame = cand.ref_frame[ref_list] as i32;
             let mut global_valid = false;
@@ -689,6 +691,38 @@ impl TileDecoder<'_, '_> {
                 let (ssx, ssy) = self.f.plane_ss(plane);
                 let last_x = ((r.upscaled_width as i32 + ssx as i32) >> ssx) - 1;
                 let last_y = ((r.frame_height as i32 + ssy as i32) >> ssy) - 1;
+                let one = 1i64 << SCALE_SUBPEL_BITS;
+                if !is_compound
+                    && !self.b.is_inter_intra
+                    && stx == one
+                    && sty == one
+                    && (sx >> 6) & SUBPEL_MASK as i64 == 0
+                    && ((sy & 1023) >> 6) & SUBPEL_MASK as i64 == 0
+                {
+                    // A whole-sample motion vector into an unscaled
+                    // reference, and nothing to blend with: both filters
+                    // are `128 * sample` and the rounding gives the sample
+                    // back, so the block is the reference's samples (its
+                    // edges repeated), copied.
+                    let refp = &r.frame.planes[plane];
+                    let cur = &mut self.f.cur.planes[plane];
+                    let (x0, y0) = ((sx >> 10) as i32, (sy >> 10) as i32);
+                    let inside = x0 >= 0 && x0 + w as i32 <= last_x + 1;
+                    for i in 0..h {
+                        let yy = clip3(0, last_y, y0 + i as i32) as usize;
+                        let src = refp.row(yy);
+                        let dst = &mut cur.data[(y + i) * cur.stride + x..][..w];
+                        if inside {
+                            dst.copy_from_slice(&src[x0 as usize..x0 as usize + w]);
+                        } else {
+                            for (j, o) in dst.iter_mut().enumerate() {
+                                *o = src[clip3(0, last_x, x0 + j as i32) as usize];
+                            }
+                        }
+                    }
+                    written = true;
+                    continue;
+                }
                 block_inter_prediction(
                     &r.frame.planes[plane],
                     last_x,
@@ -743,30 +777,39 @@ impl TileDecoder<'_, '_> {
         };
         let maxv = (1i32 << self.f.bit_depth) - 1;
         let post = rv.post_round as u32;
-        if !is_compound && !self.b.is_inter_intra {
+        if written {
+            // Already in the frame.
+        } else if !is_compound && !self.b.is_inter_intra {
             let cur = &mut self.f.cur.planes[plane];
-            for i in 0..h {
-                for j in 0..w {
-                    cur.set(x + j, y + i, preds[0][i * w + j].clamp(0, maxv) as u16);
+            let stride = cur.stride;
+            for (i, p) in preds[0][..w * h].chunks_exact(w).enumerate() {
+                for (o, &v) in cur.data[(y + i) * stride + x..][..w].iter_mut().zip(p) {
+                    *o = v.clamp(0, maxv) as u16;
                 }
             }
         } else if ct == COMPOUND_AVERAGE {
             let cur = &mut self.f.cur.planes[plane];
+            let stride = cur.stride;
+            let (p0, p1) = (&preds[0][..w * h], &preds[1][..w * h]);
+            let add = (1 << (1 + post)) >> 1;
             for i in 0..h {
+                let row = &mut cur.data[(y + i) * stride + x..][..w];
+                let (a, b) = (&p0[i * w..][..w], &p1[i * w..][..w]);
                 for j in 0..w {
-                    let v = round2(preds[0][i * w + j] + preds[1][i * w + j], 1 + post);
-                    cur.set(x + j, y + i, v.clamp(0, maxv) as u16);
+                    row[j] = ((a[j] + b[j] + add) >> (1 + post)).clamp(0, maxv) as u16;
                 }
             }
         } else if ct == COMPOUND_DISTANCE {
             let cur = &mut self.f.cur.planes[plane];
+            let stride = cur.stride;
+            let (p0, p1) = (&preds[0][..w * h], &preds[1][..w * h]);
+            let add = (1 << (4 + post)) >> 1;
             for i in 0..h {
+                let row = &mut cur.data[(y + i) * stride + x..][..w];
+                let (a, b) = (&p0[i * w..][..w], &p1[i * w..][..w]);
                 for j in 0..w {
-                    let v = round2(
-                        fwd_weight * preds[0][i * w + j] + bck_weight * preds[1][i * w + j],
-                        4 + post,
-                    );
-                    cur.set(x + j, y + i, v.clamp(0, maxv) as u16);
+                    let v = (fwd_weight * a[j] + bck_weight * b[j] + add) >> (4 + post);
+                    row[j] = v.clamp(0, maxv) as u16;
                 }
             }
         } else {
@@ -1188,8 +1231,18 @@ impl crate::decoder::FrameCtx {
     ) -> (i64, i64, i64, i64) {
         let fw = self.hdr.frame_width as i64;
         let fh = self.hdr.frame_height as i64;
-        let x_scale = (((ref_upscaled_width as i64) << REF_SCALE_SHIFT) + fw / 2) / fw;
-        let y_scale = (((ref_frame_height as i64) << REF_SCALE_SHIFT) + fh / 2) / fh;
+        // A reference of the frame's own size has a scale of exactly one;
+        // no need to divide to find that out for every block.
+        let x_scale = if ref_upscaled_width as i64 == fw {
+            1 << REF_SCALE_SHIFT
+        } else {
+            (((ref_upscaled_width as i64) << REF_SCALE_SHIFT) + fw / 2) / fw
+        };
+        let y_scale = if ref_frame_height as i64 == fh {
+            1 << REF_SCALE_SHIFT
+        } else {
+            (((ref_frame_height as i64) << REF_SCALE_SHIFT) + fh / 2) / fh
+        };
         let (sub_x, sub_y) = self.plane_ss(plane);
         let half_sample = 1i64 << (SUBPEL_BITS - 1);
         let orig_x = ((x as i64) << SUBPEL_BITS) + ((2 * mv[1] as i64) >> sub_x) + half_sample;

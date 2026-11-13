@@ -55,6 +55,11 @@ Each row is the state after the step: fps, and its ratio to rav1d's.
 |  | mandelbrot 720p | 43.9 (0.65x) | 70.0 (0.46x) | 100 |
 |  | mandelbrot 720p 10-bit | 42.2 (0.61x) | 81.6 (1.17x) | 127 |
 |  | mandelbrot 1080p | 20.2 (0.78x) | 38.7 (0.60x) | 52.4 |
+| 5. reconstruction: whole-sample vectors copied, DC-only blocks, rows instead of samples | fixture 320x180 | 740 (0.61x) | 1046 (0.59x) | 1180 |
+|  | testsrc2 720p | 111 (0.65x) | 169 (0.59x) | 157 |
+|  | mandelbrot 720p | 46.8 (0.74x) | 83.9 (0.57x) | 97.1 |
+|  | mandelbrot 720p 10-bit | 55.4 (0.77x) | 111 (1.42x) | 143 |
+|  | mandelbrot 1080p | 22.3 (0.69x) | 45.1 (0.65x) | 52.8 |
 
 ### 1. Inter prediction from an unscaled reference
 
@@ -81,3 +86,7 @@ CDEF was 21 % of the simd decode and 40 % of the baseline one. Every 8x8 block w
 ### 4. The in-plane CDEF filter with NEON; AVX2 hosts keep the window filter
 
 The step before sent interior blocks to the in-plane filter on every target, and on aarch64 that was the scalar version in place of the window filter's NEON one: native decoding got slower (mandelbrot 720p 83.5 to 70.5 fps). The in-plane filter now has a NEON version, 16-bit lanes like the SIMD128 one (tested against the window filter natively), and a host with AVX2 keeps the window filter, whose AVX2 version has no in-plane counterpart yet and could not be measured here. Native is now ahead of where it was before the CDEF work. The wasm numbers are unchanged, as they should be.
+
+### 5. Reconstruction: whole-sample vectors copied, DC-only blocks, rows instead of samples
+
+Four things around the block's samples. A single-reference block whose motion vector has no fractional part (most of a still background) had both filters run as `128 * sample` and its result clamped and stored a sample at a time; it is now the reference's rows copied. A transform block with only its DC coefficient, the commonest kind, went through the whole 2D transform; its residual is one value per row, found with one row and one column transform (checked against the full process for every size and depth). The prediction and the residual were written through `PlaneBuf::set`, a bounds check and an index computation per sample; they go a row slice at a time, which the compiler vectorises. And dequantisation divided 64-bit values by `dqDenom` (1, 2 or 4): a shift. `scale_mv` no longer divides to find a scale of one.

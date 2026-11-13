@@ -656,6 +656,41 @@ pub(crate) fn kinds(tx_type: usize) -> (u8, u8) {
     (f(row_kind(tx_type)), f(col_kind(tx_type)))
 }
 
+/// The residual of a DCT_DCT block whose only coefficient is the DC one:
+/// every column is the same, and it is returned (`h` entries). The 2D
+/// process (7.13.3) on that input, with what is zero left out: the one row
+/// that is not zero through the row transform, and, its outputs being all
+/// equal, one column through the column transform. `None` if the row's
+/// outputs are not all equal (they are, for a DCT; this checks rather than
+/// assumes) and the caller takes the general path.
+pub(crate) fn inverse_dct_dc_only(dc: i32, tx_sz: usize, bit_depth: u32) -> Option<[i32; 64]> {
+    let log2w = TX_WIDTH_LOG2[tx_sz] as u32;
+    let log2h = TX_HEIGHT_LOG2[tx_sz] as u32;
+    let (w, h) = (1usize << log2w, 1usize << log2h);
+    let row_shift = TRANSFORM_ROW_SHIFT[tx_sz] as u32;
+    let row_clamp = bit_depth + 8;
+    let col_clamp = (bit_depth + 6).max(16);
+    let mut t = [0i32; 64];
+    t[0] = if log2w.abs_diff(log2h) == 1 {
+        round2_12(dc as i64 * 2896)
+    } else {
+        dc
+    };
+    run(&mut t, Kind::Dct, log2w, row_clamp, false, 0);
+    if t[1..w].iter().any(|&v| v != t[0]) {
+        return None;
+    }
+    let lo = -(1i32 << (col_clamp - 1));
+    let hi = (1i32 << (col_clamp - 1)) - 1;
+    let mut c = [0i32; 64];
+    c[0] = round2(t[0], row_shift).clamp(lo, hi);
+    run(&mut c, Kind::Dct, log2h, col_clamp, false, 0);
+    for v in c[..h].iter_mut() {
+        *v = round2(*v, 4);
+    }
+    Some(c)
+}
+
 /// The 2D inverse transform process (7.13.3). `dequant` is the
 /// `Dequant` array with a row stride of 64 (only its top-left 32x32 can be
 /// non-zero); the result is written to `residual` with a row stride of `w`.
@@ -900,6 +935,33 @@ mod tests {
     /// The transform eight rows / columns at a time (SIMD where available)
     /// agrees with the reference for every size and type, on coefficients
     /// in the conformance range at 8 and 10 bits.
+    /// The DC-only shortcut gives the general process's residual, for
+    /// every size and DC values over the whole range at each depth.
+    #[test]
+    fn dc_only_matches_the_general_process() {
+        for bd in [8u32, 10, 12] {
+            for tx_sz in 0..TX_SIZES_ALL {
+                let w = 1usize << TX_WIDTH_LOG2[tx_sz];
+                let h = 1usize << TX_HEIGHT_LOG2[tx_sz];
+                let lim = 1i32 << (7 + bd);
+                let mut dcs = vec![-lim, lim - 1, 0, 1, -1, 2, -3, 7, 64, -65];
+                dcs.extend((0..200).map(|i| (i * 7919 % (2 * lim)) - lim));
+                for dc in dcs {
+                    let mut dequant = vec![0i32; 64 * 64];
+                    dequant[0] = dc;
+                    let mut want = vec![0i32; 64 * 64];
+                    inverse_transform_2d_scalar(&dequant, tx_sz, DCT_DCT, false, bd, &mut want);
+                    let col = inverse_dct_dc_only(dc, tx_sz, bd).expect("a DCT's row is flat");
+                    for i in 0..h {
+                        for j in 0..w {
+                            assert_eq!(want[i * w + j], col[i], "{bd}-bit size {tx_sz} dc {dc}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn lanes_match_scalar() {
         let mut seed = 0x1234_5678_9abc_def1u64;

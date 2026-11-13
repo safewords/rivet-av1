@@ -745,10 +745,11 @@ impl TileDecoder<'_, '_> {
     /// The reconstruct process (7.12.3).
     pub(crate) fn reconstruct(&mut self, plane: usize, x: usize, y: usize, tx_sz: usize) {
         let bd = self.f.bit_depth;
-        let dq_denom: i64 = match tx_sz {
-            TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 2,
-            TX_64X64 | TX_32X64 | TX_64X32 => 4,
-            _ => 1,
+        // `dqDenom` is 1, 2 or 4: a shift of the magnitude.
+        let dq_shift: u32 = match tx_sz {
+            TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 1,
+            TX_64X64 | TX_32X64 | TX_64X32 => 2,
+            _ => 0,
         };
         let log2w = TX_WIDTH_LOG2[tx_sz];
         let log2h = TX_HEIGHT_LOG2[tx_sz];
@@ -782,6 +783,7 @@ impl TileDecoder<'_, '_> {
         let use_qm = self.f.hdr.using_qmatrix && t < IDTX && qm_level < 15;
         let lim = 1i64 << (7 + bd);
         let dq = &mut self.dequant;
+        let mut ac = false;
         for i in 0..th {
             for j in 0..tw {
                 let coef = self.quant[i * tw + j] as i64;
@@ -789,6 +791,7 @@ impl TileDecoder<'_, '_> {
                     dq[i * 64 + j] = 0;
                     continue;
                 }
+                ac |= (i | j) != 0;
                 let q = if i == 0 && j == 0 { dc_q } else { ac_q };
                 let q2 = if use_qm {
                     let m = QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize]
@@ -798,13 +801,29 @@ impl TileDecoder<'_, '_> {
                     q
                 };
                 let v = coef * q2;
-                let mag = (v.abs() & 0xFFFFFF) / dq_denom;
+                let mag = (v.abs() & 0xFFFFFF) >> dq_shift;
                 let v = if v < 0 { -mag } else { mag };
                 dq[i * 64 + j] = v.clamp(-lim, lim - 1) as i32;
             }
             for j in tw..64.min(w) {
                 dq[i * 64 + j] = 0;
             }
+        }
+        let maxv = (1i32 << bd) - 1;
+        let cur = &mut self.f.cur.planes[plane];
+        let stride = cur.stride;
+        if !ac
+            && t == DCT_DCT
+            && !self.b.lossless
+            && let Some(col) = crate::dsp::itx::inverse_dct_dc_only(self.dequant[0], tx_sz, bd)
+        {
+            // Only the DC coefficient: one value for each row of the block.
+            for (i, &r) in col[..h].iter().enumerate() {
+                for o in cur.data[(y + i) * stride + x..][..w].iter_mut() {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
+            }
+            return;
         }
         inverse_transform_2d(
             &self.dequant[..],
@@ -814,18 +833,17 @@ impl TileDecoder<'_, '_> {
             bd,
             &mut self.residual[..],
         );
-        let maxv = (1i32 << bd) - 1;
-        let cur = &mut self.f.cur.planes[plane];
-        for i in 0..h {
+        for (i, res) in self.residual[..w * h].chunks_exact(w).enumerate() {
             let yy = if flip_ud { h - i - 1 } else { i };
-            for j in 0..w {
-                let xx = if flip_lr { w - j - 1 } else { j };
-                let p = cur.get(x + xx, y + yy) as i32;
-                cur.set(
-                    x + xx,
-                    y + yy,
-                    (p + self.residual[i * w + j]).clamp(0, maxv) as u16,
-                );
+            let row = &mut cur.data[(y + yy) * stride + x..][..w];
+            if flip_lr {
+                for (o, &r) in row.iter_mut().rev().zip(res) {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
+            } else {
+                for (o, &r) in row.iter_mut().zip(res) {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
             }
         }
     }
