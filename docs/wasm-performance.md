@@ -328,6 +328,11 @@ step before and after from one run.
 | | mandelbrot 720p | 57.4 (0.87x) | 122 (0.85x) | 146 |
 | | mandelbrot 720p 10-bit | 69.2 (0.90x) | 159 (1.90x) | 185 |
 | | mandelbrot 1080p | 27.9 (0.85x) | 63.4 (0.82x) | 74.7 |
+| 13. reconstruction from the end-of-block position: the scan dequantised, the transform bounded | fixture 320x180 | 802 (0.64x) | 1189 (0.65x) | 1347 |
+| | testsrc2 720p | 150 (0.79x) | 241 (0.73x) | 250 |
+| | mandelbrot 720p | 59.0 (0.87x) | 128 (0.84x) | 143 |
+| | mandelbrot 720p 10-bit | 67.2 (0.85x) | 157 (1.84x) | 189 |
+| | mandelbrot 1080p | 27.4 (0.85x) | 64.3 (0.83x) | 76.0 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -339,6 +344,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 | 10 | 1.45 | 1.47 | 1.08 | 1.61 | 2.98 | 0.98 |
 | 11 | 1.46 | 1.45 | 1.06 | 1.45 | 2.04 | 0.84 |
 | 12 | 1.44 | 1.49 | 1.05 | 1.19 | 2.00 | 0.83 |
+| 13 | 1.44 | 1.48 | 1.05 | 0.90 | 1.83 | 0.66 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -379,8 +385,20 @@ The part, from one run: 1.60 to 1.45 ms in wasm simd, 2.95 to 2.04 in baseline (
 
 ### 12. The inverse transforms' lane arithmetic in SIMD128 operations
 
-The transforms run eight rows or columns at once on `Lanes`, eight 32-bit values whose arithmetic is written lane by lane for the compiler to turn into vectors. It does that for aarch64. For wasm32 it did it badly: the 2D transform alone, the same source timed natively and in wasm simd (`tools/wasm-perf/itxbench`), took 495 and 859 ns for a full 16x16 block, 1675 and 3268 for 32x32, 4915 and 11 111 for 64x64, twice the native time where the other kernels are within a third. With `simd128` the five operations of `Lane` (the rotation, the clamped butterfly, negation, the two scalings) are now written as SIMD128 operations on the two halves, the same wrapping 32-bit arithmetic: 646, 2125 and 5990 ns. Native code is the lane-by-lane form as before, which is why this has no NEON twin: nothing changed there, and the rows above agree.
+The transforms run eight rows or columns at once on `Lanes`, eight 32-bit values whose arithmetic is written lane by lane for the compiler to turn into vectors. It does that for aarch64. For wasm32 it did it badly: the 2D transform alone, the same source timed natively and in wasm simd (`tools/wasm-perf/itxbench`), took 495 and 859 ns for a full 16x16 block, 1675 and 3268 for 32x32, 4915 and 11 111 for 64x64, twice the native time. With `simd128` the five operations of `Lane` (the rotation, the clamped butterfly, negation, the two scalings) are now written as SIMD128 operations on the two halves, the same wrapping 32-bit arithmetic: 646, 2125 and 5990 ns. Native code is the lane-by-lane form as before, which is why this has no NEON twin: nothing changed there, and the rows above agree.
 
 `cargo test` does not run on wasm32, so the comparison with the scalar reference that the unit test makes natively is made in the wasm module too: `itxbench` builds the tree's `dsp/itx.rs` into a module that runs every size and type against `inverse_transform_2d_scalar` (14 960 cases) before it times anything, and `gate.sh` runs it. An unsigned shift planted in the SIMD128 rotation fails it in the simd build alone.
 
 The part, from one run: 1.44 to 1.19 ms in wasm simd; mandelbrot 720p 117.5 to 121.8 fps, testsrc2 720p 213 to 225.
+
+### 13. Reconstruction from the end-of-block position: the scan dequantised, the transform bounded
+
+`reconstruct` walked the whole block twice whatever it held: every one of its positions was tested and dequantised in 64-bit arithmetic (333 000 a frame, for 34 000 coefficients that are not zero), and the inverse transform gathered every group of eight rows to find out whether it was zero, clamped the whole block in a pass of its own between the two directions, and stored zero rows for the column transforms to load. A decoder knows more than that: `coeffs()` returns `eob`, and nothing past the first `eob` positions of the scan is anything but zero.
+
+`reconstruct_decode` is the process for a decoder (`reconstruct` stays, untouched, for the encoder, for lossless blocks and for 12 bits). It dequantises the first `eob` positions of the scan and no others: every one of them, zero or not, with no branch (whether a coefficient is zero is no more predictable than its level was), in 32 bits (the specification keeps the low 24 bits of the product, which are those of its low 32), noting by selects how many rows and columns the coefficients that are not zero reach. `inverse_transform_2d_within` is then given those two numbers: it transforms the groups of rows up to the last that holds a coefficient, clamps each as it stores it, and the column transforms take the rows that were never stored as the zeros they are. That is exact, not an approximation: every step of 7.13.2 maps zeros to zeros. `inverse_transform_2d` itself is now that function with the whole block as its bounds, so there is one eight-lane implementation, and the encoder's results are what they were.
+
+Tests: the bounded transform against the scalar reference for every size and type, with the tightest bounds and with any looser ones, natively and in the wasm modules (a group of rows left out, planted, fails it); the dequantiser against 7.12.3 written out in 64 bits over the whole block, for every size and scan, with and without a quantiser matrix, levels up to 20 bits (a sign taken from the wrong bit, or a column too few reported, fails it).
+
+The part, from one run: 1.20 to 0.90 ms in wasm simd, 1.98 to 1.83 in baseline, 0.84 to 0.66 natively; mandelbrot 720p 123.1 to 128.3 fps simd, natively 137.5 to 142.7; testsrc2 720p 230 to 241 simd. The part is below the 1.1 ms measured for rav1d's in the first round.
+
+Two things were written for this step, verified, measured and left out (`tools/wasm-perf/tried/`). Transforms that know how many of their inputs are zero (the network run on a copy whose zero entries the compiler can see, so that what they feed folds away, with the network's loops expanded so that it can): a 32-point DCT of 8 inputs takes 80 ns for eight lanes against 231, but on these streams the reconstruction got 3 % slower, their blocks being mostly full, and the crate took five times as long to compile. And a 32-bit single-lane path for the baseline build, which has only the scalar transforms: no faster than the 64-bit one (6.4 against 6.1 us for a 32x32 block), since what the baseline build lacks is lanes, not narrower arithmetic.

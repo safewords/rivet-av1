@@ -64,3 +64,11 @@ to gain nothing, so that nobody measures them again without a reason:
 `direct-to-frame.diff` filters a single-reference prediction straight into
 the frame (within 1 % on every stream; they predict mostly from two
 references).
+`partial-transforms.diff` gives the inverse DCTs versions for inputs that
+are zero from the 8th, 16th or 32nd on, by running the network on a copy
+whose zeros the compiler sees and expanding its loops (a 32-point DCT of 8
+inputs in a third of the time; 3 % slower on the benchmark streams, whose
+blocks are mostly full, and five times the compile time).
+`narrow-lanes.diff` is a 32-bit one-value-at-a-time transform path for
+builds without vectors (no faster than the 64-bit one in wasm baseline).
+Both are against `src/dsp/itx.rs` as step 13 left it.

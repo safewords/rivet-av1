@@ -18,7 +18,7 @@ tot=sum(c.values()); ms=1000/fps
 def grp(name):
     n=re.sub(r'\[[0-9a-f]{16}\]','',name)
     if 'coeffs' in n or 'symbol::' in n or 'SymbolDecoder' in n: return 'entropy+coefficients'
-    if 'itx::' in n or 'reconstruct' in n or 'dequant' in n: return 'transforms+reconstruction'
+    if 'itx::' in n or 'reconstruct' in n or 'equantis' in n: return 'transforms+reconstruction'
     return None
 g=collections.Counter()
 for name,t in c.items():

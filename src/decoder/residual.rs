@@ -185,7 +185,11 @@ impl TileDecoder<'_, '_> {
         if !self.b.skip {
             let eob = self.coeffs(plane, start_x, start_y, tx_sz);
             if eob > 0 {
-                self.reconstruct(plane, start_x, start_y, tx_sz);
+                if self.sd.encoding() {
+                    self.reconstruct(plane, start_x, start_y, tx_sz);
+                } else {
+                    self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob);
+                }
             }
         }
         let cols = self.f.ms;
@@ -1109,6 +1113,172 @@ impl TileDecoder<'_, '_> {
             }
         }
     }
+
+    /// The reconstruct process (7.12.3) for a decoder, which knows `eob`:
+    /// what [`Self::reconstruct`] (the reference, which the encoder runs)
+    /// does, without the work for coefficients known to be zero. Only the
+    /// first `eob` positions of the scan can hold one, so only they are
+    /// dequantised, and the rows and columns they reach are all the
+    /// inverse transform is given to transform.
+    #[inline(never)]
+    pub(crate) fn reconstruct_decode(
+        &mut self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        tx_sz: usize,
+        eob: usize,
+    ) {
+        let bd = self.f.bit_depth;
+        if self.b.lossless || bd > 10 {
+            // The Walsh-Hadamard transform, and the depth whose
+            // intermediates need 64 bits: the reference, as it is.
+            return self.reconstruct(plane, x, y, tx_sz);
+        }
+        let dq_shift: u32 = match tx_sz {
+            TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 1,
+            TX_64X64 | TX_32X64 | TX_64X32 => 2,
+            _ => 0,
+        };
+        let w = 1usize << TX_WIDTH_LOG2[tx_sz];
+        let h = 1usize << TX_HEIGHT_LOG2[tx_sz];
+        let tw = w.min(32);
+        let th = h.min(32);
+        let t = self.plane_tx_type;
+        let flip_ud = matches!(
+            t,
+            FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST
+        );
+        let flip_lr = matches!(
+            t,
+            DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST
+        );
+        let qindex = self.qindex();
+        let (dc_delta, ac_delta) = match plane {
+            0 => (self.f.hdr.delta_q_y_dc, 0),
+            1 => (self.f.hdr.delta_q_u_dc, self.f.hdr.delta_q_u_ac),
+            _ => (self.f.hdr.delta_q_v_dc, self.f.hdr.delta_q_v_ac),
+        };
+        let bdi = ((bd - 8) >> 1) as usize;
+        let dc_q = DC_QLOOKUP[bdi][clip3(0, 255, qindex + dc_delta) as usize] as u32;
+        let ac_q = AC_QLOOKUP[bdi][clip3(0, 255, qindex + ac_delta) as usize] as u32;
+        let qm_level = if self.f.hdr.using_qmatrix {
+            self.f.hdr.seg_qm_level[plane][self.b.segment_id]
+        } else {
+            15
+        };
+        let qm = if self.f.hdr.using_qmatrix && t < IDTX && qm_level < 15 {
+            Some(&QUANTIZER_MATRIX[qm_level as usize][(plane > 0) as usize][QM_OFFSET[tx_sz]..])
+        } else {
+            None
+        };
+        let dequantiser = Dequantiser {
+            dc_q,
+            ac_q,
+            qm,
+            shift: dq_shift,
+            lim: 1i32 << (7 + bd),
+            tw,
+            th,
+        };
+        let scan = &scan_for(tx_sz, t)[..eob];
+        let (rows, cols) = dequantiser.scan(&self.quant, scan, &mut self.dequant);
+        let maxv = (1i32 << bd) - 1;
+        let cur = &mut self.f.cur.planes[plane];
+        let stride = cur.stride;
+        if rows == 1
+            && cols == 1
+            && t == DCT_DCT
+            && let Some(col) = crate::dsp::itx::inverse_dct_dc_only(self.dequant[0], tx_sz, bd)
+        {
+            // Only the DC coefficient: one value for each row of the block.
+            for (i, &r) in col[..h].iter().enumerate() {
+                for o in cur.data[(y + i) * stride + x..][..w].iter_mut() {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
+            }
+            return;
+        }
+        crate::dsp::itx::inverse_transform_2d_within(
+            &self.dequant[..],
+            tx_sz,
+            t,
+            bd,
+            (rows, cols),
+            &mut self.residual[..],
+        );
+        for (i, res) in self.residual[..w * h].chunks_exact(w).enumerate() {
+            let yy = if flip_ud { h - i - 1 } else { i };
+            let row = &mut cur.data[(y + yy) * stride + x..][..w];
+            if flip_lr {
+                for (o, &r) in row.iter_mut().rev().zip(res) {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
+            } else {
+                for (o, &r) in row.iter_mut().zip(res) {
+                    *o = (*o as i32 + r).clamp(0, maxv) as u16;
+                }
+            }
+        }
+    }
+}
+
+/// The dequantisation functions of 7.12.3 for one transform block, as
+/// [`TileDecoder::reconstruct_decode`] applies them.
+struct Dequantiser<'a> {
+    /// `dcQ` and `acQ`.
+    dc_q: u32,
+    ac_q: u32,
+    /// The block's quantiser matrix, if it uses one.
+    qm: Option<&'a [u8]>,
+    /// `dqDenom` as a shift.
+    shift: u32,
+    /// `1 << ( 7 + BitDepth )`.
+    lim: i32,
+    /// The width and height of the block's coefficients (32 at most).
+    tw: usize,
+    th: usize,
+}
+
+impl Dequantiser<'_> {
+    /// `Dequant` (rows of 64) from the coefficients `quant` holds at the
+    /// positions of `scan`, the only ones that can be other than zero:
+    /// zeros where the inverse transform may read (it takes whole groups
+    /// of eight rows), then each of those coefficients. Returns how many
+    /// rows and columns the non-zero ones reach (at least 1 each).
+    ///
+    /// Every coefficient of the scan is dequantised, zero or not, and the
+    /// rows and columns are found by selects: whether a coefficient is
+    /// zero cannot be predicted any better than its level could.
+    #[inline(never)]
+    fn scan(&self, quant: &[i32; 1024], scan: &[u16], dq: &mut [i32; 64 * 64]) -> (usize, usize) {
+        use core::hint::select_unpredictable as select;
+        let (tw, lim) = (self.tw, self.lim);
+        let bwl = tw.trailing_zeros();
+        for row in dq.as_chunks_mut::<64>().0[..self.th.next_multiple_of(8)].iter_mut() {
+            row[..tw].fill(0);
+        }
+        let (mut rows, mut cols) = (1, 1);
+        for &pos in scan {
+            let pos = pos as usize;
+            let coef = quant[pos];
+            let (i, j) = (pos >> bwl, pos & (tw - 1));
+            let q = select(pos == 0, self.dc_q, self.ac_q);
+            let q = match self.qm {
+                Some(m) => (q * m[pos] as u32 + 16) >> 5,
+                None => q,
+            };
+            // `( Abs( coef * q ) & 0xFFFFFF ) / dqDenom` with the sign
+            // back: the low 24 bits of the product are those of its low
+            // 32.
+            let mag = ((coef.unsigned_abs().wrapping_mul(q) & 0xFFFFFF) >> self.shift) as i32;
+            let v = select(coef < 0, -mag, mag);
+            dq[i * 64 + j] = v.clamp(-lim, lim - 1);
+            rows = rows.max(select(coef != 0, i + 1, 0));
+            cols = cols.max(select(coef != 0, j + 1, 0));
+        }
+        (rows, cols)
+    }
 }
 
 /// The index of `v` in a transform type inversion table (encode mode).
@@ -1513,6 +1683,85 @@ mod tests {
             for (o, d) in near.iter().zip(&SIG_REF_DIFF_OFFSET[tx_class]) {
                 assert_eq!(*o, d[0] as usize * LEVEL_STRIDE + d[1] as usize);
                 assert!(d[0] <= 4 && d[1] <= 4 && *o < LEVEL_NEAR);
+            }
+        }
+    }
+
+    /// `Dequantiser::scan` against 7.12.3 written out in 64 bits over the
+    /// whole block: the same `Dequant`, and no coefficient outside the
+    /// rows and columns it returns, for every size and scan, with and
+    /// without a quantiser matrix, levels up to the 20 bits `coeffs()` can
+    /// leave.
+    #[test]
+    fn dequantiser_matches_the_process() {
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for tx_sz in 0..TX_SIZES_ALL {
+            let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
+            let (tw, th) = (w.min(32), h.min(32));
+            let shift: u32 = match tx_sz {
+                TX_32X32 | TX_16X32 | TX_32X16 | TX_16X64 | TX_64X16 => 1,
+                TX_64X64 | TX_32X64 | TX_64X32 => 2,
+                _ => 0,
+            };
+            for t in [DCT_DCT, V_DCT, H_DCT, IDTX] {
+                let scan = scan_for(tx_sz, t);
+                for case in 0..60 {
+                    let bd = [8, 10][case % 2];
+                    let (dc_q, ac_q) = (4 + rnd(5343) as u32, 4 + rnd(7309) as u32);
+                    let qm = (case % 3 == 0).then(|| {
+                        &QUANTIZER_MATRIX[rnd(15) as usize][rnd(2) as usize][QM_OFFSET[tx_sz]..]
+                    });
+                    let eob = 1 + rnd(scan.len() as u64) as usize;
+                    let mut quant = Box::new([0i32; 1024]);
+                    for &pos in &scan[..eob] {
+                        let level = match rnd(8) {
+                            0..=3 => 0,
+                            4 | 5 => 1 + rnd(3) as i32,
+                            6 => rnd(4000) as i32,
+                            _ => rnd(1 << 20) as i32,
+                        };
+                        quant[pos as usize] = if rnd(2) == 0 { level } else { -level };
+                    }
+                    let lim = 1i32 << (7 + bd);
+                    let d = Dequantiser {
+                        dc_q,
+                        ac_q,
+                        qm,
+                        shift,
+                        lim,
+                        tw,
+                        th,
+                    };
+                    let mut dq = Box::new([0x1234_5678i32; 64 * 64]);
+                    let (rows, cols) = d.scan(&quant, &scan[..eob], &mut dq);
+                    for i in 0..th {
+                        for j in 0..tw {
+                            let coef = quant[i * tw + j] as i64;
+                            let q = if i == 0 && j == 0 { dc_q } else { ac_q } as i64;
+                            let q2 = match qm {
+                                Some(m) => round2_64(q * m[i * tw + j] as i64, 5),
+                                None => q,
+                            };
+                            let v = coef * q2;
+                            let mag = (v.abs() & 0xFFFFFF) >> shift;
+                            let v = if v < 0 { -mag } else { mag };
+                            let want = v.clamp(-(lim as i64), lim as i64 - 1) as i32;
+                            let at = format!("size {tx_sz} type {t} case {case} at ({i}, {j})");
+                            assert_eq!(dq[i * 64 + j], want, "{at}");
+                            assert!(coef == 0 || (i < rows && j < cols), "{at}: outside");
+                        }
+                    }
+                    // The rows the inverse transform reads past the last.
+                    for i in th..th.next_multiple_of(8) {
+                        assert!(dq[i * 64..i * 64 + tw].iter().all(|&v| v == 0));
+                    }
+                }
             }
         }
     }

@@ -1,0 +1,155 @@
+--- a/src/dsp/itx.rs
++++ b/src/dsp/itx.rs
+@@ -176,6 +176,61 @@
+     }
+ }
+ 
++/// One value in 32-bit wrapping arithmetic: [`Lanes`]' arithmetic, a lane
++/// at a time, for a target with no vectors to put eight in. Exact under
++/// the same condition (bit depths up to 10, values in the ranges
++/// conformance requires).
++#[derive(Clone, Copy)]
++#[cfg_attr(
++    not(all(target_arch = "wasm32", not(target_feature = "simd128"))),
++    allow(dead_code)
++)]
++pub(crate) struct Narrow(pub(crate) i32);
++
++impl Lane for Narrow {
++    const N: usize = 1;
++    #[inline(always)]
++    fn zero() -> Self {
++        Narrow(0)
++    }
++    #[inline(always)]
++    fn rot(a: Self, ca: i32, b: Self, cb: i32) -> Self {
++        Narrow(
++            a.0.wrapping_mul(ca)
++                .wrapping_add(b.0.wrapping_mul(cb))
++                .wrapping_add(1 << 11)
++                >> 12,
++        )
++    }
++    #[inline(always)]
++    fn add_sub_clamp(a: Self, b: Self, lo: i32, hi: i32) -> (Self, Self) {
++        (
++            Narrow(a.0.wrapping_add(b.0).clamp(lo, hi)),
++            Narrow(a.0.wrapping_sub(b.0).clamp(lo, hi)),
++        )
++    }
++    #[inline(always)]
++    fn neg(a: Self) -> Self {
++        Narrow(a.0.wrapping_neg())
++    }
++    #[inline(always)]
++    fn scale12(a: Self, c: i32) -> Self {
++        Narrow(a.0.wrapping_mul(c).wrapping_add(1 << 11) >> 12)
++    }
++    #[inline(always)]
++    fn mul(a: Self, c: i32) -> Self {
++        Narrow(a.0.wrapping_mul(c))
++    }
++    #[inline(always)]
++    fn get(&self, _l: usize) -> i32 {
++        self.0
++    }
++    #[inline(always)]
++    fn set(&mut self, _l: usize, v: i32) {
++        self.0 = v;
++    }
++}
++
+ /// The working array `T` and the butterflies `B` and `H` (7.13.2.1).
+ struct Tx<'a, L: Lane> {
+     t: &'a mut [L],
+@@ -752,11 +807,80 @@
+             inverse_transform_2d_lanes(dequant, tx_sz, tx_type, bit_depth, within, residual);
+             return;
+         }
++        // No vectors: one row or column at a time, in the same 32 bits.
++        #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
++        {
++            inverse_transform_2d_narrow(dequant, tx_sz, tx_type, bit_depth, within, residual);
++            return;
++        }
+     }
+     let _ = within;
+     inverse_transform_2d_scalar(dequant, tx_sz, tx_type, false, bit_depth, residual)
+ }
+ 
++/// The 2D inverse transform one row, then one column, at a time in 32-bit
++/// arithmetic (not lossless; bit depth 10 at most), for coefficients that
++/// are zero outside the first `rows` rows and `cols` columns: what
++/// [`inverse_transform_2d_lanes`] does eight at a time.
++#[cfg_attr(
++    not(all(target_arch = "wasm32", not(target_feature = "simd128"))),
++    allow(dead_code)
++)]
++fn inverse_transform_2d_narrow(
++    dequant: &[i32],
++    tx_sz: usize,
++    tx_type: usize,
++    bit_depth: u32,
++    (rows, cols): (usize, usize),
++    residual: &mut [i32],
++) {
++    let log2w = TX_WIDTH_LOG2[tx_sz] as u32;
++    let log2h = TX_HEIGHT_LOG2[tx_sz] as u32;
++    let w = 1usize << log2w;
++    let h = 1usize << log2h;
++    let row_shift = TRANSFORM_ROW_SHIFT[tx_sz] as u32;
++    let row_clamp = bit_depth + 8;
++    let col_clamp = (bit_depth + 6).max(16);
++    let rk = row_kind(tx_type);
++    let ck = col_kind(tx_type);
++    let rect = log2w.abs_diff(log2h) == 1;
++    let lo = -(1i32 << (col_clamp - 1));
++    let hi = (1i32 << (col_clamp - 1)) - 1;
++    let add = (1i32 << row_shift) >> 1;
++    let mut t = [Narrow(0); 64];
++    for i in 0..rows {
++        let src = &dequant[i * 64..i * 64 + cols];
++        let out = &mut residual[i * w..(i + 1) * w];
++        if src.iter().all(|&v| v == 0) {
++            out.fill(0);
++            continue;
++        }
++        for (t, &v) in t.iter_mut().zip(src) {
++            *t = Narrow(v);
++        }
++        t[cols..w].fill(Narrow(0));
++        if rect {
++            for v in t[..cols].iter_mut() {
++                *v = Narrow::scale12(*v, 2896);
++            }
++        }
++        run_lanes(&mut t[..], rk, log2w, row_clamp);
++        for (o, t) in out.iter_mut().zip(&t) {
++            *o = (t.0.wrapping_add(add) >> row_shift).clamp(lo, hi);
++        }
++    }
++    for j in 0..w {
++        for i in 0..rows {
++            t[i] = Narrow(residual[i * w + j]);
++        }
++        t[rows..h].fill(Narrow(0));
++        run_lanes(&mut t[..], ck, log2h, col_clamp);
++        for i in 0..h {
++            residual[i * w + j] = t[i].0.wrapping_add(8) >> 4;
++        }
++    }
++}
++
+ #[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+ unsafe fn inverse_transform_2d_avx2(
+@@ -1072,6 +1196,9 @@
+                             b.fill(-0x5a5a5a);
+                             inverse_transform_2d_lanes(&dq, tx_sz, tx_type, bd, within, &mut b);
+                             assert_eq!(a, b, "lanes, {at} within {within:?}");
++                            b.fill(0x3c3c3c);
++                            inverse_transform_2d_narrow(&dq, tx_sz, tx_type, bd, within, &mut b);
++                            assert_eq!(a, b, "one at a time, {at} within {within:?}");
+                         }
+                     }
+                 }
