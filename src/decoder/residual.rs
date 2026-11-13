@@ -13,9 +13,12 @@
 //! it. The encoder always uses it, and it is not to be bent for speed.
 //!
 //! `coeffs_decode` is the same syntax for decoding alone, where most of a
-//! decode's symbols are read: no encoder values to carry, the levels kept
-//! in a padded byte map so that the contexts are sums without edge tests,
-//! the level symbols read with their CDF size known. Decoding uses it.
+//! decode's symbols are read: no encoder values to carry; each scan worked
+//! out once into where a coefficient lies and which CDF its position gives
+//! it; the levels' `coeff_base` symbols kept in a padded byte map so that
+//! a context is a sum without edge tests; the level symbols read without a
+//! branch on what they are; the signs read for the coefficients that have
+//! one, found by a bit each. Decoding uses it.
 //!
 //! They must never differ, and a test holds them to that:
 //! `CoefficientReader::Checked` runs both on every transform block from
@@ -483,7 +486,6 @@ impl TileDecoder<'_, '_> {
                 self.transform_type(x4, y4, tx_sz);
             }
             self.plane_tx_type = self.compute_tx_type(plane, tx_sz, x4, y4);
-            let scan = self.get_scan(tx_sz);
             let eob_multisize = TX_WIDTH_LOG2[tx_sz].min(5) + TX_HEIGHT_LOG2[tx_sz].min(5) - 4;
             let tx_class = get_tx_class(self.plane_tx_type);
             let ectx = if tx_class == TX_CLASS_2D { 0 } else { 1 };
@@ -521,94 +523,90 @@ impl TileDecoder<'_, '_> {
             let adj = ADJUSTED_TX_SIZE[tx_sz];
             let bwl = TX_WIDTH_LOG2[adj];
             let height = TX_HEIGHT[adj];
-            // The padded level map and where the context neighbours of
-            // this transform class lie in it (all at or after the
-            // coefficient, at most four rows or columns away).
-            let width = 1usize << bwl;
-            let lstride = width + 4;
-            let levels = &mut self.levels[..(height + 4) * lstride];
-            levels.fill(0);
-            let base_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| {
-                let o = SIG_REF_DIFF_OFFSET[tx_class][i];
-                o[0] as usize * lstride + o[1] as usize
-            });
-            let br_off: [usize; 3] = std::array::from_fn(|i| {
-                let o = MAG_REF_OFFSET_WITH_TX_CLASS[tx_class][i];
-                o[0] as usize * lstride + o[1] as usize
-            });
-            let quant = &mut self.quant;
+            // Each coefficient of the scan: where it lies, and the CDF its
+            // position alone would give it.
+            let map = &scan_map(tx_sz, tx_class)[..eob];
+            let near = match tx_class {
+                TX_CLASS_2D => NEAR_2D,
+                TX_CLASS_HORIZ => NEAR_HORIZ,
+                _ => NEAR_VERT,
+            };
+            self.levels[..(height + 4) * LEVEL_STRIDE].fill(0);
             let cdf_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
-            let cdf_base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
-            let cdf_br = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
-            for c in (0..eob).rev() {
-                let pos = scan[c] as usize;
-                let (row, col) = (pos >> bwl, pos & (width - 1));
-                let lpos = row * lstride + col;
-                let mut level;
-                if c == eob - 1 {
-                    let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    level = d.read_symbol_fixed(&mut cdf_eob[ctx]) as u32 + 1;
-                } else {
-                    let near = &levels[lpos..];
-                    let mag: u32 = base_off.iter().map(|&o| near[o].min(3) as u32).sum();
-                    let ctx = coeff_base_ctx_of(tx_sz, tx_class, row, col, mag);
-                    level = d.read_symbol_fixed(&mut cdf_base[ctx]) as u32;
+            // The levels, from the last coefficient back. From here to the
+            // signs the symbol decoder is a local of this function, which
+            // nothing takes the address of: it stays in registers.
+            let mut pass = LevelPass {
+                d: d.clone(),
+                cdf_base: cdf.coeff_base[tx_sz_ctx][ptype].as_flattened_mut(),
+                cdf_br: &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype],
+                levels: &mut self.levels,
+                quant: &mut self.quant,
+                tx_class,
+                bwl,
+                height,
+            };
+            // Which coefficients of the scan are not zero, a bit each.
+            let mut nonzero = [0u64; 16];
+            // The last coefficient has CDFs of its own and is never zero.
+            let c = eob - 1;
+            let ctx = coeff_base_eob_ctx(c, bwl, height);
+            let base = pass.d.read_symbol_fixed(&mut cdf_eob[ctx]) + 1;
+            pass.level(map[c] as usize, base);
+            nonzero[c >> 6] |= 1 << (c & 63);
+            // The ones between it and the first.
+            if eob > 2 {
+                match tx_class {
+                    TX_CLASS_2D => pass.between(map, &mut nonzero, NEAR_2D),
+                    TX_CLASS_HORIZ => pass.between(map, &mut nonzero, NEAR_HORIZ),
+                    _ => pass.between(map, &mut nonzero, NEAR_VERT),
                 }
-                if level > NUM_BASE_LEVELS {
-                    let near = &levels[lpos..];
-                    let mag: u32 = br_off.iter().map(|&o| near[o] as u32).sum();
-                    let br_ctx = coeff_br_ctx_of(tx_class, row, col, mag);
-                    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let coeff_br = d.read_symbol_fixed(&mut cdf_br[br_ctx]) as u32;
-                        level += coeff_br;
-                        if coeff_br < BR_CDF_SIZE - 1 {
-                            break;
-                        }
-                    }
-                }
-                quant[pos] = level as i32;
-                // At most NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15 here
-                // (the Golomb part comes with the signs, below).
-                levels[lpos] = level as u8;
             }
-            for c in 0..eob {
-                let pos = scan[c] as usize;
-                let sign = if quant[pos] != 0 {
-                    if c == 0 {
-                        d.read_symbol_fixed(&mut cdf.dc_sign[ptype][dc_ctx]) as u32
-                    } else {
-                        d.read_bool()
-                    }
+            // The first, whose context is 0 in a 2D transform whatever its
+            // neighbours.
+            if eob > 1 {
+                let e = map[0] as usize;
+                let around = &pass.levels[e & MAP_LPOS..];
+                let mag: u32 = near.iter().map(|&o| around[o] as u32).sum();
+                let ctx = coeff_base_ctx_of(tx_sz, tx_class, 0, 0, mag);
+                let base = pass.d.read_symbol_fixed(cdf_of(pass.cdf_base, 5 * ctx));
+                pass.level(e, base);
+                nonzero[0] |= (base != 0) as u64;
+            }
+            let LevelPass { mut d, quant, .. } = pass;
+            // The signs and the Golomb parts, in scan order: only a
+            // coefficient that is not zero has either, and `Quant` holds
+            // its level.
+            if nonzero[0] & 1 != 0 {
+                let sign = d.read_symbol_fixed(&mut cdf.dc_sign[ptype][dc_ctx]);
+                let level = level_golomb(&mut d, quant[0] as u32);
+                dc_category = if sign != 0 { 1 } else { 2 };
+                let level = level & 0xFFFFF;
+                cul_level += level;
+                quant[0] = if sign != 0 {
+                    -(level as i32)
                 } else {
-                    0
+                    level as i32
                 };
-                if quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
-                    let mut length = 0;
-                    loop {
-                        length += 1;
-                        if d.read_bool() != 0 {
-                            break;
-                        }
-                        if length > 32 {
-                            break;
-                        }
-                    }
-                    let mut x: u32 = 1;
-                    for _ in 0..length - 1 {
-                        x = (x << 1) | d.read_bool();
-                    }
-                    quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64)
-                        .min(i32::MAX as u64) as i32;
-                }
-                if pos == 0 && quant[pos] > 0 {
-                    dc_category = if sign != 0 { 1 } else { 2 };
-                }
-                quant[pos] &= 0xFFFFF;
-                cul_level += quant[pos] as u32;
-                if sign != 0 {
-                    quant[pos] = -quant[pos];
+                nonzero[0] &= !1;
+            }
+            for (i, word) in nonzero[..=(eob - 1) >> 6].iter().enumerate() {
+                let mut word = *word;
+                while word != 0 {
+                    let c = (i << 6) + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let pos = map[c] as usize >> MAP_POS_SHIFT;
+                    let sign = d.read_bool();
+                    let level = level_golomb(&mut d, quant[pos] as u32) & 0xFFFFF;
+                    cul_level += level;
+                    quant[pos] = if sign != 0 {
+                        -(level as i32)
+                    } else {
+                        level as i32
+                    };
                 }
             }
+            *self.sd.dec() = d;
             cul_level = cul_level.min(63);
         }
         self.above_level_ctx[plane][x4..x4 + w4].fill(cul_level as u8);
@@ -1230,6 +1228,231 @@ fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
     }
 }
 
+/// The row stride of the decode-only reader's level map: the widest
+/// transform's 32 columns and the 4 of padding the context neighbours
+/// reach into.
+const LEVEL_STRIDE: usize = 36;
+/// How far past a coefficient its context neighbours lie in the level
+/// map: four rows down at most.
+const LEVEL_NEAR: usize = 4 * LEVEL_STRIDE + 1;
+
+/// A scan map entry (see [`scan_map`]): the coefficient's place in the
+/// level map, the index in a block of `coeff_base` CDFs (as one array) of
+/// the CDF its position alone gives it, and its position in the block.
+const MAP_LPOS: usize = (1 << 11) - 1;
+const MAP_CDF_SHIFT: usize = 11;
+const MAP_CDF: usize = (1 << 8) - 1;
+const MAP_POS_SHIFT: usize = 19;
+
+/// Where the neighbours `Sig_Ref_Diff_Offset` names for a transform class
+/// lie in the level map, from the coefficient.
+const fn near_offsets(tx_class: usize) -> [usize; SIG_REF_DIFF_OFFSET_NUM] {
+    let mut o = [0; SIG_REF_DIFF_OFFSET_NUM];
+    let mut i = 0;
+    while i < SIG_REF_DIFF_OFFSET_NUM {
+        let d = SIG_REF_DIFF_OFFSET[tx_class][i];
+        o[i] = d[0] as usize * LEVEL_STRIDE + d[1] as usize;
+        i += 1;
+    }
+    o
+}
+const NEAR_2D: [usize; SIG_REF_DIFF_OFFSET_NUM] = near_offsets(TX_CLASS_2D);
+const NEAR_HORIZ: [usize; SIG_REF_DIFF_OFFSET_NUM] = near_offsets(TX_CLASS_HORIZ);
+const NEAR_VERT: [usize; SIG_REF_DIFF_OFFSET_NUM] = near_offsets(TX_CLASS_VERT);
+
+/// `5 * Min( ( mag + 1 ) >> 1, 4 )`: what the neighbours' sum `mag` adds
+/// to the index of a coefficient's `coeff_base` CDF (five entries each),
+/// for a sum of five values of at most 3.
+const MAG_CDF: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut mag = 0;
+    while mag < 16 {
+        let ctx = (mag + 1) >> 1;
+        t[mag] = 5 * if ctx < 4 { ctx as u8 } else { 4 };
+        mag += 1;
+    }
+    t
+};
+
+/// For the decode-only reader: the scan of a transform size and class,
+/// with what the reader needs of each position worked out once. Entry `c`
+/// holds, for the coefficient `pos = scan[c]` at `(row, col)`: its place
+/// `row * LEVEL_STRIDE + col` in the level map (`MAP_LPOS`); five times the
+/// part of `get_coeff_base_ctx()` that depends on the position alone
+/// (`MAP_CDF`: the context is that plus `Min( ( mag + 1 ) >> 1, 4 )` for
+/// every coefficient but the first of a 2D transform, whose context is 0);
+/// and `pos` itself.
+fn scan_map(tx_sz: usize, tx_class: usize) -> &'static [u32] {
+    static MAPS: std::sync::OnceLock<Vec<Box<[u32]>>> = std::sync::OnceLock::new();
+    &MAPS.get_or_init(|| {
+        let mut maps = Vec::with_capacity(TX_SIZES_ALL * 3);
+        for tx_sz in 0..TX_SIZES_ALL {
+            let bwl = TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx_sz]];
+            // A type of each class: the scan depends on the type through
+            // its class alone.
+            for (tx_class, t) in [
+                (TX_CLASS_2D, DCT_DCT),
+                (TX_CLASS_HORIZ, H_DCT),
+                (TX_CLASS_VERT, V_DCT),
+            ] {
+                let scan = scan_for(tx_sz, t);
+                // The first coefficient of every scan is the DC one, which
+                // the reader takes the first to be.
+                assert!(scan[0] == 0 && scan[1..].iter().all(|&pos| pos != 0));
+                let map = scan.iter().map(|&pos| {
+                    let pos = pos as usize;
+                    let (row, col) = (pos >> bwl, pos & ((1 << bwl) - 1));
+                    let ctx = coeff_base_ctx_of(tx_sz, tx_class, row, col, 0);
+                    ((pos << MAP_POS_SHIFT)
+                        | ((5 * ctx) << MAP_CDF_SHIFT)
+                        | (row * LEVEL_STRIDE + col)) as u32
+                });
+                maps.push(map.collect());
+            }
+        }
+        maps
+    })[tx_sz * 3 + tx_class]
+}
+
+/// The CDF at index `i` of a block of 4-symbol CDFs taken as one array.
+#[inline(always)]
+fn cdf_of(cdfs: &mut [u16], i: usize) -> &mut [u16; 5] {
+    (&mut cdfs[i..i + 5])
+        .try_into()
+        .expect("a slice of five is an array of five")
+}
+
+/// What the decode-only reader's pass over the levels works on.
+struct LevelPass<'a, 'd> {
+    d: crate::symbol::SymbolDecoder<'d>,
+    /// The 42 `coeff_base` CDFs of the block's size and plane type, end to
+    /// end.
+    cdf_base: &'a mut [u16],
+    cdf_br: &'a mut [[u16; 5]; 21],
+    /// `Min( level, 3 )` of the coefficients read so far, which is their
+    /// `coeff_base` symbol: what the contexts of `coeff_base` sum.
+    levels: &'a mut [u8; 36 * 36],
+    /// The levels themselves, as the reference keeps them.
+    quant: &'a mut [i32; 1024],
+    tx_class: usize,
+    bwl: usize,
+    height: usize,
+}
+
+impl LevelPass<'_, '_> {
+    /// Stores the level of the coefficient of map entry `e` whose
+    /// `coeff_base` symbol (or `coeff_base_eob` plus one) is `base`, after
+    /// reading its `coeff_br` part if it has one.
+    #[inline(always)]
+    fn level(&mut self, e: usize, base: usize) {
+        self.levels[e & MAP_LPOS] = base as u8;
+        let pos = e >> MAP_POS_SHIFT;
+        let mut level = base as u32;
+        if level > NUM_BASE_LEVELS {
+            (self.d, level) = level_above_base(
+                self.d.clone(),
+                self.cdf_br,
+                self.quant,
+                (self.tx_class, self.bwl, self.height),
+                pos,
+            );
+        }
+        self.quant[pos] = level as i32;
+    }
+
+    /// The coefficients between the last and the first of the block, from
+    /// the end of the scan back: `coeff_base` with the context of the five
+    /// neighbours at `near` (their offsets in the level map, known where
+    /// this is compiled).
+    #[inline(always)]
+    fn between(
+        &mut self,
+        map: &[u32],
+        nonzero: &mut [u64; 16],
+        near: [usize; SIG_REF_DIFF_OFFSET_NUM],
+    ) {
+        // The bits of the 64 coefficients the pass is in.
+        let mut word = 0u64;
+        for c in (1..map.len() - 1).rev() {
+            let e = map[c] as usize;
+            let lpos = e & MAP_LPOS;
+            let around: &[u8; LEVEL_NEAR] = self.levels[lpos..lpos + LEVEL_NEAR]
+                .try_into()
+                .expect("a slice of that length");
+            let mag: usize = near.iter().map(|&o| around[o] as usize).sum();
+            let i = MAG_CDF[mag & 15] as usize + ((e >> MAP_CDF_SHIFT) & MAP_CDF);
+            let base = self.d.read_symbol_fixed(cdf_of(self.cdf_base, i));
+            self.level(e, base);
+            word |= ((base != 0) as u64) << (c & 63);
+            if c & 63 == 0 {
+                nonzero[c >> 6] |= word;
+                word = 0;
+            }
+        }
+        nonzero[0] |= word;
+    }
+}
+
+/// `coeff_br` for a coefficient whose `coeff_base` left it above
+/// `NUM_BASE_LEVELS`: its level, at most
+/// `NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1` (15; the Golomb part comes with
+/// the signs). The context is `TileDecoder::coeff_br_ctx`'s, from `Quant`
+/// with its edge tests. One coefficient in seventy gets here: it is out of
+/// line and takes and returns the symbol decoder by value, so that the
+/// level pass keeps it in registers.
+#[inline(never)]
+fn level_above_base<'d>(
+    mut d: crate::symbol::SymbolDecoder<'d>,
+    cdf_br: &mut [[u16; 5]; 21],
+    quant: &[i32; 1024],
+    (tx_class, bwl, height): (usize, usize, usize),
+    pos: usize,
+) -> (crate::symbol::SymbolDecoder<'d>, u32) {
+    let width = 1usize << bwl;
+    let (row, col) = (pos >> bwl, pos & (width - 1));
+    let mut mag = 0u32;
+    for o in &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class] {
+        let (r, c) = (row + o[0] as usize, col + o[1] as usize);
+        if r < height && c < width {
+            mag += (quant[(r << bwl) + c] as u32).min(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1);
+        }
+    }
+    let br_ctx = coeff_br_ctx_of(tx_class, row, col, mag);
+    let mut level = NUM_BASE_LEVELS + 1;
+    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
+        let coeff_br = d.read_symbol_fixed(&mut cdf_br[br_ctx]) as u32;
+        level += coeff_br;
+        if coeff_br < BR_CDF_SIZE - 1 {
+            break;
+        }
+    }
+    (d, level)
+}
+
+/// The Golomb part of a level that the symbols left at their most, 15:
+/// `golomb_length_bit`s and the bits they count.
+#[inline(always)]
+fn level_golomb(d: &mut crate::symbol::SymbolDecoder, level: u32) -> u32 {
+    if level <= NUM_BASE_LEVELS + COEFF_BASE_RANGE {
+        return level;
+    }
+    let mut length = 0;
+    loop {
+        length += 1;
+        if d.read_bool() != 0 {
+            break;
+        }
+        if length > 32 {
+            break;
+        }
+    }
+    let mut x: u32 = 1;
+    for _ in 0..length - 1 {
+        x = (x << 1) | d.read_bool();
+    }
+    (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64).min(i32::MAX as u64) as u32
+}
+
 /// `get_coeff_base_ctx()` with `isEob` set, rebased for `coeff_base_eob`.
 fn coeff_base_eob_ctx(c: usize, bwl: usize, height: usize) -> usize {
     if c == 0 {
@@ -1242,4 +1465,55 @@ fn coeff_base_eob_ctx(c: usize, bwl: usize, height: usize) -> usize {
         return 2;
     }
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scan map entry says of its coefficient what the reference
+    /// functions say: its position, its place in the level map, and, with
+    /// the table of the neighbours' sums, the `coeff_base` context of every
+    /// coefficient but the first, for every sum.
+    #[test]
+    fn scan_map_agrees_with_the_reference_contexts() {
+        for tx_sz in 0..TX_SIZES_ALL {
+            let bwl = TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx_sz]];
+            for t in 0..16 {
+                let tx_class = get_tx_class(t);
+                let scan = scan_for(tx_sz, t);
+                let map = scan_map(tx_sz, tx_class);
+                assert_eq!(map.len(), scan.len(), "size {tx_sz} type {t}");
+                for (c, (&e, &pos)) in map.iter().zip(scan).enumerate() {
+                    let (e, pos) = (e as usize, pos as usize);
+                    let (row, col) = (pos >> bwl, pos & ((1 << bwl) - 1));
+                    assert_eq!(e >> MAP_POS_SHIFT, pos);
+                    assert_eq!(e & MAP_LPOS, row * LEVEL_STRIDE + col);
+                    assert!((e & MAP_LPOS) + LEVEL_NEAR <= 36 * 36);
+                    assert_eq!(c == 0, pos == 0);
+                    if c == 0 {
+                        continue;
+                    }
+                    for mag in 0..16u32 {
+                        let i = MAG_CDF[mag as usize] as usize + ((e >> MAP_CDF_SHIFT) & MAP_CDF);
+                        let ctx = coeff_base_ctx_of(tx_sz, tx_class, row, col, mag);
+                        assert_eq!(i, 5 * ctx, "size {tx_sz} type {t} c {c} mag {mag}");
+                        assert!(ctx < 42);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The neighbours of the level map are `Sig_Ref_Diff_Offset`'s, and a
+    /// block's padding holds every one of them.
+    #[test]
+    fn level_map_neighbours() {
+        for (tx_class, near) in [NEAR_2D, NEAR_HORIZ, NEAR_VERT].iter().enumerate() {
+            for (o, d) in near.iter().zip(&SIG_REF_DIFF_OFFSET[tx_class]) {
+                assert_eq!(*o, d[0] as usize * LEVEL_STRIDE + d[1] as usize);
+                assert!(d[0] <= 4 && d[1] <= 4 && *o < LEVEL_NEAR);
+            }
+        }
+    }
 }

@@ -152,10 +152,10 @@ pub(crate) struct TileDecoder<'a, 'b> {
     // Coefficient decoding.
     pub(crate) quant: Box<[i32; 1024]>,
     /// The decode-only coefficient reader's map of the levels read so far
-    /// in the transform block (at most 15 each), with four zero columns to
-    /// the right of each row and four zero rows below, so that a context
-    /// neighbour past the block's edge reads as the zero the specification
-    /// gives it, without a test.
+    /// in the transform block (`Min( level, 3 )` each, rows of 36), with
+    /// zero columns to the right of each row and four zero rows below, so
+    /// that a context neighbour past the block's edge reads as the zero
+    /// the specification gives it, without a test.
     pub(crate) levels: Box<[u8; 36 * 36]>,
     /// Which coefficient reader decodes (see `residual.rs`).
     pub(crate) coeff_reader: crate::decoder::CoefficientReader,

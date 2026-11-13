@@ -313,6 +313,11 @@ step before and after from one run.
 | | mandelbrot 720p | 51.3 (0.79x) | 104 (0.72x) | 125 |
 | | mandelbrot 720p 10-bit | 66.0 (0.88x) | 147 (1.80x) | 166 |
 | | mandelbrot 1080p | 25.3 (0.76x) | 55.1 (0.73x) | 65.3 |
+| 10. the level pass: each scan worked out once, a map of `coeff_base` symbols, the signs by a bit each | fixture 320x180 | 756 (0.64x) | 1103 (0.64x) | 1295 |
+| | testsrc2 720p | 129 (0.75x) | 205 (0.70x) | 242 |
+| | mandelbrot 720p | 52.9 (0.81x) | 110 (0.76x) | 135 |
+| | mandelbrot 720p 10-bit | 65.0 (0.87x) | 149 (1.84x) | 175 |
+| | mandelbrot 1080p | 25.9 (0.80x) | 58.3 (0.78x) | 70.1 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -321,6 +326,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 | before | 2.92 | 2.82 | 2.46 | 1.66 | 2.96 | 0.97 |
 | 8 | 2.40 | 2.42 | 1.98 | 1.60 | 2.94 | 0.97 |
 | 9 | 2.06 | 2.10 | 1.71 | 1.62 | 2.96 | 0.97 |
+| 10 | 1.45 | 1.47 | 1.08 | 1.61 | 2.98 | 0.98 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -338,4 +344,17 @@ After step 8 a 4-symbol read still cost 7.3 ns, about 29 cycles, for a dependent
 
 `read_symbol_fixed` for two, three and four symbols (every CDF the coefficient loop reads: `coeff_base`, `coeff_base_eob`, `coeff_br`, `dc_sign`) now has no branch that depends on the symbol. Every threshold of 8.2.6 is computed. They decrease strictly from one symbol to the next (a CDF does not decrease, and the `EC_MIN_PROB` term does), so the symbol is the number of thresholds above `SymbolValue`, and the entries the adaptation moves towards zero, those below the symbol, are exactly those whose threshold is above it: each entry's two possible adaptations are computed and one is selected by that entry's own comparison, and the two ends of the new interval are selected the same way (`core::hint::select_unpredictable`, so that they stay selects). What this takes for granted of a CDF, that it does not decrease and ends at `1 << 15`, is tested for every default coefficient CDF and for the adaptation, which keeps both. The general `read_symbol` is unchanged, and so is everything that is not a coefficient.
 
-On a recording of the level and sign passes of twelve frames (16 000 blocks, 1.6 million coefficients) replayed outside the decoder, with the loop otherwise as it was: 12.3 to 9.5 ns a coefficient natively, 12.9 to 11.0 in wasm. In the decoder, from one run: the part 2.37 to 2.06 ms in wasm simd and 1.98 to 1.71 natively; testsrc2 720p 198 to 211 fps simd and 124 to 135 baseline, mandelbrot 720p 101.2 to 103.8 and 50.8 to 51.3, natively 120 to 125. Two variants measured on the way and left out: one arm for each symbol (the search's exit for a symbol doing that symbol's renormalisation and adaptation, so that the adaptation has no loop) is 12 % faster than the loops on the symbols alone and 3 to 5 % in the coefficient loop, where the mispredictions stay; the adaptation without a branch but computed from the symbol after the search (masks) is slower than the loops, because the next read of the same CDF then waits for the whole search.
+On a recording of the level and sign passes of twelve frames (16 000 blocks, 1.6 million coefficients) replayed outside the decoder, in a loop that differs in the reads alone: 12.1 to 9.5 ns a coefficient natively, 12.7 to 11.0 in wasm. In the decoder, from one run: the part 2.37 to 2.06 ms in wasm simd and 1.98 to 1.71 natively; testsrc2 720p 198 to 211 fps simd and 124 to 135 baseline, mandelbrot 720p 101.2 to 103.8 and 50.8 to 51.3, natively 120 to 125. Two variants measured on the way and left out: one arm for each symbol (the search's exit for a symbol doing that symbol's renormalisation and adaptation, so that the adaptation has no loop) is 12 % faster than the loops on the symbols alone and 3 to 5 % in the coefficient loop, where the mispredictions stay; the adaptation without a branch but computed from the symbol after the search (masks) is slower than the loops, because the next read of the same CDF then waits for the whole search.
+
+### 10. The level pass: each scan worked out once, a map of `coeff_base` symbols, the signs by a bit each
+
+With the reads no longer mispredicted, what bounds the level pass is how many instructions surround each read: about 135 a coefficient natively, at four or so a cycle, against a dependent chain of twenty cycles. The pass was rewritten to need fewer, each change measured on the replay of step 9 before it went in:
+
+- **The scan, worked out once.** For each transform size and class a table gives, for every position of the scan, where the coefficient lies in the level map, the index of the `coeff_base` CDF its position alone gives it, and the position: one load for what was a row and column split, two clamps and a three-dimensional table lookup for every coefficient. The tables are built from `scan_for` and `coeff_base_ctx_of` the first time they are needed, and a test holds every entry to those two for every size, type, position and neighbour sum.
+- **A map of `coeff_base` symbols.** The padded level map (now with one stride, 36, so that the neighbours' offsets are constants) holds `Min( level, 3 )`, which is the `coeff_base` symbol as read, so a context is five loads, four additions and a 16-entry table. The levels themselves go to `Quant`, where the reference keeps them; the context of `coeff_br` (one coefficient in seventy has one) is computed from there as the reference computes it, edge tests and all, in a function out of line.
+- **The symbol decoder in registers.** For the two passes it is a local that nothing takes the address of: the byte-at-a-time refill and the `coeff_br` reader take and return it by value.
+- **The signs by a bit each.** The level pass sets a bit for every coefficient that is not zero; the sign pass walks the bits, 34 000 of the 124 000 coefficients of a frame, and no longer tests each coefficient for zero, a test that was mispredicted as often as the symbols were.
+
+A padded level map was measured in the first round at between -5 % and +6 % and left for later; step 6 then put one in. Measured again here, interleaved on the replay: the pass with the padded map of step 6 and searching reads is 14.2 ns a coefficient natively and 16.2 in wasm; this step's map, tables and bits bring that to 12.1 and 12.7, the reads of step 9 to 9.5 and 11.0, the `Min( level, 3 )` map with the CDF index in the table and `coeff_br` out of line to 8.1 and 10.5. A padded map pays, and more once nothing around it is mispredicted.
+
+In the decoder, from one run: the part 2.11 to 1.45 ms in wasm simd, 2.15 to 1.47 in baseline, 1.71 to 1.08 natively; mandelbrot 720p 103.3 to 110.3 fps simd, 51.2 to 52.9 baseline, 124.5 to 135.3 natively. The part is now below the 1.6 ms measured for rav1d's symbol decoder and coefficient reader in the first round. What it still costs is the reads themselves: the dependent chain of an adaptive read is about twenty cycles when the next read uses the same CDF, which it often does.
