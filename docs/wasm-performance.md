@@ -917,3 +917,252 @@ percent):
 
 All fifteen gate streams are bit-exact in both builds. This is one thread;
 the threads builds still scale as before, which is what is left.
+
+## Threads
+
+Everything above is one thread. With `set_threads(n)` the decoder
+parallelised the tiles of a frame and the bands of its post-filters, so a
+stream with one tile to a frame, which is what video sites serve, was
+parsed and reconstructed on one thread whatever `n`, and eight threads
+bought it a fifth. This section is the work on that. The design, and how
+what may run at the same time was derived from the specification, is in
+[threading.md](threading.md).
+
+**How the numbers are taken.** wasm-av1 at `ee33e98` with
+`tools/wasm-perf/wasm-av1-ee33e98-frames-in-flight.diff` on this crate
+(its adapter queues each unit and takes frames as they come), the
+simd-threads build, in Node 26 with every wasm thread a `worker_threads`
+Worker. `threads-table.sh`: the builds and thread counts take turns, a
+process each (one warm-up decode, three timed ones, their median), and a
+cell is the median of seven such rounds; every decode's MD5 is checked
+against libdav1d's. rav1d is its prebuilt simd-threads package (`6f780a0`
+in that checkout's manifest) through the same harness. Other work was
+running on the machine (an Apple M3 Max, 16 cores; load average 2.5 to
+4.5), so read a few percent as noise.
+
+There are two clocks, and they do not agree for a decoder that decodes
+while its caller is doing something else:
+
+- **The wall clock** of the whole decode loop, frames taken and not
+  hashed (`WALL=1`). What a player gets.
+- **The time inside the decode calls alone**, which is what every table
+  above uses and what this document's earlier thread figures were. With
+  frames in flight the decoder's threads go on decoding while the harness
+  hashes the frame it was just handed, and that time is not counted: this
+  clock then flatters the decoder (rav1d's frame threads hardly gain by
+  it in this harness; this crate's frames in flight gain a great deal).
+  It is given because the reference figures were taken with it; **compare
+  by the wall clock.**
+
+`before` is `c753ea1`, where this section starts. `one at a time` is the
+decoder now through `decode_all` (the adapter built with
+`RIVET_FRAMES_IN_FLIGHT=1`): a unit's frames come back from the call that
+took the unit. `in flight` has a frame in flight for each thread, the
+adapter's default with more than one thread.
+
+Wall clock, fps on 1 / 2 / 4 / 8 threads:
+
+| clip | build | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| mandelbrot 720p | rav1d | 153 | 277 | 398 | 505 |
+|  | before | 184 (1.20x) | 209 (0.75x) | 224 (0.56x) | 220 (0.44x) |
+|  | one at a time | 185 (1.21x) | 313 (1.13x) | 341 (0.86x) | 338 (0.67x) |
+|  | in flight | 185 (1.21x) | 326 (1.18x) | 505 (1.27x) | 680 (1.35x) |
+| mandelbrot 1080p | rav1d | 80 | 144 | 213 | 278 |
+|  | before | 89 (1.11x) | 104 (0.72x) | 113 (0.53x) | 115 (0.41x) |
+|  | one at a time | 89 (1.11x) | 157 (1.09x) | 191 (0.90x) | 189 (0.68x) |
+|  | in flight | 90 (1.12x) | 162 (1.12x) | 266 (1.25x) | 369 (1.33x) |
+| mandelbrot 720p, 8 tiles | rav1d | 154 | 294 | 542 | 958 |
+|  | before | 185 (1.20x) | 292 (0.99x) | 390 (0.72x) | 373 (0.39x) |
+|  | one at a time | 186 (1.21x) | 292 (0.99x) | 391 (0.72x) | 371 (0.39x) |
+|  | in flight | 185 (1.20x) | 288 (0.98x) | 386 (0.71x) | 372 (0.39x) |
+
+The same runs by the time inside the decode calls:
+
+| clip | build | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| mandelbrot 720p | rav1d | 152 | 276 | 395 | 503 |
+|  | before | 182 (1.20x) | 208 (0.75x) | 223 (0.56x) | 222 (0.44x) |
+|  | one at a time | 184 (1.21x) | 312 (1.13x) | 341 (0.86x) | 338 (0.67x) |
+|  | in flight | 184 (1.21x) | 411 (1.49x) | 832 (2.11x) | 1016 (2.02x) |
+| mandelbrot 1080p | rav1d | 80 | 143 | 210 | 277 |
+|  | before | 89 (1.11x) | 104 (0.73x) | 112 (0.53x) | 115 (0.42x) |
+|  | one at a time | 89 (1.11x) | 156 (1.09x) | 191 (0.91x) | 190 (0.69x) |
+|  | in flight | 89 (1.11x) | 205 (1.43x) | 430 (2.05x) | 501 (1.81x) |
+| mandelbrot 720p, 8 tiles | rav1d | 153 | 290 | 538 | 952 |
+|  | before | 184 (1.20x) | 289 (1.00x) | 391 (0.73x) | 376 (0.39x) |
+|  | one at a time | 184 (1.20x) | 290 (1.00x) | 391 (0.73x) | 379 (0.40x) |
+|  | in flight | 184 (1.20x) | 288 (0.99x) | 386 (0.72x) | 376 (0.39x) |
+
+Natively (aarch64): wasm-av1's `decode_ivf` by its own clock, which is
+the time inside the decode calls (`native-threads-table.sh`, median of 7,
+the builds taking turns); rav1d's native build there has no assembly.
+
+| clip | build | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| mandelbrot 720p | rav1d | 88 | 163 | 249 | 328 |
+|  | before | 224 (2.55x) | 252 (1.55x) | 267 (1.07x) | 259 (0.79x) |
+|  | one at a time | 222 (2.52x) | 377 (2.31x) | 420 (1.69x) | 412 (1.26x) |
+|  | in flight | 221 (2.51x) | 562 (3.45x) | 904 (3.63x) | 1542 (4.70x) |
+| mandelbrot 1080p | rav1d | 43 | 80 | 128 | 180 |
+|  | before | 107 (2.49x) | 124 (1.55x) | 134 (1.05x) | 136 (0.76x) |
+|  | one at a time | 106 (2.47x) | 186 (2.33x) | 233 (1.82x) | 231 (1.28x) |
+|  | in flight | 106 (2.47x) | 267 (3.34x) | 421 (3.29x) | 614 (3.41x) |
+| mandelbrot 720p, 8 tiles | rav1d | 85 | 163 | 309 | 557 |
+|  | before | 224 (2.64x) | 332 (2.04x) | 425 (1.38x) | 372 (0.67x) |
+|  | one at a time | 223 (2.62x) | 338 (2.07x) | 436 (1.41x) | 404 (0.73x) |
+|  | in flight | 222 (2.61x) | 332 (2.04x) | 437 (1.41x) | 394 (0.71x) |
+
+And this crate's own `examples/av1_decbench.rs`, the wall clock of the
+decode with nothing else in the loop, best of 5 (not interleaved), one
+frame at a time and with as many frames in flight as threads:
+
+| clip | | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| mandelbrot 720p | one at a time | 213 | 371 | 429 | 418 |
+| | in flight | 213 | 384 | 617 | 870 |
+| mandelbrot 1080p | one at a time | 105 | 185 | 237 | 235 |
+| | in flight | 105 | 192 | 326 | 462 |
+| mandelbrot 720p, 8 tiles | one at a time | 222 | 342 | 448 | 408 |
+| | in flight | 222 | 340 | 446 | 403 |
+
+**Against the target** (at 4 and at 8 threads at least 0.85 of rav1d on
+the one-tile clips, one thread unchanged, the eight-tile clip no slower):
+by the wall clock, with frames in flight, mandelbrot 720p is at 1.27 of rav1d on 4 threads and 1.35 on 8, and 1080p at 1.25 and 1.33: ahead of it. One frame at a time they are at 0.86 and 0.67, and 0.90 and 0.68: the target takes the frames in flight, and with them a unit's frames come out a few units after the unit went in. One thread is where it was (185 against 184 fps and 90 against 89 in this build; the builds without threads are below). The eight-tile clip is where it was, to within the noise (185 / 292 / 390 / 373 before, 186 / 292 / 391 / 371 one at a time, 185 / 288 / 386 / 372 with frames in flight, where each of its units was tried in flight and then decoded in place; a stream of such frames is no longer tried unit after unit, since `6be8d84`: 185 / 293 / 392 / 378): nothing here makes its frames jobs, and rav1d is 2.6 times as fast on it on 8 threads.
+
+### The steps
+
+1. **Rows behind the parsing** (`53fa752`). The tile walker can parse a
+   superblock row into a record and reconstruct a row from one, as well
+   as do both; the calling thread parses, the others reconstruct the
+   rows in a wavefront two superblocks behind the row above, each taking
+   that row's last sample line as a copy. `Shared`, the window type the
+   threads hold their rows through. In the wasm simd-threads build by the
+   time inside the decode calls (a frame at a time, the two clocks agree
+   to a percent or two; these and the next step's are from the runs of
+   their day, one timed decode a process, which reads some 8 % lower
+   than the tables above), mandelbrot 720p on 1 / 2 / 4 / 8 threads: 168
+   / 190 / 203 / 204 to 167 / 254 / 254 / 249; 1080p 82 / 94 / 102 / 104
+   to 81 / 131 / 134 / 137.
+2. **The post-filters behind the reconstruction** (`0618dee`). Deblock,
+   CDEF and loop restoration are tasks of a row (a stripe), ready when
+   the rows they read are final; a frame without CDEF or loop restoration
+   no longer copies the frame for them. 720p: 167 / 253 / 255 / 250 to
+   166 / 277 / 287 / 270; 1080p 81 / 130 / 135 / 137 to 81 / 138 / 158 /
+   147. A frame has work for two or three threads and no more: its
+   parsing is one thread's, about 1.8 ms of a 4.8 ms frame natively.
+3. **Frames in flight** (`906fbe4`). One engine for the tasks of every
+   frame in flight; a frame's parsing waits for the frames whose saved
+   state it reads and its rows for its references' samples;
+   `set_frames_in_flight`, `queue`, `poll`, `wait`, with every unit's
+   result that of decoding it in place. With it: the scheduler wakes one
+   waiting thread for each task that becomes ready, the one that waited
+   last first, where every thread used to be woken at every change
+   (which is why eight threads were slower than four, and are not now);
+   the decoder keeps its threads between frames (worth nothing measurable
+   by itself on this machine, where starting a thread takes some ten
+   microseconds, but it is what a session of frames in flight runs on);
+   and the windows read a prefix of their array, below. The tables above
+   are its before and after.
+
+### One thread
+
+The same decoder on one thread, in the builds without threads (`simd`,
+`baseline`), by `bench-turns.mjs`, median of 9:
+
+| clip | simd: rav1d | before | now | baseline: rav1d | before | now |
+|---|---|---|---|---|---|---|
+| mandelbrot 720p | 153.2 | 183.9 | 183.4 (-0.3 %) | 68.6 | 74.6 | 74.5 (-0.1 %) |
+| mandelbrot 720p, 8 tiles | 152.7 | 183.7 | 182.3 (-0.8 %) | 65.4 | 70.6 | 70.5 (-0.1 %) |
+| mandelbrot 1080p | 79.8 | 89.1 | 89.1 (+0.0 %) | 34.0 | 34.2 | 34.3 (+0.3 %) |
+| mandelbrot 720p, 10-bit | 86.8 | 219.9 | 219.5 (-0.2 %) | 79.9 | 82.1 | 81.8 (-0.4 %) |
+| testsrc2 720p | 323.3 | 281.5 | 278.3 (-1.1 %) | 187.0 | 175.2 | 174.7 (-0.3 %) |
+
+The first version of the window type let a window read any range of its
+array, and checking an index against a range is a subtraction more than
+checking it against a length. That cost about 1 % of a one-thread decode
+in the simd build (183.1 against 184.1 fps on mandelbrot 720p, 87.5
+against 88.3 on 1080p, 278.6 against 281.4 on testsrc2; a build with the
+subtraction taken out of the reads, which is not sound for windows, gave
+184.2, 89.0 and 283.3). So a window now reads from the start of its array
+to a limit, which is all a reader in the pipeline ever needs, and reads
+the rows it writes by name (`Shared::mine`). A variant with the second
+check behind a call that returns (179.8 to 174.9 fps on mandelbrot 720p)
+is not on the branch: a slow path that comes back costs the compiler what
+a panic does not.
+
+### What every step was held to
+
+`tools/wasm-perf/gate.sh` for each step's commit: formatting, clippy for
+the host, wasm32 with and without `simd128` and x86-64, the
+documentation, `cargo test --release` (the 244 AOM vectors with both
+coefficient readers checked against each other among them), the vectors
+again on 4 and on 8 threads and, from step 3, with 4 and 8 frames in
+flight; the threaded tests (`tests/threads.rs`) and the fuzz tests in
+debug, the latter on 4 threads and with frames in flight too; x86-64's
+tests under Rosetta; wasm-av1's tests on the tree; 15 streams through
+both wasm builds against rav1d's and libdav1d's MD5s; the clips natively
+and in the simd-threads build on 1, 2, 4 and 8 threads.
+
+`tests/threads.rs` holds every thread count (2, 3, 4, 8, 16) and every
+combination of threads and frames in flight it tries to one thread, unit
+by unit: the same frames, the same errors, for the committed vectors and
+for those vectors with bits flipped and units cut (24 kinds of damage a
+vector, which give an error in more than a quarter of the cases); every
+such decode on a thread of its own with two minutes to finish, so that a
+hang fails. Looped: `tests/threads.rs` and the registered-runner test 25 times
+over with twice the repetitions (`AV1_THREAD_SOAK=2`), while a gate was
+running on the same machine: the threaded tests passed every time. The
+runner test failed once in the 25: a race in the test itself (it asked
+whether the runner's threads were back from a started job before they
+could be), which was fixed, and it then passed 60 times of 60. The unit
+tests of the pool and of the window type 200 times of 200, after two of
+the pool's tests were corrected the same way (they assumed every index
+of a job is taken by a different thread, which the pool does not
+promise).
+
+At the end, on `906fbe4`: the 244 AOM vectors natively, both coefficient readers
+checked against each other, on 1, 2, 3, 4, 8 and 16 threads and with 2,
+4 and 8 frames in flight (244 of 244 each time); the 242 of them that are
+IVF through the wasm simd-threads build, with frames in flight on 1, 4
+and 8 threads and one frame at a time on 4 and 8, against rav1d's build
+(`vectors-threads.sh`: the same MD5 for all 242, five times); and
+wasm-av1 `main` with its adapter changed as `threading.md` says ("What a
+caller changes"; the patch is for that repository, not in this one): its
+Rust tests, its Node tests of the four variants on 1, 2, 4 and 8
+threads, and its browser tests in Chromium, Firefox and WebKit, on 2, 4
+and 8 threads among them.
+
+### Ideas known from elsewhere
+
+That decoders parse apart from reconstructing, run superblock rows in a
+wavefront, let the post-filters follow by rows, and decode several frames
+at once with the output delayed, is common knowledge of how video
+decoders are threaded. None of it was taken from another decoder's
+source or design notes: what waits for what was read off the
+specification (threading.md, "What depends on what"), and what the
+implementation adds of its own is how it keeps that safe (the windows,
+which turn a mistake in the schedule into a panic) and how it keeps a
+unit's result exact (anything that does not fit, and every error, is
+decoded again in place).
+
+### What is left
+
+- **A frame waits for whole reference frames.** Its rows could start when
+  the rows of a reference their motion vectors reach are final; the
+  frames at the top of a pyramid, which everything refers to, would then
+  overlap with the ones below them. The windows already say "up to this
+  row".
+- **Frames of several tiles are not jobs.** They are decoded in place
+  (tiles in parallel into frame states that are copied back, the filters
+  in bands), with or without frames in flight: the eight-tile clip is
+  where it was, a third of rav1d's speed on eight threads.
+- **Memory is allocated per frame.** Every frame's buffers, and a tile
+  walker for every row's reconstruction; a frame's setup is 2 % of a
+  one-thread decode.
+- **One frame at a time is bound by the parsing**, one thread's: two or
+  three threads' worth. That is what frames in flight are for, and they
+  cost a few units of delay.
+- **One thread** is within about 1 % of where it was, and not ahead: a
+  window's writes still check a range, and a block still goes through
+  the question "which walk is this".
