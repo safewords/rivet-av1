@@ -390,11 +390,23 @@ input, so the one run covers both.
 
 Written from the specification's text; **no AV1 implementation's source was
 read** — not libaom, not dav1d or rav1d, not rav1e, not SVT-AV1, not
-FFmpeg — and none was run: the tests use only the specification-derived
-checks above, round trips through this crate, and published conformance
-bitstreams with their MD5s (data: the AOM test vectors from AOMedia's
-public test-data bucket, the committed ones listed with their source in
-[`tests/data/README.md`](tests/data/README.md), and the Argon streams). The
+FFmpeg. The tests run none of them either: they use only the
+specification-derived checks above, round trips through this crate, and
+published conformance bitstreams with their MD5s (data: the AOM test vectors
+from AOMedia's public test-data bucket, the committed ones listed with their
+source in [`tests/data/README.md`](tests/data/README.md), and the Argon
+streams).
+
+The speed work recorded in
+[`docs/wasm-performance.md`](docs/wasm-performance.md) does run two of them,
+as black boxes: rav1d as the timing reference, and libdav1d (through FFmpeg)
+for the MD5s of the benchmark clips in `tools/wasm-perf`. Their source was
+not read for it. Some of its optimisations are techniques commonly known
+from other AV1 decoders (16-bit prediction intermediates, a DC-only
+transform shortcut, a padded level map for coefficient contexts); each was
+written from this crate's own specification-derived code and held to it
+bit for bit, and what that document says about rav1d's internals comes from
+profiles and general knowledge, not from its code. The
 specification's tables (default CDFs, scans, quantiser lookups and
 matrices, filter taps) are data and were transcribed by
 [`tools/gen_tables.py`](tools/gen_tables.py) from the specification's own
