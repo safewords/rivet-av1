@@ -1,8 +1,10 @@
 #!/bin/bash
 # threads-table.sh ROUNDS "label=pkgdir[:variant] ..." "1 2 4 8" clip.ivf... — the threads builds in Node (bench-threads.mjs),
-# taking turns: every round runs each build at each thread count once (one warm-up decode and one timed decode per
-# process), so that other work on the machine falls on all of them alike. Prints the median fps of the rounds per clip,
-# build and thread count, and fails a cell whose MD5 is not the reference. Raw lines go to logs/threads-table-<pid>.log.
+# taking turns: every round runs each build at each thread count once (a process: one warm-up decode, then RUNS_PER
+# timed decodes, 3 unless set, of which the median), so that other work on the machine falls on all of them alike.
+# Prints the median fps of the rounds per clip, build and thread count, and marks a cell whose MD5 is not the
+# reference. Raw lines go to logs/threads-table-<pid>.log. (A process's first timed decode is slower than its later
+# ones when the threads have just been parked: one timed decode a process understates a decoder that keeps them busy.)
 S="${WASM_PERF:?set WASM_PERF to the working directory described in README.md}"
 here="$(cd "$(dirname "$0")" && pwd)"
 rounds="$1"; builds="$2"; threads="$3"; shift 3
@@ -14,7 +16,7 @@ for clip in "$@"; do
       label="${b%%=*}"; dir="${b#*=}"; variant=simd-threads
       case "$dir" in *:*) variant="${dir##*:}"; dir="${dir%:*}";; esac
       for t in $threads; do
-        out=$(node "$here/bench-threads.mjs" 1 "$dir" "$variant" "$t" "$clip" 2>&1 | tail -1)
+        out=$(node "$here/bench-threads.mjs" "${RUNS_PER:-3}" "$dir" "$variant" "$t" "$clip" 2>&1 | tail -1)
         echo "$label $t $out" >> "$raw"
       done
     done

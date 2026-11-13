@@ -328,6 +328,11 @@ pub struct Decoder {
     samples_in_flight: u64,
     units: flight::Units,
     flying: Option<flight::Flight>,
+    /// How many units are decoded in place before one is flown again:
+    /// counted down, and what the unit being flown asks for when it meets
+    /// a frame that is not a job or finds no thread to fly on.
+    grounded: usize,
+    ground_for: usize,
 }
 
 impl Default for Decoder {
@@ -360,6 +365,8 @@ impl Decoder {
             samples_in_flight: u64::MAX,
             units: Default::default(),
             flying: None,
+            grounded: 0,
+            ground_for: 0,
         }
     }
 
@@ -594,6 +601,7 @@ impl Decoder {
                         // Not a frame that flies: the unit is decoded in
                         // place (`flight.rs`), and this error goes no
                         // further.
+                        self.ground_for = flight::AFTER_A_FRAME_THAT_IS_NOT_A_JOB;
                         return Err(Error::unsupported("a frame that is decoded in place"));
                     }
                     let f = self.setup_frame(seq, hdr)?;
@@ -701,7 +709,13 @@ impl Decoder {
         let job = pipeline::Job::new(&self.refs, out.clone(), input);
         if self.flying.is_some() {
             // In flight: the frame is in its slots as of now (7.20), and
-            // decoded when its turn comes.
+            // decoded when its turn comes, by the threads of a session.
+            if !self.engine.session(self.threads) {
+                // No thread to be had (not yet, perhaps): in place, then,
+                // this unit and the next few (the error goes no further).
+                self.ground_for = flight::WITHOUT_THREADS;
+                return Err(Error::unsupported("no threads for frames in flight"));
+            }
             self.engine.wait_for_room(
                 self.frames_in_flight,
                 self.samples_in_flight,

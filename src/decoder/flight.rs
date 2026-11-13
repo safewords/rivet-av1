@@ -69,6 +69,14 @@ pub(super) struct Unit {
     state: State,
 }
 
+/// How many units are decoded in place without trying to fly them, after
+/// one that held a frame that is not a job (a frame of several tiles,
+/// say: they come in streams, and the attempt costs a snapshot and a
+/// second parse of the unit's headers), and after one that found no
+/// thread to fly on (an embedder's threads may still be coming up).
+pub(super) const AFTER_A_FRAME_THAT_IS_NOT_A_JOB: usize = 15;
+pub(super) const WITHOUT_THREADS: usize = 3;
+
 /// The units queued, oldest first.
 #[derive(Default)]
 pub(super) struct Units {
@@ -167,12 +175,18 @@ impl Decoder {
         self.seen_frame_header = false;
         self.shown.clear();
         self.hdr = HdrMetadata::default();
+        self.grounded = 0;
     }
 
-    /// Whether units are flown at all: several frames may be in flight,
-    /// and there are threads to decode them while the caller is away.
+    /// Whether the next unit is flown: several frames may be in flight on
+    /// several threads, and the decoder is not staying on the ground for
+    /// a few units (see `AFTER_A_FRAME_THAT_IS_NOT_A_JOB`).
     fn flies(&mut self) -> bool {
-        self.frames_in_flight > 1 && self.threads > 1 && self.engine.session(self.threads)
+        if self.grounded > 0 {
+            self.grounded -= 1;
+            return false;
+        }
+        self.frames_in_flight > 1 && self.threads > 1
     }
 
     fn before(&self) -> Before {
@@ -217,6 +231,7 @@ impl Decoder {
             if flown.is_err() {
                 // Something flying does not do, or an error: the unit is
                 // decoded again, in place.
+                self.grounded = std::mem::take(&mut self.ground_for);
                 self.decode_in_place(i);
             }
         }

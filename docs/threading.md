@@ -377,13 +377,61 @@ abandoned with it by the engine (they were submitted as if it had
 decoded, and may be waiting for it), which is what keeps `queue` and
 `wait` from waiting for them.
 
+A unit decoded in place for a frame that is not a job is followed by
+fifteen that are decoded in place without the attempt: such frames come
+in streams, and the attempt costs a snapshot and a second parse of the
+unit's headers. (Three, after a unit that found no thread to fly on: an
+embedder's threads may still be coming up.)
+
 The threads: between two calls of the decoder its caller is away, so the
 tasks are taken by threads started for that, `parallel::start` (the
 decoder's own pool, or the embedder's `Runner::start`): a *session*,
-which the decoder begins when it first flies a unit and ends before it
+which the decoder begins when it first submits a job and ends before it
 decodes anything in place (so that the tiles and filter bands of that
 have the threads) and when it is reset or dropped. `Decoder::reset()`
 forgets the stream and keeps the threads, for a seek.
+
+### What a caller changes
+
+A caller that decodes with `decode_all` changes nothing and gets what it
+got, a frame at a time. To have frames in flight (wasm-av1's adapter is
+the example; `tools/wasm-perf/wasm-av1-ee33e98-frames-in-flight.diff` is
+the change for the checkout the benchmarks use):
+
+- **Settings.** `set_frames_in_flight(n)` beside `set_threads`: a frame
+  for each thread is the natural number. `set_samples_in_flight` bounds
+  them by size for a caller that does not know the frame size yet (the
+  adapter allows eight frames of 1920x1088 between them, which is two of
+  3840x2160).
+- **Input.** `queue(unit)` instead of `decode_all(unit)`. It reports
+  nothing: a unit's error comes with its result. (The adapter puts its
+  temporal delimiter in front of the unit's bytes, one unit, where it
+  made two calls.)
+- **Output.** After queueing, and whenever it wants frames, `poll()`
+  until it gives `None`: each `Some` is the oldest unit's result, its
+  frames or its error. What belongs to a unit (its presentation time)
+  is kept in a queue beside the decoder's, one entry in for each `queue`,
+  one out for each result.
+- **The end of the input.** `wait()` until it gives `None`: the units
+  still in flight are decoded, on the calling thread too. A caller that
+  asks "is anything left" counts `queued()` as well as the frames it
+  holds.
+- **A seek.** `reset()` in place of a new `Decoder`: the stream is
+  forgotten, the threads stay.
+- **Threads, where the embedder provides them** (`parallel::Runner`,
+  wasm): `Runner::start(n, job)`, a job the runner's threads call and
+  nobody waits for; the provided method returns 0, and then every unit
+  is decoded in place. The contract: it adds calls of `job(k)`, each
+  with a `k` of its own in `1..n`, and says how many it added; asked
+  again with the same job it may add more (threads that had not come up
+  yet); every call it promised is made; while calls of a started job are
+  out, `run` may do its job on the calling thread alone. The adapter's
+  pool keeps the started job beside the job of `run`, gives an index of
+  it to each of its Workers that is waiting, and frees itself when the
+  last has returned.
+- **Errors.** An error is reported when its unit's turn comes, which is
+  a few units after the unit went in; the units after it are decoded as
+  after an error of `decode_all`.
 
 ### Memory
 
