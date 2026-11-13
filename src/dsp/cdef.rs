@@ -140,10 +140,13 @@ pub(crate) fn filter_plane(
 #[inline]
 pub(crate) fn plane_filter_pays() -> bool {
     #[cfg(target_arch = "x86_64")]
-    if crate::dsp::avx2() {
-        return false;
+    {
+        !crate::dsp::avx2()
     }
-    true
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
 }
 
 /// [`filter_plane`] with NEON: a row of the block at a time in 16-bit
