@@ -45,6 +45,11 @@ Each row is the state after the step: fps, and its ratio to rav1d's.
 |  | mandelbrot 720p | 34.4 (0.50x) | 72.5 (0.47x) | 84.2 |
 |  | mandelbrot 720p 10-bit | 41.5 (0.52x) | 91.4 (1.06x) | 108 |
 |  | mandelbrot 1080p | 17.5 (0.52x) | 37.5 (0.47x) | 44.5 |
+| 3. CDEF without the window: zero strengths skipped, interior blocks filtered in the plane, 16-bit SIMD128 lanes | fixture 320x180 | 683 (0.57x) | 959 (0.56x) | 904 |
+|  | testsrc2 720p | 103 (0.58x) | 136 (0.45x) | 157 |
+|  | mandelbrot 720p | 43.5 (0.65x) | 80.0 (0.53x) | 70.5 |
+|  | mandelbrot 720p 10-bit | 51.5 (0.67x) | 98.2 (1.21x) | 82.6 |
+|  | mandelbrot 1080p | 21.8 (0.68x) | 39.8 (0.54x) | 32.9 |
 
 ### 1. Inter prediction from an unscaled reference
 
@@ -63,3 +68,7 @@ measured where this was written.
 ### 2. The symbol decoder reads its bits from a 24-bit window, not one at a time
 
 The symbol decoder followed the specification bit for bit: every renormalisation read its bits one at a time, each with its own byte index and bounds check, and the CDF update tested for the symbol at every entry. Bits now come out of the three bytes at the read position in one step (zeros past the end, as before), a renormalisation that shifts nothing returns at once, and the update runs as two loops, below the symbol and from it. Worth 1 to 3 %: `read_symbol` is 12 % of the simd decode and most of that is the search and the update, not the bits.
+
+### 3. CDEF without the window: zero strengths skipped, interior blocks filtered in the plane, 16-bit SIMD128 lanes
+
+CDEF was 21 % of the simd decode and 40 % of the baseline one. Every 8x8 block was copied into a 12x12 window of 32-bit values with the unavailable samples marked, then filtered with all twelve taps, whatever its strengths. Now: a block whose primary and secondary strengths are both zero is not touched (the filter is the identity there), and its direction is not searched unless a primary strength needs it; a block whose border of 2 lies inside the frame, which is nearly all of them, is filtered from the plane itself; a strength of zero costs no taps (with one set of taps alone the clip to the taps' range is a no-op, so leaving the unused taps out of it changes nothing: tested against the window filter); and the SIMD128 version takes a row of eight samples in 16-bit lanes instead of four in 32-bit ones. After: 3.6 % of the simd decode, 21 % of the baseline one (where it is the scalar arithmetic itself).

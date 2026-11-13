@@ -97,6 +97,168 @@ pub(crate) fn filter_scalar(
     }
 }
 
+/// Filters the `w` x `h` block at index `pos` of a plane (`stride` samples a
+/// row) into `res` (row stride `w`), reading the plane itself: for a block
+/// whose border of 2 is all available, so that no tap needs the window's
+/// marking. `t`'s offsets are in samples of the plane.
+///
+/// A strength of zero contributes nothing, and its taps are not read. That
+/// leaves them out of the minimum and maximum the result is clipped to as
+/// well, which changes nothing: with one of the two sets of taps alone the
+/// result already lies between the sample and the taps used (their weights
+/// sum to 12/16, and `constrain` never passes the difference it is given).
+pub(crate) fn filter_plane(
+    src: &[u16],
+    stride: usize,
+    pos: usize,
+    w: usize,
+    h: usize,
+    t: &Taps,
+    res: &mut [u16; 64],
+) {
+    // Every tap of every sample is inside the plane.
+    assert!(w <= 8 && h <= 8 && pos >= 2 * stride + 2);
+    assert!(pos + (h + 1) * stride + w + 2 <= src.len());
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if w == 8 || w == 4 {
+        filter_plane_simd128(src, stride, pos, w, h, t, res);
+        return;
+    }
+    filter_plane_scalar(src, stride, pos, w, h, t, res)
+}
+
+/// The reference version of [`filter_plane`].
+pub(crate) fn filter_plane_scalar(
+    src: &[u16],
+    stride: usize,
+    pos: usize,
+    w: usize,
+    h: usize,
+    t: &Taps,
+    res: &mut [u16; 64],
+) {
+    for i in 0..h {
+        for j in 0..w {
+            let ci = (pos + i * stride + j) as isize;
+            let x = src[ci as usize] as i32;
+            let mut sum = 0i32;
+            let mut max = x;
+            let mut min = x;
+            if t.pri_str != 0 {
+                for k in 0..2 {
+                    for sign in [-1isize, 1] {
+                        let p = src[(ci + sign * t.pri_off[k]) as usize] as i32;
+                        sum += t.pri_taps[k] * constrain(p - x, t.pri_str, t.pri_adj);
+                        max = max.max(p);
+                        min = min.min(p);
+                    }
+                }
+            }
+            if t.sec_str != 0 {
+                for k in 0..2 {
+                    for sign in [-1isize, 1] {
+                        for so in t.sec_off[k] {
+                            let s = src[(ci + sign * so) as usize] as i32;
+                            sum += t.sec_taps[k] * constrain(s - x, t.sec_str, t.sec_adj);
+                            max = max.max(s);
+                            min = min.min(s);
+                        }
+                    }
+                }
+            }
+            let v = x + ((8 + sum - (sum < 0) as i32) >> 4);
+            res[i * w + j] = v.clamp(min, max) as u16;
+        }
+    }
+}
+
+/// A row of the block at a time in 16-bit lanes (eight samples, or four
+/// for a block four wide). Samples are at most 12 bits, a constrained
+/// difference at most a strength (240), and the twelve weighted taps sum
+/// to well under 2^15.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn filter_plane_simd128(
+    src: &[u16],
+    stride: usize,
+    pos: usize,
+    w: usize,
+    h: usize,
+    t: &Taps,
+    res: &mut [u16; 64],
+) {
+    use std::arch::wasm32::*;
+    // The bounds every load below relies on (also checked by the caller).
+    assert!((w == 8 || w == 4) && h <= 8 && pos >= 2 * stride + 2);
+    assert!(pos + (h + 1) * stride + w + 2 <= src.len());
+    let sp = src.as_ptr();
+    let wide = w == 8;
+    // SAFETY (every call): `i` is a sample of the block or one of its taps,
+    // at most two rows and two columns away, and `w` samples are read: all
+    // inside `src` by the assertions above.
+    let load = |i: isize| unsafe {
+        if wide {
+            v128_load(sp.offset(i) as *const v128)
+        } else {
+            v128_load64_zero(sp.offset(i) as *const u64)
+        }
+    };
+    let zero = i16x8_splat(0);
+    let pri_str = i16x8_splat(t.pri_str as i16);
+    let sec_str = i16x8_splat(t.sec_str as i16);
+    let (pri_adj, sec_adj) = (t.pri_adj as u32, t.sec_adj as u32);
+    for i in 0..h {
+        let base = (pos + i * stride) as isize;
+        let x = load(base);
+        let mut sum = zero;
+        let mut mx = x;
+        let mut mn = x;
+        let mut tap = |off: isize, strv: v128, adj: u32, k: i32| {
+            let p = load(base + off);
+            let d = i16x8_sub(p, x);
+            let ad = i16x8_abs(d);
+            let lim = i16x8_max(i16x8_sub(strv, u16x8_shr(ad, adj)), zero);
+            let mag = i16x8_min(ad, lim);
+            // Negate where the difference is negative.
+            let neg = i16x8_shr(d, 15);
+            let c = i16x8_sub(v128_xor(mag, neg), neg);
+            sum = i16x8_add(sum, i16x8_mul(c, i16x8_splat(k as i16)));
+            mx = i16x8_max(mx, p);
+            mn = i16x8_min(mn, p);
+        };
+        if t.pri_str != 0 {
+            for k in 0..2 {
+                for sign in [-1isize, 1] {
+                    tap(sign * t.pri_off[k], pri_str, pri_adj, t.pri_taps[k]);
+                }
+            }
+        }
+        if t.sec_str != 0 {
+            for k in 0..2 {
+                for sign in [-1isize, 1] {
+                    for so in t.sec_off[k] {
+                        tap(sign * so, sec_str, sec_adj, t.sec_taps[k]);
+                    }
+                }
+            }
+        }
+        // x + ((8 + sum - (sum < 0)) >> 4): the sign is -1 where it is set.
+        let r = i16x8_shr(
+            i16x8_add(i16x8_add(sum, i16x8_splat(8)), i16x8_shr(sum, 15)),
+            4,
+        );
+        let v = i16x8_max(i16x8_min(i16x8_add(x, r), mx), mn);
+        // SAFETY: row i of the result, `w` samples, i < h <= 8.
+        unsafe {
+            let o = res.as_mut_ptr().add(i * w);
+            if wide {
+                v128_store(o as *mut v128, v);
+            } else {
+                v128_store64_lane::<0>(v, o as *mut u64);
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn filter_avx2(win: &[i32; WS * WS], w: usize, h: usize, t: &Taps, res: &mut [u16; 64]) {
@@ -378,6 +540,31 @@ mod tests {
                 filter_scalar(&win, w, h, &t, &mut a);
                 filter(&win, w, h, &t, &mut b);
                 assert_eq!(a, b, "case {case} {w}x{h} {t:?}");
+            }
+            // With every sample available, filtering the same samples as a
+            // plane (the window's rows are its rows) gives the same block,
+            // zero strengths included.
+            if win.iter().all(|&v| v != NA) {
+                let plane: Vec<u16> = win.iter().map(|&v| v as u16).collect();
+                for (w, h) in [(8, 8), (4, 4), (4, 8), (8, 4)] {
+                    for (p, s) in [(true, true), (true, false), (false, true), (false, false)] {
+                        let mut t = t;
+                        if !p {
+                            (t.pri_str, t.pri_adj) = (0, 0);
+                        }
+                        if !s {
+                            (t.sec_str, t.sec_adj) = (0, 0);
+                        }
+                        let mut a = [0u16; 64];
+                        let mut b = [0u16; 64];
+                        let mut c = [0u16; 64];
+                        filter_scalar(&win, w, h, &t, &mut a);
+                        filter_plane_scalar(&plane, WS, 2 * WS + 2, w, h, &t, &mut b);
+                        filter_plane(&plane, WS, 2 * WS + 2, w, h, &t, &mut c);
+                        assert_eq!(a[..w * h], b[..w * h], "plane {case} {w}x{h} {t:?}");
+                        assert_eq!(b[..w * h], c[..w * h], "plane simd {case} {w}x{h} {t:?}");
+                    }
+                }
             }
         }
     }

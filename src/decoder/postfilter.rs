@@ -309,8 +309,23 @@ fn cdef_block(f: &FrameCtx, out: &[SharedPlane], r: usize, c: usize, idx: usize)
         return;
     }
     let coeff_shift = f.bit_depth - 8;
-    let (y_dir, var) = cdef_direction(f, r, c);
     let h = &f.hdr;
+    let uv_on =
+        f.num_planes > 1 && (h.cdef_uv_pri_strength[idx] != 0 || h.cdef_uv_sec_strength[idx] != 0);
+    if h.cdef_y_pri_strength[idx] == 0 && h.cdef_y_sec_strength[idx] == 0 && !uv_on {
+        // Every strength zero: the filter leaves the block as it is.
+        return;
+    }
+    // The direction matters to the primary taps alone (a primary strength
+    // of zero filters along direction 0, and the variance only scales the
+    // luma primary strength).
+    let (y_dir, var) = if h.cdef_y_pri_strength[idx] != 0
+        || (f.num_planes > 1 && h.cdef_uv_pri_strength[idx] != 0)
+    {
+        cdef_direction(f, r, c)
+    } else {
+        (0, 0)
+    };
     let mut pri_str = h.cdef_y_pri_strength[idx] << coeff_shift;
     let sec_str = h.cdef_y_sec_strength[idx] << coeff_shift;
     let dir = if pri_str == 0 { 0 } else { y_dir };
@@ -325,8 +340,10 @@ fn cdef_block(f: &FrameCtx, out: &[SharedPlane], r: usize, c: usize, idx: usize)
         0
     };
     let damping = h.cdef_damping + coeff_shift as i32;
-    cdef_filter(f, out, 0, r, c, pri_str, sec_str, damping, dir);
-    if f.num_planes == 1 {
+    if pri_str != 0 || sec_str != 0 {
+        cdef_filter(f, out, 0, r, c, pri_str, sec_str, damping, dir);
+    }
+    if !uv_on {
         return;
     }
     let pri_str = h.cdef_uv_pri_strength[idx] << coeff_shift;
@@ -350,8 +367,9 @@ pub(crate) fn cdef_direction(f: &FrameCtx, r: usize, c: usize) -> (usize, i32) {
     let p = &f.cur.planes[0];
     let sh = f.bit_depth - 8;
     for i in 0..8 {
+        let row = &p.data[(y0 + i) * p.stride + x0..][..8];
         for j in 0..8 {
-            let x = (p.get(x0 + j, y0 + i) as i32 >> sh) - 128;
+            let x = (row[j] as i32 >> sh) - 128;
             partial[0][i + j] += x;
             partial[1][i + j / 2] += x;
             partial[2][i] += x;
@@ -461,9 +479,42 @@ pub(crate) fn cdef_filter_block(
     coeff_shift: u32,
     res: &mut [u16; 64],
 ) {
-    // The block with a border of 2, unavailable samples marked.
     use crate::dsp::cdef::{NA, Taps, WS};
     const B: usize = 2;
+    let adj = |s: i32| {
+        if s != 0 {
+            (damping - floor_log2(s as u32) as i32).max(0)
+        } else {
+            0
+        }
+    };
+    let d_lo = (dir + 6) & 7;
+    let d_hi = (dir + 2) & 7;
+    // The taps, their offsets in samples of a buffer `stride` wide: primary
+    // (k, +/-), secondary (k, +/-, -2/+2).
+    let taps = |stride: usize| {
+        let off = |d: usize, k: usize| -> isize {
+            CDEF_DIRECTIONS[d][k][0] as isize * stride as isize + CDEF_DIRECTIONS[d][k][1] as isize
+        };
+        Taps {
+            pri_str,
+            sec_str,
+            pri_adj: adj(pri_str),
+            sec_adj: adj(sec_str),
+            pri_taps: CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize],
+            sec_taps: CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize],
+            pri_off: [off(dir, 0), off(dir, 1)],
+            sec_off: [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]],
+        }
+    };
+    if x0 >= B && y0 >= B && x0 + w + B <= xlim.min(src.w) && y0 + h + B <= ylim.min(src.h) {
+        // Every sample the filter reads is available: filter the plane
+        // where it lies.
+        let pos = y0 * src.stride + x0;
+        crate::dsp::cdef::filter_plane(&src.data, src.stride, pos, w, h, &taps(src.stride), res);
+        return;
+    }
+    // The block with a border of 2, unavailable samples marked.
     let mut win = [NA; WS * WS];
     let inside_x = x0 >= B && x0 + w + B <= xlim;
     for i in 0..h + 2 * B {
@@ -486,30 +537,7 @@ pub(crate) fn cdef_filter_block(
             }
         }
     }
-    let adj = |s: i32| {
-        if s != 0 {
-            (damping - floor_log2(s as u32) as i32).max(0)
-        } else {
-            0
-        }
-    };
-    // Window offsets of the taps: primary (k, +/-), secondary (k, +/-, -2/+2).
-    let off = |d: usize, k: usize| -> isize {
-        CDEF_DIRECTIONS[d][k][0] as isize * WS as isize + CDEF_DIRECTIONS[d][k][1] as isize
-    };
-    let d_lo = (dir + 6) & 7;
-    let d_hi = (dir + 2) & 7;
-    let taps = Taps {
-        pri_str,
-        sec_str,
-        pri_adj: adj(pri_str),
-        sec_adj: adj(sec_str),
-        pri_taps: CDEF_PRI_TAPS[((pri_str >> coeff_shift) & 1) as usize],
-        sec_taps: CDEF_SEC_TAPS[((pri_str >> coeff_shift) & 1) as usize],
-        pri_off: [off(dir, 0), off(dir, 1)],
-        sec_off: [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]],
-    };
-    crate::dsp::cdef::filter(&win, w, h, &taps, res);
+    crate::dsp::cdef::filter(&win, w, h, &taps(WS), res);
 }
 
 // ---------------------------------------------------------------------------
