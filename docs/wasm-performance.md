@@ -90,3 +90,103 @@ The step before sent interior blocks to the in-plane filter on every target, and
 ### 5. Reconstruction: whole-sample vectors copied, DC-only blocks, rows instead of samples
 
 Four things around the block's samples. A single-reference block whose motion vector has no fractional part (most of a still background) had both filters run as `128 * sample` and its result clamped and stored a sample at a time; it is now the reference's rows copied. A transform block with only its DC coefficient, the commonest kind, went through the whole 2D transform; its residual is one value per row, found with one row and one column transform (checked against the full process for every size and depth). The prediction and the residual were written through `PlaneBuf::set`, a bounds check and an index computation per sample; they go a row slice at a time, which the compiler vectorises. And dequantisation divided 64-bit values by `dqDenom` (1, 2 or 4): a shift. `scale_mv` no longer divides to find a scale of one.
+
+## Where it stands after step 6 (`7369fee`)
+
+All fourteen streams of the comparison, median of 7, load average about 5.
+`start` is `3c2c549`; the ratio is to rav1d.
+
+| stream | native: rav1d | start | now | wasm baseline: rav1d | start | now | wasm simd: rav1d | start | now |
+|---|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1520 | 1012 | 1252 (0.82x) | 1184 | 606 | 732 (0.62x) | 1771 | 853 | 1060 (0.60x) |
+| fixture 160x90, 10-bit | 3466 | 2550 | 3067 (0.88x) | 3005 | 1777 | 2110 (0.70x) | 3046 | 2445 | 2918 (0.96x) |
+| fixture 128x72, film grain | 2856 | 2000 | 2250 (0.79x) | 2342 | 1423 | 1594 (0.68x) | 3225 | 1846 | 2063 (0.64x) |
+| fixture 177x99, 8-bit | 2266 | 1972 | 2332 (1.03x) | 1990 | 1134 | 1354 (0.68x) | 3394 | 1808 | 2159 (0.64x) |
+| fixture 96x64, 4:4:4 | 4347 | 3300 | 3802 (0.87x) | 3813 | 2147 | 2572 (0.67x) | 6129 | 3284 | 4004 (0.65x) |
+| fixture 96x64, mono | 10468 | 7600 | 8594 (0.82x) | 12101 | 6529 | 7727 (0.64x) | 16016 | 8487 | 10155 (0.63x) |
+| AOM b8-05-mv 352x288 | 203 | 172 | 230 (1.13x) | 156 | 91.2 | 138 (0.88x) | 250 | 154 | 194 (0.77x) |
+| AOM b10-00-quantizer-10, 10-bit | 92.8 | 73.4 | 93.2 (1.00x) | 70.3 | 39.4 | 59.6 (0.85x) | 73.2 | 64.5 | 81.1 (1.11x) |
+| AOM b8-23-film_grain-50 | 438 | 317 | 401 (0.92x) | 360 | 158 | 224 (0.62x) | 540 | 282 | 347 (0.64x) |
+| AOM b8-00-quantizer-20 | 244 | 203 | 247 (1.01x) | 201 | 102 | 150 (0.75x) | 291 | 179 | 218 (0.75x) |
+| SVT testsrc2 720p | 249 | 132 | 205 (0.82x) | 187 | 61.7 | 117 (0.63x) | 320 | 113 | 172 (0.54x) |
+| SVT mandelbrot 720p | 87.4 | 75.8 | 111 (1.27x) | 67.9 | 31.0 | 48.4 (0.71x) | 152 | 62.9 | 91.1 (0.60x) |
+| SVT mandelbrot 720p, 10-bit | 101 | 94.2 | 149 (1.48x) | 78.4 | 37.2 | 60.6 (0.77x) | 85.5 | 80.6 | 125 (1.46x) |
+| SVT mandelbrot 1080p | 40.9 | 37.0 | 59.3 (1.45x) | 33.5 | 15.6 | 23.9 (0.71x) | 78.8 | 33.3 | 49.0 (0.62x) |
+
+**Not at parity.** One thread, against rav1d: the baseline build is at 0.62
+to 0.88 (it started at 0.33 to 0.61), the simd build at 0.54 to 0.77 on
+8-bit streams (0.36 to 0.63) and at 0.96 to 1.46 on 10-bit ones (rav1d's
+wasm kernels are 8-bit only). Native aarch64 went from 0.54 to 0.93 of
+rav1d to 0.79 to 1.48, and no row got slower. Every stream decodes to the
+same MD5 in every build.
+
+Threads are as they were, since nothing here touches them: the simd +
+threads build on 1 / 2 / 4 / 8 threads decodes mandelbrot 720p at 90 / 99 /
+109 / 107 fps (rav1d: 143 on one, 485 on eight) and its eight-tile version
+at 91 / 152 / 221 / 245 (rav1d: 152 and 940).
+
+### What is left, measured
+
+V8's profile of both simd builds on mandelbrot 720p (rav1d built with its
+function names for this), as milliseconds a frame:
+
+| part | rav1d | here | gap |
+|---|---|---|---|
+| symbol decoder and coefficient reading | 1.60 | 3.12 | 1.5 |
+| inter prediction | 1.16 | 2.24 | 1.1 |
+| loop filter | 0.59 | 1.36 | 0.8 |
+| inverse transforms and reconstruction | 1.13 | 1.69 | 0.6 |
+| CDEF | 1.16 | 1.03 | ahead |
+| everything else | 1.0 | 1.6 | 0.6 |
+| a frame | 6.65 | 11.05 | 4.4 |
+
+So, in order of what it would buy:
+
+1. **Entropy decoding, 1.5 ms.** Twice rav1d's time for the same symbols.
+   The reader is the specification's, and it is shared with the encoder:
+   every symbol goes through `Coder::symbol` with the value the encoder
+   would write, every context is derived from the 32-bit `Quant` array with
+   bounds tests. rav1d has dav1d's: a 64-bit window refilled a word at a
+   time, the search and the adaptation specialised by alphabet size, a
+   padded byte map of levels for the contexts. The level map was tried
+   here (`coeff_base_ctx` / `coeff_br_ctx` over a padded `u8` map, bit-exact
+   on all 244 vectors) and measured between -5 % and +6 % on a machine too
+   loaded to tell; it is not on the branch. Doing this properly means a
+   decode-only coefficient reader beside the shared walker, which is a
+   decision about the encoder's "the decoder's own walker" design.
+2. **Inter prediction, 1.1 ms.** The two filters are now SIMD; what remains
+   is around them: the prediction goes through a 32-bit buffer and is
+   clamped and stored afterwards, each row is fetched through a closure,
+   compound averaging and the masks are scalar. Filtering straight into the
+   frame for a single reference, and 16-bit SIMD for the compound cases.
+3. **Loop filter, 0.8 ms.** Every 4-sample edge is gathered into a 14 x 4
+   array of 32-bit values, all filter sizes are computed for every lane, and
+   the result is scattered back; the mode info is copied per edge. rav1d
+   filters eight edges' worth in 16-bit lanes from the plane. (Skipping the
+   write-back when no lane passes the mask was tried: no measurable
+   change.)
+4. **Inverse transforms, 0.6 ms.** The network is the specification's
+   generic one, with its bit-reversal permutation and angles looked up as it
+   runs; rav1d has one straight-line function per size and skips what the
+   end-of-block position says is zero. (Sending the baseline build through
+   the eight-lane path was tried: within noise, and 150 KB larger.)
+
+None of this needs a different sample type: 16-bit lanes hold 8- and
+10-bit samples, which is what the CDEF and prediction kernels here already
+do. For the baseline build the same list applies with CDEF added back on
+top (its scalar arithmetic is a fifth of that decode).
+
+### What every step was held to
+
+`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -D
+warnings`, `cargo doc`, `cargo test --release`, the committed vectors and
+the runner test on 4 threads, the fuzz and encoder tests in debug, clippy
+for wasm32 with and without `simd128`; wasm-av1's tests on this crate (its
+six fixtures, natively on 1, 2 and 4 threads); the fixtures, four AOM
+vectors and five SVT-AV1 clips through the wasm baseline and simd builds
+against rav1d and libdav1d's MD5s; the clips natively on 1 and 4 threads.
+From step 6 on, x86-64 as well: clippy and `cargo test --release` with a
+locally built std, run under Rosetta, which reports no AVX2, so those runs
+take x86-64's scalar paths. At the end: all 244 AOM vectors natively on 1
+and 4 threads (244 of 244), and the 242 that are IVF through both wasm
+builds against rav1d (242 of 242 agree).
