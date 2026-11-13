@@ -38,6 +38,21 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
   15 streams through the wasm builds against rav1d, and the clips natively
   on 1 and 4 threads.
 
+For the residual path (steps 8 on):
+
+- `parts.sh <label> <variant> <clip>`: V8's profile at 200 us, as
+  milliseconds a frame of the symbol decoder with the coefficient reader
+  and of the inverse transforms with reconstruction.
+- `parts-native.sh <label> [tree]`: the same two natively, as timers
+  around `coeffs()` and `reconstruct()` in a patched copy of the tree.
+- `table.sh <runs> <before> <after> [all]`: rav1d, and two `iter.sh`
+  builds, interleaved clip by clip: wasm baseline and simd, then native
+  (`native-build.sh <label> <tree>` builds the native side of a tree that
+  `gate.sh` did not).
+- `plant.sh <file> <old> <new> --test committed_vectors`: the committed
+  vectors, which decode with `CoefficientReader::Checked`, on a copy of
+  the tree with one planted difference. They are expected to fail.
+
 `tried/` holds changes that were written, verified bit-exact and measured
 to gain nothing, so that nobody measures them again without a reason:
 `direct-to-frame.diff` filters a single-reference prediction straight into

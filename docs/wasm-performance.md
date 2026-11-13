@@ -267,3 +267,58 @@ dav1d-shaped (the mode info walk, motion vector prediction, the frame
 buffers), which is not a list of kernels.
 
 `tools/wasm-perf/` has the scripts every number here came from.
+
+## The residual path, written from the specification
+
+A second round on two of the four parts above, the symbol decoder with the
+coefficient reader and the inverse transforms with reconstruction, under a
+stricter rule than the first: nothing but the specification and this
+crate's own code as the source, rav1d only as a black box to time. Each
+idea that is common knowledge from other decoders is named as such where
+it is used, and was derived and checked here against this crate's
+reference code, not taken from anywhere.
+
+**How the numbers are taken.** As above (wasm-av1 at `ee33e98`, Node 26,
+one thread, the M3 Max), with two differences. The machine was busier
+(load average 8 to 20 throughout, other builds running), so every
+comparison is of builds run interleaved, clip by clip, median of 7; the
+absolute numbers are lower than the tables above for the same code, and
+`before` is measured again each time rather than copied. And the two parts
+are measured directly: in wasm as V8's profile (200 us sampling) of
+`coeffs_decode` with the symbol decoder, and of `itx::*` with
+`reconstruct`, as milliseconds a frame on mandelbrot 720p; natively as
+timers around `coeffs()` and `reconstruct()` in `transform_block`
+(`parts.sh` and `parts-native.sh` in `tools/wasm-perf`).
+
+Each row is the state after the step: fps, and its ratio to rav1d's in the
+same run. `before` is `829b1e1`.
+
+| step | clip | baseline | simd | native |
+|---|---|---|---|---|
+| before | fixture 320x180 | 732 (0.64x) | 1036 (0.60x) | 1198 |
+| | testsrc2 720p | 119 (0.69x) | 180 (0.63x) | 195 |
+| | mandelbrot 720p | 47.9 (0.75x) | 93.6 (0.67x) | 108 |
+| | mandelbrot 720p 10-bit | 59.7 (0.82x) | 123 (1.56x) | 143 |
+| | mandelbrot 1080p | 24.0 (0.78x) | 50.4 (0.70x) | 58.8 |
+| 8. the symbol decoder keeps its value at the top of a 64-bit window | fixture 320x180 | 736 (0.64x) | 1064 (0.62x) | 1205 |
+| | testsrc2 720p | 120 (0.69x) | 187 (0.65x) | 205 |
+| | mandelbrot 720p | 49.3 (0.77x) | 97.4 (0.69x) | 114 |
+| | mandelbrot 720p 10-bit | 61.0 (0.84x) | 130 (1.65x) | 150 |
+| | mandelbrot 1080p | 24.3 (0.79x) | 52.2 (0.72x) | 61.5 |
+
+The two parts, in milliseconds a frame on mandelbrot 720p:
+
+| after step | symbol decoder and coefficients: simd | baseline | native | transforms and reconstruction: simd | baseline | native |
+|---|---|---|---|---|---|---|
+| before | 2.92 | 2.82 | 2.46 | 1.66 | 2.96 | 0.97 |
+| 8 | 2.40 | 2.42 | 1.98 | 1.60 | 2.94 | 0.97 |
+
+### 8. The symbol decoder keeps its value at the top of a 64-bit window
+
+Where the time went first: a frame of mandelbrot 720p is 1020 transform blocks, 124 000 coefficients read (90 000 of them zero) and 34 000 signs, against 12 000 symbols for everything else in the frame. A recording of the symbols of twelve frames, decoded alone, cost 9.3 ns a symbol in wasm and natively: a 4-symbol read 9.5 ns, an equiprobable bit 5.9 ns in wasm and 9.1 natively. Every renormalisation computed a byte position and a bit offset, loaded three bytes with a bounds test, and kept `SymbolMaxBits` in 64 bits, for a shift of one or two bits.
+
+8.2.6 renormalises with `SymbolValue = paddedData ^ ( ( ( SymbolValue + 1 ) << bits ) - 1 )`. The right-hand operand is `SymbolValue << bits` with ones below, so this is the value shifted up with the stream's next bits shifted in complemented (`init_symbol` starts it the same way; the bits past the end are zeros, so ones). `SymbolValue` is then the top of one long number, and since a symbol subtracts from it no more than it holds, nothing below is touched by decoding: the bits to come can sit under it ahead of time. The decoder now holds `SymbolValue` in the top 16 bits of a 64-bit word with up to 48 complemented stream bits below, renormalises with two shifts, and reloads six or seven bytes at once when they run out (about every thirty symbols), a byte at a time only at the end of a tile. The read position and `SymbolMaxBits` are no longer kept: both follow from the count of bits taken in. (A window refilled a word at a time is how arithmetic decoders are commonly built, and it is what the first round guessed rav1d has; what is here is derived from the formula above.)
+
+The decoder as 8.2 writes it stays in the crate as `ReferenceSymbolDecoder`. Tests read mixed symbols with both, from encoded streams and from arbitrary bytes of every length from 0 to 40, and require the same symbol, CDF and state (value, range, position, `SymbolMaxBits`) after each, past the end of the data included. And `CoefficientReader::Checked` now puts the reference symbol decoder beside the window one for everything in the tile from its first transform block on (`Coder::Both`): the shared coefficient reader, the mode info, the motion vectors. Three planted differences were each caught by the committed vectors in that mode: a context clamp of 2 for 3 in the fast coefficient reader, the lowest bit of a refill dropped, `>` for `>=` in `read_bool`.
+
+The recording after the change: 6.9 ns a symbol (4-symbol 7.3, bit 3.2 in wasm and 4.1 natively). Three further variants were measured on it and left out, none of them a gain in wasm: the 4-symbol search without branches (every threshold computed, the symbol counted) is level with the loop natively and in wasm; the adaptation as one vector operation on four lanes is slower everywhere (9.1 against 7.1 ns in wasm simd: the next read of the same CDF waits on a store it cannot forward from); an equiprobable bit without a branch changes nothing in the decoder itself.

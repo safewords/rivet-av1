@@ -22,7 +22,10 @@
 //! the same state and panics unless the coefficients, the end-of-block
 //! position, every CDF, the symbol decoder's state (bit position included)
 //! and the contexts left for later blocks are identical. The vector, fuzz
-//! and encoder round-trip tests all decode that way.
+//! and encoder round-trip tests all decode that way. In that mode the
+//! symbol decoder is checked too: the reference reader's symbols, and all
+//! the rest of the tile's from its first transform block on, are read by
+//! `symbol::ReferenceSymbolDecoder` (8.2 as written) alongside it.
 
 use crate::Result;
 use crate::consts::*;
@@ -396,7 +399,10 @@ impl TileDecoder<'_, '_> {
             return self.coeffs_decode(plane, start_x, start_y, tx_sz);
         }
         // Checked: the reference first, then the fast reader from the same
-        // state; everything either leaves behind must be the same.
+        // state; everything either leaves behind must be the same. And the
+        // reference reads through the reference symbol decoder as well
+        // (`Coder::Both`), as everything else in the tile does from here on.
+        self.sd.check_against_reference();
         let (x4, y4) = (start_x >> 2, start_y >> 2);
         let (w4, h4) = (TX_WIDTH[tx_sz] >> 2, TX_HEIGHT[tx_sz] >> 2);
         type Ctx = [Vec<u8>; 4];
@@ -414,7 +420,7 @@ impl TileDecoder<'_, '_> {
         let tx0 = self.plane_tx_type;
         let eob_ref = self.coeffs_shared(plane, start_x, start_y, tx_sz);
         let quant_ref = self.quant.clone();
-        let sd_ref = std::mem::replace(self.sd.dec(), sd0);
+        let (sd_ref, sd_reference) = self.sd.split(sd0);
         let cdf_ref = std::mem::replace(&mut self.cdf, cdf0);
         let ctx_ref = contexts(self, plane, (x4, w4), (y4, h4));
         let tx_ref = std::mem::replace(&mut self.plane_tx_type, tx0);
@@ -434,6 +440,7 @@ impl TileDecoder<'_, '_> {
             "the decode-only coefficient reader differs from the shared walker: plane {plane}, \
              block at ({start_x}, {start_y}), transform size {tx_sz}, eob {eob} against {eob_ref}"
         );
+        self.sd.rejoin(sd_reference);
         eob
     }
 
