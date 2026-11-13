@@ -2068,3 +2068,128 @@ fn wedge_masks() -> &'static WedgeMasks {
 pub(crate) fn wedge_mask(bsize: usize, sign: usize, index: usize) -> &'static [u8] {
     &wedge_masks().masks[(bsize * 2 + sign) * 16 + index]
 }
+
+#[cfg(all(test, not(target_arch = "x86_64")))]
+mod tests {
+    use super::*;
+
+    /// The prediction from an unscaled reference, whole, against the
+    /// general process as the specification writes it (32-bit
+    /// intermediates, all eight taps, every coordinate clamped): references
+    /// of 8, 10 and 12 bits whose planes are larger than the frame, blocks
+    /// of every size inside it, across each edge and wholly outside, every
+    /// filter and phase with the zero phases as often as not, as a single
+    /// prediction and as a compound one less its bias.
+    #[test]
+    fn unscaled_prediction_matches_the_general_process() {
+        let mut seed = 0x510e_527f_ade6_82d1u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (last_x, last_y) = (69i32, 57i32);
+        for bit_depth in [8u32, 10, 12] {
+            // The samples past the frame's last column and row are not the
+            // frame's: over the largest value, so that reading one shows.
+            let mut plane = PlaneBuf::new(96, 80, 0);
+            for (i, v) in plane.data.iter_mut().enumerate() {
+                let inside = i % 96 <= last_x as usize && i / 96 <= last_y as usize;
+                *v = match (inside, rnd(8)) {
+                    (false, _) => 0x7000,
+                    (true, 0) => (1 << bit_depth) - 1,
+                    (true, 1) => 0,
+                    _ => rnd(1 << bit_depth) as u16,
+                };
+            }
+            for compound in [false, true] {
+                let round0 = if bit_depth == 12 { 5 } else { 3 };
+                let round1 = match (compound, bit_depth) {
+                    (true, _) => 7,
+                    (false, 12) => 9,
+                    _ => 11,
+                };
+                let rv = RoundingVars {
+                    round0,
+                    round1,
+                    post_round: 14 - (round0 + round1) as i32,
+                    bit_depth,
+                };
+                let bias = if compound {
+                    crate::dsp::mc::Compound::new(bit_depth, 0).bias
+                } else {
+                    0
+                };
+                for (w, h) in [
+                    (2usize, 2usize),
+                    (4, 4),
+                    (4, 8),
+                    (8, 4),
+                    (8, 8),
+                    (16, 8),
+                    (8, 16),
+                    (16, 16),
+                    (32, 16),
+                    (16, 32),
+                    (32, 32),
+                    (64, 64),
+                ] {
+                    for _ in 0..120 {
+                        let filters = filter_kinds([rnd(4) as u8, rnd(4) as u8], w, h);
+                        // Where the block starts: anywhere from wholly
+                        // before the frame to wholly after it, at any
+                        // phase (the bits under the phase are not used).
+                        let mut at = |last: i32, size: usize| {
+                            let whole =
+                                rnd((last + 2 * size as i32 + 20) as u64) as i64 - size as i64 - 10;
+                            let phase = if rnd(2) == 0 { 0 } else { rnd(16) as i64 };
+                            (whole << 10) + (phase << 6) + rnd(64) as i64
+                        };
+                        let (x, y) = (at(last_x, w), at(last_y, h));
+                        let mut want = vec![0i32; w * h];
+                        let mut intermediate = vec![0i32; (h + 7) * w];
+                        block_inter_prediction_with(
+                            &plane,
+                            last_x,
+                            last_y,
+                            x,
+                            y,
+                            1 << SCALE_SUBPEL_BITS,
+                            1 << SCALE_SUBPEL_BITS,
+                            w,
+                            h,
+                            filters,
+                            h + 7,
+                            rv,
+                            &mut want,
+                            &mut intermediate,
+                        );
+                        let mut got = vec![0i16; w * h];
+                        let (mut edge, mut intermediate) = (Vec::new(), Vec::new());
+                        block_inter_prediction16(
+                            &plane,
+                            last_x,
+                            last_y,
+                            x,
+                            y,
+                            w,
+                            h,
+                            filters,
+                            rv,
+                            bias,
+                            &mut got,
+                            &mut edge,
+                            &mut intermediate,
+                        );
+                        let got: Vec<i32> = got.iter().map(|&v| v as i32 + bias).collect();
+                        assert_eq!(
+                            want, got,
+                            "{bit_depth}-bit compound {compound} {w}x{h} at {x},{y} {filters:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

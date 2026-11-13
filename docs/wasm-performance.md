@@ -371,4 +371,110 @@ Each output of the warp's two passes has its own filter, so there is no row of o
 
 The baseline wasm build (no SIMD) and any target without a SIMD version take the scalar kernels, and LLVM has nothing to vectorise them with there. Two of them now work four samples at a time in a 64-bit word. Four neighbouring samples of a plane are the four 16-bit lanes of the word at their address (the compiler turns the four loads and shifts into one 64-bit load: checked in the wasm it emits), and a tap times that word is the tap times each sample as long as no lane carries into the next. For 8-bit samples that is the arithmetic of step 8 again: the positive taps are summed in one word with the lift (under 65536 a lane), the negative ones in another (at most 14280 a lane, less than the lift, so subtracting it borrows nothing), then one shift, one mask and the lift taken off with each lane's top bit set against a borrow. And the rounded mean of two whole-sample references is `(a | b) - ((a ^ b) >> 1)` in each lane. Inter prediction on mandelbrot 720p in the baseline build: 3.42 to 2.63 ms a frame (3.02 with the filter alone, 2.85 with one bounds test for the samples under all its taps, 2.63 with the mean). The simd and native builds take these only for blocks under eight wide, and do not move.
 
+## Where inter prediction stands after step 15 (`eb42f3c`)
+
+The fourteen streams again, median of 7, the three builds taking turns on
+each stream, load average 4 to 6. `before` is `829b1e1`; the ratio is to
+rav1d.
+
+| stream | native: rav1d | before | now | wasm baseline: rav1d | before | now | wasm simd: rav1d | before | now |
+|---|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1578 | 1305 | 1369 (0.87x) | 1217 | 766 | 794 (0.65x) | 1771 | 1102 | 1154 (0.65x) |
+| fixture 160x90, 10-bit | 3598 | 3279 | 3430 (0.95x) | 2895 | 2099 | 2151 (0.74x) | 2891 | 2844 | 2990 (1.03x) |
+| fixture 128x72, film grain | 2947 | 2378 | 2448 (0.83x) | 2388 | 1626 | 1648 (0.69x) | 3349 | 2087 | 2133 (0.64x) |
+| fixture 177x99, 8-bit | 2360 | 2675 | 2811 (1.19x) | 1927 | 1429 | 1461 (0.76x) | 3254 | 2287 | 2388 (0.73x) |
+| fixture 96x64, 4:4:4 | 4342 | 3936 | 4210 (0.97x) | 3495 | 2400 | 2457 (0.70x) | 5222 | 3594 | 3747 (0.72x) |
+| fixture 96x64, mono | 10814 | 8807 | 9185 (0.85x) | 9355 | 6505 | 6668 (0.71x) | 12732 | 8471 | 8840 (0.69x) |
+| AOM b8-05-mv 352x288 | 208 | 241 | 277 (1.33x) | 160 | 143 | 153 (0.96x) | 258 | 202 | 230 (0.89x) |
+| AOM b10-00-quantizer-10, 10-bit | 90.9 | 97.2 | 105 (1.15x) | 73.3 | 61.1 | 63.0 (0.86x) | 75.6 | 82.3 | 88.9 (1.18x) |
+| AOM b8-23-film_grain-50 | 428 | 396 | 420 (0.98x) | 354 | 225 | 229 (0.65x) | 514 | 349 | 366 (0.71x) |
+| AOM b8-00-quantizer-20 | 244 | 255 | 270 (1.11x) | 194 | 154 | 158 (0.81x) | 278 | 222 | 235 (0.85x) |
+| SVT testsrc2 720p | 245 | 222 | 242 (0.99x) | 182 | 124 | 136 (0.75x) | 311 | 189 | 202 (0.65x) |
+| SVT mandelbrot 720p | 85.3 | 115 | 131 (1.54x) | 65.1 | 49.8 | 54.3 (0.83x) | 146 | 96.2 | 108 (0.74x) |
+| SVT mandelbrot 720p, 10-bit | 98.4 | 152 | 173 (1.76x) | 77.5 | 63.6 | 67.2 (0.87x) | 84.5 | 135 | 151 (1.79x) |
+| SVT mandelbrot 1080p | 42.2 | 62.5 | 69.4 (1.64x) | 33.8 | 26.0 | 27.9 (0.83x) | 80.3 | 55.3 | 60.9 (0.76x) |
+
+Every row is up in all three builds, and every stream decodes to the same
+MD5 in every build. What the steps were about, inter prediction on
+mandelbrot 720p in milliseconds a decoded frame, `829b1e1` against step 15
+with the two builds taking turns (nine turns; seven for baseline):
+
+| build | before | now |
+|---|---|---|
+| wasm simd | 1.77 | 0.79 |
+| wasm baseline | 4.38 | 2.56 |
+| native aarch64 | 1.66 | 0.70 |
+
+rav1d's was 1.2 ms in the simd build's profile above. On a machine this
+loaded the wasm figure moved between 0.79 and 0.85 from one run of nine
+turns to the next (`829b1e1` between 1.77 and 1.99).
+
+What is left of it in the simd build, from V8's profile with each block
+kernel kept out of line (taken at step 12, total 1.0 ms; steps 13 and 14
+have since taken about 0.1 off the warp and the per-block part): the
+8-bit sums of the horizontal filter and of a vertical filter alone 0.24 ms
+a frame, the vertical filter over intermediates 0.17 to 0.19, the mean of
+two whole-sample references 0.11, the copy of one 0.10, the warp 0.11,
+and 0.25 for everything a block does before and between its kernels. By
+that clip's block counts the horizontal filter costs about 0.3 ns a
+sample there, against 0.12 to 0.14 alone on blocks that sit in the cache.
+The likely reason is memory: a block's rows are some twenty separate
+lines of a reference that was written a frame ago. The mean and the copy
+do nothing but move such rows, and a SIMD128 copy in place of
+`memory.copy` changed nothing (`tools/wasm-perf/tried/`). Samples are 16
+bits whatever the depth here; a plane of bytes for 8-bit frames would
+halve that traffic, and is a change to every stage, not to prediction.
+
+Still on the general path, in 32 bits and scalar: the distance-weighted,
+wedge and difference-weighted compounds, inter-intra, overlapped
+prediction's blend, and prediction from a scaled reference. None of the
+benchmark streams spends time there. x86-64 is as it was but for the warp
+(steps 11 and 14, which are not specific to a target): its other paths
+keep the 32-bit AVX2 filters, which could not be measured here.
+
+### What came from knowing how decoders are built
+
+No other implementation's source was read for these steps, and the two
+earlier attempts at them (the branches `perf-loopfilter` and
+`perf-compound`) were not looked at. Some of the ideas are nevertheless
+common knowledge about how AV1 decoders are built rather than things the
+specification suggests, and were used by deriving them from this crate's
+arithmetic and testing them against it: filtering a block from one window
+of the reference, with a copy that repeats the edges when the block
+reaches past them; multiplying only by the taps that are not zero (the
+regular and smooth filters as six taps, the narrow-block ones as four);
+doing an 8-bit filter in 16-bit lanes; separate paths for the horizontal
+filter alone, the vertical one alone (on the reference's samples) and
+both; a vertical filter that goes down a strip of columns keeping its
+rows (or interleaved pairs of rows) from one output row to the next; the
+warp's outputs as 16-bit dot products over a 16-bit filter table. The
+four-samples-to-a-word scalar kernels, the dot products taken straight
+from the row for even and odd outputs, the taps table and the single
+borrow of the buffers are ordinary programming, not decoder lore.
+
+### What these steps were held to
+
+The list of the first round for every one of them (`tools/wasm-perf/gate.sh`:
+fmt; clippy for the host, wasm32 with and without `simd128`, and x86-64;
+doc; `cargo test --release`, which with the vectors in `tests/vectors/`
+decodes all 244 AOM vectors, natively and for x86-64 under Rosetta; the
+committed vectors and the runner test on 4 threads; the fuzz and encoder
+tests; wasm-av1's tests on the tree; the 15 streams through both wasm
+builds against rav1d and libdav1d; the clips natively on 1 and 4 threads).
+At the end: the 244 vectors natively on 1 and 4 threads (244 of 244, with
+`AV1_REQUIRE_VECTORS=1`), and the 242 that are IVF through both wasm builds
+against rav1d (242 of 242 agree).
+
+Each kernel has a unit test against the specification's arithmetic on
+random blocks with the extreme values among them (`dsp::mc`), run natively
+and, for SIMD128, as a `wasm32-wasip1` module in Node (`wasi-test.sh`);
+bugs were planted in each kernel, 21 in all, to see the tests fail. One
+did not fail them and was not a bug: a mask one bit too wide in the scalar
+word filter, harmless because every tap of `Subpel_Filters` is even. And
+the whole unscaled prediction (the windows, the edges, the zero phases,
+the shifts of each depth) is held to the general process, the one the
+specification writes, on random references of 8, 10 and 12 bits with
+blocks inside, across and beyond every edge (`decoder::predict`); four
+planted bugs in the window and the shifts fail it.
+
 `tools/wasm-perf/` has the scripts every number here came from.

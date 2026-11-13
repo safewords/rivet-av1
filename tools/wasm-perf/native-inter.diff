@@ -1,0 +1,56 @@
+diff --git a/src/decoder/predict.rs b/src/decoder/predict.rs
+index 512825e..322ba7a 100644
+--- a/src/decoder/predict.rs
++++ b/src/decoder/predict.rs
+@@ -3,6 +3,43 @@
+ 
+ use std::sync::OnceLock;
+ 
++// TIMING PATCH (measurement only, never committed)
++pub(crate) static T_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static T_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++unsafe extern "C" {
++    fn atexit(cb: extern "C" fn()) -> i32;
++}
++extern "C" fn t_report() {
++    use std::sync::atomic::Ordering::Relaxed;
++    let calls = T_CALLS.load(Relaxed);
++    // What a timer pair costs, measured here.
++    let t0 = std::time::Instant::now();
++    let mut acc = 0u64;
++    for _ in 0..100_000 {
++        let t = std::time::Instant::now();
++        acc += t.elapsed().as_nanos() as u64;
++    }
++    let pair = t0.elapsed().as_nanos() as f64 / 100_000.0;
++    let ns = T_NS.load(Relaxed) as f64;
++    eprintln!("PREDICT_INTER calls={calls} raw_ms={:.3} pair_ns={pair:.1} inside_ns_per_call={:.1} net_ms={:.3}", ns / 1e6, acc as f64 / 100_000.0, (ns - calls as f64 * (acc as f64 / 100_000.0)) / 1e6);
++}
++struct Timed(std::time::Instant);
++impl Timed {
++    fn start() -> Self {
++        use std::sync::atomic::Ordering::Relaxed;
++        if T_CALLS.fetch_add(1, Relaxed) == 0 {
++            // SAFETY: registering a plain function with the C runtime.
++            unsafe { atexit(t_report) };
++        }
++        Timed(std::time::Instant::now())
++    }
++}
++impl Drop for Timed {
++    fn drop(&mut self) {
++        T_NS.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
+ use crate::consts::*;
+ use crate::decoder::state::{Mv, PlaneBuf};
+ use crate::decoder::tile::{TileDecoder, is_directional_mode};
+@@ -572,6 +609,7 @@ impl TileDecoder<'_, '_> {
+         cand_row: usize,
+         cand_col: usize,
+     ) {
++        let _timed = Timed::start();
+         let cand = *self.mi(cand_row, cand_col);
+         let is_compound = cand.ref_frame[1] as i32 > INTRA_FRAME;
+         let rv = self.f.rounding_variables(is_compound);

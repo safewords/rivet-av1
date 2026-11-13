@@ -32,6 +32,23 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `bench-native.py <runs> <threads> <decode_ivf>...`: the same natively,
   with wasm-av1's `decode_ivf` example.
 - `prof.sh <label> <variant> <clip>`: V8's CPU profile by function.
+- `bench-turns.mjs`: `bench-node.mjs` with the builds taking turns (every
+  round decodes the clip once with each build), so that a change in the
+  machine's load during a measurement falls on all of them. The tables of
+  the inter prediction steps (8 on) are from this.
+- `prof-inter.sh <label> <variant> <clip>`: V8's profile again, as the
+  time under `predict_inter` (it and everything it calls) in ms per
+  decoded frame; `cmp-inter.sh <variant> <clip> <rounds> <label>...` runs
+  it for several builds in turn and gives the medians.
+- `native-inter.diff`: the measuring patch behind the native figure for
+  the same thing, a timer around `predict_inter` that reports at exit, less
+  what the timer costs (apply, build `decode_ivf`, read `net_ms` on
+  stderr, and take the patch off again; it is not for the branch).
+- `wasi-test.sh [filter]`, `wasi-run.mjs`: the crate's unit tests built for
+  `wasm32-wasip1` with `simd128` and run in Node's WASI, which is how the
+  SIMD128 kernels themselves are held to the scalar reference (`cargo test`
+  cannot run `wasm32-unknown-unknown`). With a filter: `dsp::`,
+  `decoder::predict` (a test that starts a thread ends the run there).
 - `gate.sh <label>`: this crate's gates (fmt, clippy on the host, wasm32
   with and without simd128, and x86-64 with a locally built std under
   Rosetta; doc; the tests), wasm-av1's tests on the tree, bit-exactness of
@@ -43,3 +60,8 @@ to gain nothing, so that nobody measures them again without a reason:
 `direct-to-frame.diff` filters a single-reference prediction straight into
 the frame (within 1 % on every stream; they predict mostly from two
 references).
+`copy-samples.diff` (against step 12) copies a whole-sample single
+prediction with SIMD128 loads and stores instead of the `memory.copy` that
+`copy_from_slice` compiles to (inter prediction 0.93 and 0.95 ms a frame
+with and without: that time is the reference's and the frame's memory, not
+the call).

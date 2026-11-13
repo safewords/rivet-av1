@@ -1,0 +1,154 @@
+diff --git a/src/decoder/predict.rs b/src/decoder/predict.rs
+index 01a2c69..8707278 100644
+--- a/src/decoder/predict.rs
++++ b/src/decoder/predict.rs
+@@ -715,22 +715,22 @@ impl TileDecoder<'_, '_> {
+                     // are `128 * sample` and the rounding gives the sample
+                     // back, so the block is the reference's samples (its
+                     // edges repeated), copied.
+-                    let refp = &r.frame.planes[plane];
+                     let cur = &mut self.f.cur.planes[plane];
+-                    let (x0, y0) = ((sx >> 10) as i32, (sy >> 10) as i32);
+-                    let inside = x0 >= 0 && x0 + w as i32 <= last_x + 1;
+-                    for i in 0..h {
+-                        let yy = clip3(0, last_y, y0 + i as i32) as usize;
+-                        let src = refp.row(yy);
+-                        let dst = &mut cur.data[(y + i) * cur.stride + x..][..w];
+-                        if inside {
+-                            dst.copy_from_slice(&src[x0 as usize..x0 as usize + w]);
+-                        } else {
+-                            for (j, o) in dst.iter_mut().enumerate() {
+-                                *o = src[clip3(0, last_x, x0 + j as i32) as usize];
+-                            }
+-                        }
+-                    }
++                    let stride = cur.stride;
++                    let mut edges = EDGES.take();
++                    let (src, src_stride) = source_window(
++                        &r.frame.planes[plane],
++                        sx >> 10,
++                        sy >> 10,
++                        w,
++                        h,
++                        last_x,
++                        last_y,
++                        &mut edges[0],
++                    );
++                    let dst = &mut cur.data[y * stride + x..];
++                    crate::dsp::mc::copy_samples(src, src_stride, w, h, dst, stride);
++                    EDGES.set(edges);
+                     written = true;
+                     continue;
+                 }
+diff --git a/src/dsp/mc.rs b/src/dsp/mc.rs
+index 5444806..5aec4fe 100644
+--- a/src/dsp/mc.rs
++++ b/src/dsp/mc.rs
+@@ -444,6 +444,33 @@ impl Compound {
+     }
+ }
+ 
++/// A block of a reference's samples, copied: a prediction with no
++/// fractional part and nothing to blend with. Row `r` of each starts at
++/// `r` times its stride.
++///
++/// A wasm module's `copy_from_slice` is `memory.copy`, which V8 leaves to a
++/// call out of the compiled code: for the 8 to 64 samples of a block's row
++/// that call costs more than the copy. The SIMD128 version loads and
++/// stores the row's vectors itself.
++#[inline]
++pub(crate) fn copy_samples(
++    src: &[u16],
++    src_stride: usize,
++    w: usize,
++    h: usize,
++    dst: &mut [u16],
++    dst_stride: usize,
++) {
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    if w >= 8 {
++        copy_samples_simd128(src, src_stride, w, h, dst, dst_stride);
++        return;
++    }
++    for r in 0..h {
++        dst[r * dst_stride..][..w].copy_from_slice(&src[r * src_stride..][..w]);
++    }
++}
++
+ /// The average of two predictions that are both whole samples of their
+ /// references, a block of them: `(a + b + 1) >> 1`. (Each is the sample
+ /// times `1 << InterPostRound`, and `Round2(a + b, 1 + InterPostRound)` of
+@@ -792,6 +819,43 @@ fn cols16_simd128<T: Lane16, const P: usize, const WIDE: bool>(
+     }
+ }
+ 
++#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++fn copy_samples_simd128(
++    src: &[u16],
++    src_stride: usize,
++    w: usize,
++    h: usize,
++    dst: &mut [u16],
++    dst_stride: usize,
++) {
++    use std::arch::wasm32::*;
++    assert!(w >= 8 && h > 0);
++    assert!(src.len() >= (h - 1) * src_stride + w && dst.len() >= (h - 1) * dst_stride + w);
++    for r in 0..h {
++        // SAFETY: row r of each, which the assertions put inside.
++        let (sp, dp) = unsafe {
++            (
++                src.as_ptr().add(r * src_stride),
++                dst.as_mut_ptr().add(r * dst_stride),
++            )
++        };
++        // Whole vectors, then one more ending at the last column
++        // (overlapping what is done: the same values are stored again).
++        let mut c = 0;
++        while c < w {
++            let c0 = c.min(w - 8);
++            // SAFETY: c0 + 8 <= w, and every row holds w samples.
++            unsafe {
++                v128_store(
++                    dp.add(c0) as *mut v128,
++                    v128_load(sp.add(c0) as *const v128),
++                )
++            };
++            c = c0 + 8;
++        }
++    }
++}
++
+ #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+ #[allow(clippy::too_many_arguments)]
+ fn avg_samples_simd128(
+@@ -1758,4 +1822,29 @@ mod tests {
+             }
+         }
+     }
++
++    /// A copied block is the block, and nothing around it is touched.
++    #[test]
++    fn copies_are_copies() {
++        let mut seed = 0x3c6e_f372_fe94_f82bu64;
++        let mut rnd = |n: u64| {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed % n
++        };
++        for w in [2usize, 4, 8, 12, 16, 32, 64, 128] {
++            for h in [1usize, 2, 5, 8] {
++                let (ss, ds) = (w + rnd(7) as usize, w + rnd(7) as usize);
++                let src: Vec<u16> = (0..h * ss).map(|_| rnd(1 << 12) as u16).collect();
++                let mut want = vec![9u16; h * ds];
++                for r in 0..h {
++                    want[r * ds..][..w].copy_from_slice(&src[r * ss..][..w]);
++                }
++                let mut got = vec![9u16; h * ds];
++                copy_samples(&src, ss, w, h, &mut got, ds);
++                assert_eq!(want, got, "{w}x{h}");
++            }
++        }
++    }
+ }
