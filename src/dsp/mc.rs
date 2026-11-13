@@ -1,8 +1,8 @@
-//! The 8-tap interpolation filters of inter prediction (7.11.3.4), one
-//! row at a time, and the blends of compound prediction (7.11.3.1): scalar,
-//! and AVX2 versions of the 32-bit filters chosen at run time. The 16-bit
-//! filters and the blends have SIMD128 versions in a wasm32 module built
-//! with `simd128` and NEON versions on aarch64. All bit-exact.
+//! The 8-tap interpolation filters of inter prediction (7.11.3.4) and the
+//! blends of compound prediction (7.11.3.1): scalar, and AVX2 versions of
+//! the 32-bit filters chosen at run time. The 16-bit filters and the blends
+//! have SIMD128 versions in a wasm32 module built with `simd128` and NEON
+//! versions on aarch64. All bit-exact.
 
 /// The horizontal filter: `out[c] = Round2(sum_t f[t] * src[c + t],
 /// round0)`, `src` holding `out.len() + 7` samples.
@@ -92,9 +92,46 @@ pub(crate) fn filter_col_scalar(
     }
 }
 
-/// The horizontal filter into 16-bit intermediates: `out[c] = Round2(sum_t
-/// f[t] * src[c + t], round0) - bias`, `src` holding `out.len() + 7`
-/// samples.
+/// The taps of a filter that are worth multiplying by: the shortest run of
+/// 2, 4, 6 or 8 that holds every tap that is not zero. (Of
+/// `Subpel_Filters`, the regular and smooth sets fit six, the sets for
+/// blocks 4 wide four, the bilinear one two.)
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Taps {
+    /// Which tap of the eight the run starts at.
+    pub(crate) first: usize,
+    /// How many taps it has.
+    pub(crate) len: usize,
+    taps: [i16; 8],
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+impl Taps {
+    pub(crate) fn new(f: &[i32; 8]) -> Self {
+        let lo = f.iter().position(|&t| t != 0).unwrap_or(0);
+        let hi = f.iter().rposition(|&t| t != 0).unwrap_or(0);
+        let len = (hi - lo + 2) & !1;
+        let first = lo.min(8 - len);
+        let mut taps = [0i16; 8];
+        for (t, v) in taps[..len].iter_mut().enumerate() {
+            *v = f[first + t] as i16;
+        }
+        Taps { first, len, taps }
+    }
+
+    /// The run itself.
+    #[inline]
+    pub(crate) fn taps(&self) -> &[i16] {
+        &self.taps[..self.len]
+    }
+}
+
+/// The horizontal filter of a block's rows into 16-bit intermediates:
+/// `out[r][c] = Round2(sum_t taps[t] * src[r][c + t], round0) - bias`. Row
+/// `r` of `src` starts at `r * stride` and holds `w + taps.len - 1`
+/// samples, the first of them under the first tap kept; row `r` of `out`
+/// starts at `r * w`.
 ///
 /// The intermediate of the prediction process fits 16 bits at every bit
 /// depth (a sample of at most `BitDepth` bits times taps whose positive
@@ -103,16 +140,174 @@ pub(crate) fn filter_col_scalar(
 /// multiply 16-bit lanes. `bias` is zero for an intermediate; a compound
 /// prediction with no vertical phase is this filter's output as it stands,
 /// and takes its bias here (see [`Compound`]).
+///
+/// `eight_bit` says that no sample is over 255, as in a frame of 8 bits.
+/// The sum itself then fits 16 bits (see [`taps8_scalar`]), and the SIMD
+/// versions never leave 16-bit lanes.
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-#[inline]
-pub(crate) fn filter_row16(src: &[u16], f: &[i32; 8], round0: u32, bias: i32, out: &mut [i16]) {
-    debug_assert!(src.len() >= out.len() + 7);
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_rows16(
+    src: &[u16],
+    stride: usize,
+    w: usize,
+    rows: usize,
+    taps: &Taps,
+    round0: u32,
+    bias: i32,
+    eight_bit: bool,
+    out: &mut [i16],
+) {
+    let t = taps.taps();
+    if eight_bit && bias == 0 {
+        return taps8(src, stride, 1, w, rows, t, round0, out);
+    }
+    let add = ((1 << round0) >> 1) - (bias << round0);
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    if out.len() >= 8 {
-        filter_row16_simd128(src, f, round0, bias, out);
+    if w >= 4 {
+        match t.len() {
+            2 => rows16_simd128::<1>(src, stride, w, rows, t, add, round0, out),
+            4 => rows16_simd128::<2>(src, stride, w, rows, t, add, round0, out),
+            6 => rows16_simd128::<3>(src, stride, w, rows, t, add, round0, out),
+            _ => rows16_simd128::<4>(src, stride, w, rows, t, add, round0, out),
+        }
         return;
     }
-    filter_row16_scalar(src, f, round0, bias, out)
+    #[cfg(target_arch = "aarch64")]
+    if w >= 4 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe {
+            match t.len() {
+                2 => rows16_neon::<2>(src, stride, w, rows, t, add, round0, out),
+                4 => rows16_neon::<4>(src, stride, w, rows, t, add, round0, out),
+                6 => rows16_neon::<6>(src, stride, w, rows, t, add, round0, out),
+                _ => rows16_neon::<8>(src, stride, w, rows, t, add, round0, out),
+            }
+        }
+        return;
+    }
+    match t.len() {
+        2 => rows16_scalar::<2>(src, stride, w, rows, t, add, round0, out),
+        4 => rows16_scalar::<4>(src, stride, w, rows, t, add, round0, out),
+        6 => rows16_scalar::<6>(src, stride, w, rows, t, add, round0, out),
+        _ => rows16_scalar::<8>(src, stride, w, rows, t, add, round0, out),
+    }
+}
+
+/// A filter over samples of at most 8 bits, its taps `step` samples apart
+/// (1 for the horizontal filter, the stride for a vertical one): `out[r][c]
+/// = Round2(sum_t taps[t] * src[r * stride + c + t * step], shift)`, row `r`
+/// of `out` at `r * w`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn taps8(
+    src: &[u16],
+    stride: usize,
+    step: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    shift: u32,
+    out: &mut [i16],
+) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if w >= 4 {
+        match taps.len() {
+            2 => taps8_simd128::<2>(src, stride, step, w, rows, taps, shift, out),
+            4 => taps8_simd128::<4>(src, stride, step, w, rows, taps, shift, out),
+            6 => taps8_simd128::<6>(src, stride, step, w, rows, taps, shift, out),
+            _ => taps8_simd128::<8>(src, stride, step, w, rows, taps, shift, out),
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if w >= 4 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe {
+            match taps.len() {
+                2 => taps8_neon::<2>(src, stride, step, w, rows, taps, shift, out),
+                4 => taps8_neon::<4>(src, stride, step, w, rows, taps, shift, out),
+                6 => taps8_neon::<6>(src, stride, step, w, rows, taps, shift, out),
+                _ => taps8_neon::<8>(src, stride, step, w, rows, taps, shift, out),
+            }
+        }
+        return;
+    }
+    match taps.len() {
+        2 => taps8_scalar::<2>(src, stride, step, w, rows, taps, shift, out),
+        4 => taps8_scalar::<4>(src, stride, step, w, rows, taps, shift, out),
+        6 => taps8_scalar::<6>(src, stride, step, w, rows, taps, shift, out),
+        _ => taps8_scalar::<8>(src, stride, step, w, rows, taps, shift, out),
+    }
+}
+
+/// What the 8-bit filters add to a sum to keep it in an unsigned 16-bit
+/// lane.
+///
+/// The taps of a filter sum to 128, the positive ones to at most 184 and
+/// the negative ones to at least -56 (the test goes through the table), so
+/// over samples of 0..=255 the sum lies in -14280..=46920. With 16384 and
+/// the rounding constant of a shift of up to 7 added it lies in 0..65536:
+/// 16-bit lanes that wrap hold it exactly, a logical shift is the
+/// arithmetic one, and `16384 >> shift` taken off afterwards leaves
+/// `Round2(sum, shift)`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+const LIFT8: i32 = 16384;
+
+/// The scalar version of [`taps8`], in the 16-bit arithmetic the SIMD
+/// versions use.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn taps8_scalar<const N: usize>(
+    src: &[u16],
+    stride: usize,
+    step: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    shift: u32,
+    out: &mut [i16],
+) {
+    let taps: [u16; N] = std::array::from_fn(|t| taps[t] as u16);
+    let add = (LIFT8 + ((1 << shift) >> 1)) as u16;
+    let sub = (LIFT8 >> shift) as i16;
+    for r in 0..rows {
+        let s = &src[r * stride..][..(N - 1) * step + w];
+        for (c, o) in out[r * w..][..w].iter_mut().enumerate() {
+            let mut acc = add;
+            for t in 0..N {
+                acc = acc.wrapping_add(taps[t].wrapping_mul(s[c + t * step]));
+            }
+            *o = (acc >> shift) as i16 - sub;
+        }
+    }
+}
+
+/// The scalar version of [`filter_rows16`] for samples of any depth: `out =
+/// (sum + add) >> round0`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rows16_scalar<const N: usize>(
+    src: &[u16],
+    stride: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    add: i32,
+    round0: u32,
+    out: &mut [i16],
+) {
+    let taps: [i32; N] = std::array::from_fn(|t| taps[t] as i32);
+    for r in 0..rows {
+        let s = &src[r * stride..][..w + N - 1];
+        for (c, o) in out[r * w..][..w].iter_mut().enumerate() {
+            let mut acc = add;
+            for t in 0..N {
+                acc += taps[t] * s[c + t] as i32;
+            }
+            *o = (acc >> round0) as i16;
+        }
+    }
 }
 
 /// The vertical filter over eight rows of 16-bit intermediates, `rows`
@@ -150,25 +345,6 @@ pub(crate) fn filter_col16_compound(
         return;
     }
     filter_col16_compound_scalar(rows, w, f, round1, bias, out)
-}
-
-pub(crate) fn filter_row16_scalar(
-    src: &[u16],
-    f: &[i32; 8],
-    round0: u32,
-    bias: i32,
-    out: &mut [i16],
-) {
-    // `Round2(s, round0) - bias` is `(s + add) >> round0` with the bias
-    // taken off the rounding constant.
-    let add = ((1 << round0) >> 1) - (bias << round0);
-    for (o, s) in out.iter_mut().zip(src.windows(8)) {
-        let mut acc = add;
-        for t in 0..8 {
-            acc += f[t] * s[t] as i32;
-        }
-        *o = (acc >> round0) as i16;
-    }
 }
 
 pub(crate) fn filter_col16_scalar(
@@ -315,43 +491,143 @@ fn tap_pairs(f: &[i32; 8]) -> ([std::arch::wasm32::v128; 4], [bool; 4]) {
     )
 }
 
-/// Eight outputs at a time: taps two by two, the samples under each pair
-/// interleaved so that one 16-bit dot product gives four sums.
+/// [`taps8`] in 16-bit lanes that wrap, eight outputs at a time (four for a
+/// block under eight wide): a multiply and an add per tap.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn filter_row16_simd128(src: &[u16], f: &[i32; 8], round0: u32, bias: i32, out: &mut [i16]) {
+#[allow(clippy::too_many_arguments)]
+fn taps8_simd128<const N: usize>(
+    src: &[u16],
+    stride: usize,
+    step: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    shift: u32,
+    out: &mut [i16],
+) {
     use std::arch::wasm32::*;
-    let w = out.len();
-    assert!(w >= 8 && src.len() >= w + 7);
-    let (coef, used) = tap_pairs(f);
-    let add = i32x4_splat(((1 << round0) >> 1) - (bias << round0));
-    let sp = src.as_ptr();
-    let op = out.as_mut_ptr();
-    let mut c = 0;
-    // Whole vectors, then one more ending at the last column (overlapping
-    // what is done: the same values are stored again).
-    while c < w {
-        let c0 = c.min(w - 8);
-        let (mut lo, mut hi) = (add, add);
-        for k in 0..4 {
-            if !used[k] {
-                continue;
+    assert!(taps.len() == N && w >= 4 && rows > 0);
+    assert!(src.len() >= (rows - 1) * stride + (N - 1) * step + w && out.len() >= rows * w);
+    let coef: [v128; N] = std::array::from_fn(|t| i16x8_splat(taps[t]));
+    let add = i16x8_splat((LIFT8 + ((1 << shift) >> 1)) as i16);
+    let sub = i16x8_splat((LIFT8 >> shift) as i16);
+    for r in 0..rows {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (sp, op) = unsafe { (src.as_ptr().add(r * stride), out.as_mut_ptr().add(r * w)) };
+        // Whole vectors, then one more ending at the last column
+        // (overlapping what is done: the same values are stored again).
+        let mut c = 0;
+        if w >= 8 {
+            while c < w {
+                let c0 = c.min(w - 8);
+                let mut acc = add;
+                for t in 0..N {
+                    // SAFETY: eight samples under tap t, the last of them
+                    // at (rows - 1) * stride + (N - 1) * step + w - 1 or
+                    // before.
+                    let s = unsafe { v128_load(sp.add(t * step + c0) as *const v128) };
+                    acc = i16x8_add(acc, i16x8_mul(s, coef[t]));
+                }
+                let v = i16x8_sub(u16x8_shr(acc, shift), sub);
+                // SAFETY: c0 + 8 <= w.
+                unsafe { v128_store(op.add(c0) as *mut v128, v) };
+                c = c0 + 8;
             }
-            // SAFETY: c0 + 2k + 1 + 8 <= w - 8 + 7 + 8 = w + 7 <= src.len().
-            let (a, b) = unsafe {
-                (
-                    v128_load(sp.add(c0 + 2 * k) as *const v128),
-                    v128_load(sp.add(c0 + 2 * k + 1) as *const v128),
-                )
-            };
-            let l = i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(a, b);
-            let h = i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(a, b);
-            lo = i32x4_add(lo, i32x4_dot_i16x8(l, coef[k]));
-            hi = i32x4_add(hi, i32x4_dot_i16x8(h, coef[k]));
+        } else {
+            while c < w {
+                let c0 = c.min(w - 4);
+                let mut acc = add;
+                for t in 0..N {
+                    // SAFETY: four samples under tap t, as above.
+                    let s = unsafe { v128_load64_zero(sp.add(t * step + c0) as *const u64) };
+                    acc = i16x8_add(acc, i16x8_mul(s, coef[t]));
+                }
+                let v = i16x8_sub(u16x8_shr(acc, shift), sub);
+                // SAFETY: c0 + 4 <= w.
+                unsafe { v128_store64_lane::<0>(v, op.add(c0) as *mut u64) };
+                c = c0 + 4;
+            }
         }
-        let v = i16x8_narrow_i32x4(i32x4_shr(lo, round0), i32x4_shr(hi, round0));
-        // SAFETY: c0 + 8 <= w.
-        unsafe { v128_store(op.add(c0) as *mut v128, v) };
-        c = c0 + 8;
+    }
+}
+
+/// The horizontal filter over samples of any depth, `(sum + add) >>
+/// round0`: taps two by two (`P` pairs), each pair one 16-bit dot product.
+/// A 32-bit lane of the source is two neighbouring samples, so the product
+/// of the row from an even column gives the even outputs' sums and the row
+/// from the next column the odd ones'; the two are put together at the end.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[allow(clippy::too_many_arguments)]
+fn rows16_simd128<const P: usize>(
+    src: &[u16],
+    stride: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    add: i32,
+    round0: u32,
+    out: &mut [i16],
+) {
+    use std::arch::wasm32::*;
+    assert!(taps.len() == 2 * P && w >= 4 && rows > 0);
+    assert!(src.len() >= (rows - 1) * stride + 2 * P - 1 + w && out.len() >= rows * w);
+    let coef: [v128; P] = std::array::from_fn(|k| {
+        let (a, b) = (taps[2 * k], taps[2 * k + 1]);
+        i16x8(a, b, a, b, a, b, a, b)
+    });
+    let add = i32x4_splat(add);
+    let low = i32x4_splat(0xffff);
+    for r in 0..rows {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (sp, op) = unsafe { (src.as_ptr().add(r * stride), out.as_mut_ptr().add(r * w)) };
+        let mut c = 0;
+        if w >= 8 {
+            while c < w {
+                let c0 = c.min(w - 8);
+                let (mut even, mut odd) = (add, add);
+                for k in 0..P {
+                    // SAFETY: eight samples from c0 + 2k and from the
+                    // column after; c0 + 2k + 1 + 8 <= w + 2P - 1.
+                    let (a, b) = unsafe {
+                        (
+                            v128_load(sp.add(c0 + 2 * k) as *const v128),
+                            v128_load(sp.add(c0 + 2 * k + 1) as *const v128),
+                        )
+                    };
+                    even = i32x4_add(even, i32x4_dot_i16x8(a, coef[k]));
+                    odd = i32x4_add(odd, i32x4_dot_i16x8(b, coef[k]));
+                }
+                // Each result fits 16 bits: the even ones in the low
+                // halves of their lanes, the odd ones in the high halves.
+                let even = v128_and(i32x4_shr(even, round0), low);
+                let v = v128_or(even, i32x4_shl(i32x4_shr(odd, round0), 16));
+                // SAFETY: c0 + 8 <= w.
+                unsafe { v128_store(op.add(c0) as *mut v128, v) };
+                c = c0 + 8;
+            }
+        } else {
+            while c < w {
+                let c0 = c.min(w - 4);
+                let (mut even, mut odd) = (add, add);
+                for k in 0..P {
+                    // SAFETY: four samples from c0 + 2k and from the
+                    // column after; c0 + 2k + 1 + 4 <= w + 2P - 1.
+                    let (a, b) = unsafe {
+                        (
+                            v128_load64_zero(sp.add(c0 + 2 * k) as *const u64),
+                            v128_load64_zero(sp.add(c0 + 2 * k + 1) as *const u64),
+                        )
+                    };
+                    even = i32x4_add(even, i32x4_dot_i16x8(a, coef[k]));
+                    odd = i32x4_add(odd, i32x4_dot_i16x8(b, coef[k]));
+                }
+                let even = v128_and(i32x4_shr(even, round0), low);
+                let v = v128_or(even, i32x4_shl(i32x4_shr(odd, round0), 16));
+                // SAFETY: c0 + 4 <= w.
+                unsafe { v128_store64_lane::<0>(v, op.add(c0) as *mut u64) };
+                c = c0 + 4;
+            }
+        }
     }
 }
 
@@ -519,6 +795,129 @@ fn compound_avg_simd128(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
         // SAFETY: c0 + 8 <= w = dst.len().
         unsafe { v128_store(dp.add(c0) as *mut v128, v) };
         col = c0 + 8;
+    }
+}
+
+/// [`taps8`] in 16-bit lanes that wrap, eight outputs at a time (four for a
+/// block under eight wide): a multiply-accumulate per tap.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn taps8_neon<const N: usize>(
+    src: &[u16],
+    stride: usize,
+    step: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    shift: u32,
+    out: &mut [i16],
+) {
+    use std::arch::aarch64::*;
+    assert!(taps.len() == N && w >= 4 && rows > 0);
+    assert!(src.len() >= (rows - 1) * stride + (N - 1) * step + w && out.len() >= rows * w);
+    let add = (LIFT8 + ((1 << shift) >> 1)) as u16;
+    let sub = (LIFT8 >> shift) as i16;
+    // A shift left by a negative count is the shift right.
+    let down = -(shift as i16);
+    for r in 0..rows {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (sp, op) = unsafe { (src.as_ptr().add(r * stride), out.as_mut_ptr().add(r * w)) };
+        // Whole vectors, then one more ending at the last column
+        // (overlapping what is done: the same values are stored again).
+        let mut c = 0;
+        if w >= 8 {
+            while c < w {
+                let c0 = c.min(w - 8);
+                let mut acc = vdupq_n_u16(add);
+                for t in 0..N {
+                    // SAFETY: eight samples under tap t, the last of them
+                    // at (rows - 1) * stride + (N - 1) * step + w - 1 or
+                    // before.
+                    let s = unsafe { vld1q_u16(sp.add(t * step + c0)) };
+                    acc = vmlaq_n_u16(acc, s, taps[t] as u16);
+                }
+                let v = vreinterpretq_s16_u16(vshlq_u16(acc, vdupq_n_s16(down)));
+                // SAFETY: c0 + 8 <= w.
+                unsafe { vst1q_s16(op.add(c0), vsubq_s16(v, vdupq_n_s16(sub))) };
+                c = c0 + 8;
+            }
+        } else {
+            while c < w {
+                let c0 = c.min(w - 4);
+                let mut acc = vdup_n_u16(add);
+                for t in 0..N {
+                    // SAFETY: four samples under tap t, as above.
+                    let s = unsafe { vld1_u16(sp.add(t * step + c0)) };
+                    acc = vmla_n_u16(acc, s, taps[t] as u16);
+                }
+                let v = vreinterpret_s16_u16(vshl_u16(acc, vdup_n_s16(down)));
+                // SAFETY: c0 + 4 <= w.
+                unsafe { vst1_s16(op.add(c0), vsub_s16(v, vdup_n_s16(sub))) };
+                c = c0 + 4;
+            }
+        }
+    }
+}
+
+/// The horizontal filter over samples of any depth, `(sum + add) >>
+/// round0`: a widening multiply-accumulate per tap into 32-bit lanes,
+/// narrowed again (the result fits 16 bits).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn rows16_neon<const N: usize>(
+    src: &[u16],
+    stride: usize,
+    w: usize,
+    rows: usize,
+    taps: &[i16],
+    add: i32,
+    round0: u32,
+    out: &mut [i16],
+) {
+    use std::arch::aarch64::*;
+    assert!(taps.len() == N && w >= 4 && rows > 0);
+    assert!(src.len() >= (rows - 1) * stride + N - 1 + w && out.len() >= rows * w);
+    let down = vdupq_n_s32(-(round0 as i32));
+    for r in 0..rows {
+        // SAFETY: row r of each, which the assertions put inside.
+        let (sp, op) = unsafe { (src.as_ptr().add(r * stride), out.as_mut_ptr().add(r * w)) };
+        let mut c = 0;
+        if w >= 8 {
+            while c < w {
+                let c0 = c.min(w - 8);
+                let (mut lo, mut hi) = (vdupq_n_s32(add), vdupq_n_s32(add));
+                for t in 0..N {
+                    // SAFETY: eight samples under tap t; c0 + t + 8 <= w +
+                    // N - 1.
+                    let s = vreinterpretq_s16_u16(unsafe { vld1q_u16(sp.add(c0 + t)) });
+                    lo = vmlal_n_s16(lo, vget_low_s16(s), taps[t]);
+                    hi = vmlal_high_n_s16(hi, s, taps[t]);
+                }
+                let v = vcombine_s16(
+                    vmovn_s32(vshlq_s32(lo, down)),
+                    vmovn_s32(vshlq_s32(hi, down)),
+                );
+                // SAFETY: c0 + 8 <= w.
+                unsafe { vst1q_s16(op.add(c0), v) };
+                c = c0 + 8;
+            }
+        } else {
+            while c < w {
+                let c0 = c.min(w - 4);
+                let mut lo = vdupq_n_s32(add);
+                for t in 0..N {
+                    // SAFETY: four samples under tap t; c0 + t + 4 <= w +
+                    // N - 1.
+                    let s = vreinterpret_s16_u16(unsafe { vld1_u16(sp.add(c0 + t)) });
+                    lo = vmlal_n_s16(lo, s, taps[t]);
+                }
+                // SAFETY: c0 + 4 <= w.
+                unsafe { vst1_s16(op.add(c0), vmovn_s32(vshlq_s32(lo, down))) };
+                c = c0 + 4;
+            }
+        }
     }
 }
 
@@ -690,16 +1089,8 @@ mod tests {
                             filter_col(&inter, 1, w, f, round1, &mut b);
                             assert_eq!(a, b, "col {bd}-bit w {w} {f:?}");
                         }
-                        // The 16-bit intermediates: the same values, and the
-                        // vertical pass over them the same as over 32-bit ones.
-                        let mut a16 = vec![0i16; w];
-                        let mut b16 = vec![0i16; w];
-                        filter_row16_scalar(&src, f, round0, 0, &mut a16);
-                        filter_row16(&src, f, round0, 0, &mut b16);
-                        assert_eq!(a16, b16, "row16 {bd}-bit w {w} {f:?}");
-                        let wide: Vec<i32> = a16.iter().map(|&v| v as i32).collect();
-                        filter_row_scalar(&src, f, round0, &mut a);
-                        assert_eq!(wide, a, "row16 {bd}-bit w {w} {f:?} fits 16 bits");
+                        // The vertical pass over 16-bit intermediates is the
+                        // same as over 32-bit ones.
                         let inter16: Vec<i16> = (0..(w * 9))
                             .map(|_| (rnd(1 << (bd + 3)) as i32 - (1 << (bd + 1))) as i16)
                             .collect();
@@ -711,13 +1102,13 @@ mod tests {
                             filter_col16(&inter16[w..], w, f, round1, &mut b);
                             assert_eq!(a, b, "col16 {bd}-bit w {w} {f:?}");
                         }
-                        // A compound prediction's filters: the same values
-                        // less the bias, in 16 bits.
+                        // A compound prediction's vertical filter: the same
+                        // values less the bias, in 16 bits.
                         let bias = Compound::new(bd, 0).bias;
                         let less_bias =
                             |v: &[i32]| v.iter().map(|&v| (v - bias) as i16).collect::<Vec<_>>();
-                        filter_row16(&src, f, round0, bias, &mut b16);
-                        assert_eq!(less_bias(&wide), b16, "row16 bias {bd}-bit w {w} {f:?}");
+                        let mut a16 = vec![0i16; w];
+                        let mut b16 = vec![0i16; w];
                         // (The intermediates here are the horizontal
                         // filter's range at this depth.)
                         let inter16: Vec<i16> = (0..(w * 8))
@@ -823,6 +1214,164 @@ mod tests {
                     avg_samples(&s0, &s1, &mut out);
                     assert_eq!(want, out_scalar, "whole samples scalar {bd}-bit w {w}");
                     assert_eq!(want, out, "whole samples {bd}-bit w {w}");
+                }
+            }
+        }
+    }
+
+    /// What [`LIFT8`] rests on: over 8-bit samples, every filter's sum with
+    /// the lift and the rounding constant of any shift up to 7 is a 16-bit
+    /// unsigned value, and the lift is a multiple of `1 << shift`.
+    #[test]
+    fn eight_bit_sums_fit_a_lifted_lane() {
+        for f in SUBPEL_FILTERS.iter().flatten() {
+            let pos: i32 = f.iter().filter(|&&t| t > 0).sum();
+            let neg: i32 = f.iter().filter(|&&t| t < 0).sum();
+            assert_eq!(pos + neg, 128, "{f:?}");
+            for shift in 0..=7 {
+                let round = (1 << shift) >> 1;
+                assert!(255 * neg + LIFT8 + round >= 0, "{f:?}");
+                assert!(255 * pos + LIFT8 + round <= u16::MAX as i32, "{f:?}");
+                assert_eq!(LIFT8 % (1 << shift), 0);
+            }
+        }
+    }
+
+    /// The run of taps kept holds every tap that is not zero, in place.
+    #[test]
+    fn kept_taps_are_the_filter() {
+        for f in SUBPEL_FILTERS.iter().flatten() {
+            let t = Taps::new(f);
+            assert!(
+                matches!(t.len, 2 | 4 | 6 | 8) && t.first + t.len <= 8,
+                "{f:?}"
+            );
+            let mut back = [0i32; 8];
+            for (k, &v) in t.taps().iter().enumerate() {
+                back[t.first + k] = v as i32;
+            }
+            assert_eq!(&back, f);
+        }
+        // The sets for narrow blocks keep four taps, the bilinear one two,
+        // the regular and smooth ones six.
+        for (set, len) in [(0usize, 6usize), (1, 6), (2, 8), (3, 2), (4, 4), (5, 4)] {
+            for f in &SUBPEL_FILTERS[set][1..] {
+                assert!(Taps::new(f).len <= len, "{f:?}");
+            }
+        }
+    }
+
+    /// The horizontal filter of a block, every version of it, against the
+    /// specification's arithmetic (`Round2` of the 32-bit sum of all eight
+    /// taps): every filter and phase, random blocks of every width with
+    /// the extreme samples among them, a stride wider than the block, 8, 10
+    /// and 12 bits, with and without a compound prediction's bias.
+    #[test]
+    fn block_rows_match_the_specification() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for bd in [8u32, 10, 12] {
+            let round0 = if bd == 12 { 5 } else { 3 };
+            let max = (1u64 << bd) - 1;
+            for (set, filt) in SUBPEL_FILTERS.iter().enumerate() {
+                for (phase, f) in filt.iter().enumerate() {
+                    for w in [2usize, 4, 8, 16, 32, 64, 128] {
+                        let rows = 1 + rnd(5) as usize;
+                        let stride = w + 7 + rnd(9) as usize;
+                        let kind = rnd(4);
+                        let src: Vec<u16> = (0..rows * stride)
+                            .map(|_| match (kind, rnd(4)) {
+                                (0, _) | (1, 0) => max as u16,
+                                (1, 1) => 0,
+                                _ => rnd(max + 1) as u16,
+                            })
+                            .collect();
+                        let taps = Taps::new(f);
+                        // The kernels read from the first tap kept.
+                        let from = &src[taps.first..];
+                        for bias in [0, Compound::new(bd, 0).bias] {
+                            let mut want = vec![0i16; rows * w];
+                            let mut line = vec![0i32; w];
+                            for r in 0..rows {
+                                filter_row_scalar(
+                                    &src[r * stride..][..w + 7],
+                                    f,
+                                    round0,
+                                    &mut line,
+                                );
+                                for (o, &v) in want[r * w..][..w].iter_mut().zip(&line) {
+                                    assert!(
+                                        (i16::MIN as i32..=i16::MAX as i32).contains(&(v - bias))
+                                    );
+                                    *o = (v - bias) as i16;
+                                }
+                            }
+                            let what =
+                                format!("{bd}-bit set {set} phase {phase} w {w} bias {bias}");
+                            let mut got = vec![0i16; rows * w];
+                            filter_rows16(
+                                from,
+                                stride,
+                                w,
+                                rows,
+                                &taps,
+                                round0,
+                                bias,
+                                bd == 8,
+                                &mut got,
+                            );
+                            assert_eq!(want, got, "{what}");
+                            // The version for any depth, on these samples
+                            // too.
+                            got.fill(0);
+                            filter_rows16(
+                                from, stride, w, rows, &taps, round0, bias, false, &mut got,
+                            );
+                            assert_eq!(want, got, "{what}, 32-bit sums");
+                            // And the scalar ones, whatever the target has.
+                            let add = ((1 << round0) >> 1) - (bias << round0);
+                            let t = taps.taps();
+                            got.fill(0);
+                            match t.len() {
+                                2 => rows16_scalar::<2>(
+                                    from, stride, w, rows, t, add, round0, &mut got,
+                                ),
+                                4 => rows16_scalar::<4>(
+                                    from, stride, w, rows, t, add, round0, &mut got,
+                                ),
+                                6 => rows16_scalar::<6>(
+                                    from, stride, w, rows, t, add, round0, &mut got,
+                                ),
+                                _ => rows16_scalar::<8>(
+                                    from, stride, w, rows, t, add, round0, &mut got,
+                                ),
+                            }
+                            assert_eq!(want, got, "{what}, scalar");
+                            if bd == 8 && bias == 0 {
+                                got.fill(0);
+                                match t.len() {
+                                    2 => taps8_scalar::<2>(
+                                        from, stride, 1, w, rows, t, round0, &mut got,
+                                    ),
+                                    4 => taps8_scalar::<4>(
+                                        from, stride, 1, w, rows, t, round0, &mut got,
+                                    ),
+                                    6 => taps8_scalar::<6>(
+                                        from, stride, 1, w, rows, t, round0, &mut got,
+                                    ),
+                                    _ => taps8_scalar::<8>(
+                                        from, stride, 1, w, rows, t, round0, &mut got,
+                                    ),
+                                }
+                                assert_eq!(want, got, "{what}, scalar in 16 bits");
+                            }
+                        }
+                    }
                 }
             }
         }

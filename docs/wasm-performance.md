@@ -266,4 +266,42 @@ Done completely, those would bring the frame to roughly 7.5 to 8 ms: about
 dav1d-shaped (the mode info walk, motion vector prediction, the frame
 buffers), which is not a list of kernels.
 
+## Inter prediction, from the specification's processes
+
+`090bf70` (after step 7, and not a row above) keeps both predictions of an
+averaging compound block in 16 bits. The steps below go on from `829b1e1`
+and are inter prediction alone (7.11.3): its filters, how a block's rows
+reach them, the blends, the warp. They were written from the
+specification's block inter prediction process and this crate's scalar
+code for it, and every kernel is held to that arithmetic by a unit test on
+random blocks: run natively for the NEON and scalar versions, and for the
+SIMD128 ones with the crate's tests built for `wasm32-wasip1` with
+`simd128` and run in Node's WASI (`cargo test` cannot run
+`wasm32-unknown-unknown`).
+
+Besides fps, each step says what inter prediction costs on mandelbrot
+720p, in milliseconds a decoded frame. In wasm that is V8's profile: the
+time under `predict_inter`, it and everything it calls. Natively it is a
+timer around `predict_inter` (a measuring patch, not on the branch), less
+what the timer itself costs. The builds compared take turns and the
+figure is the median of the turns; other builds were running on the
+machine (load average 8 to 19), so the fps columns move by a few percent
+from one table to the next. The native column has its ratio to rav1d too.
+
+| step | clip | baseline | simd | native |
+|---|---|---|---|---|
+| 8. the horizontal filter a block at a time; 8-bit sums in 16-bit lanes | fixture 320x180 | 746 (0.63x) | 1078 (0.62x) | 1234 (0.81x) |
+|  | testsrc2 720p | 126 (0.69x) | 194 (0.62x) | 211 (0.91x) |
+|  | mandelbrot 720p | 50.6 (0.78x) | 102 (0.70x) | 116 (1.38x) |
+|  | mandelbrot 720p 10-bit | 62.5 (0.83x) | 136 (1.66x) | 162 (1.60x) |
+|  | mandelbrot 1080p | 25.0 (0.77x) | 54.5 (0.72x) | 64.9 (1.53x) |
+
+### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
+
+The horizontal filter was called a row at a time, each row fetched through `source_row` (a clamp of the row number, a test for the block's columns lying inside the reference, a slice), and it multiplied by all eight taps in 32-bit lanes: pairs of taps as 16-bit dot products over interleaved samples, with a test per pair for both taps being zero. Now a block's filter is one call. `source_window` gives the samples under the taps as a slice of the reference and its stride, or, for a block that reaches past the reference's edges, a copy with the edges repeated; the kernel runs over the block's rows. It multiplies by the taps that are not zero (`Taps`: six for the regular and smooth filters, four for the filters of blocks 4 wide, two for the bilinear one), which also narrows what has to lie inside the reference.
+
+For a frame of 8 bits the sum itself fits 16 bits. A filter's taps sum to 128, at most 184 of it positive and 56 negative (tested over the table), so over samples of 0..255 the sum lies in -14280..46920, and with 16384 added it is an unsigned 16-bit value. The 8-bit kernel is then one 16-bit multiply and one add per tap for eight outputs (`i16x8_mul` in SIMD128, `vmlaq_n_u16` in NEON), a logical shift, and the 16384 taken off again. For 10 and 12 bits the SIMD128 kernel takes the taps two by two as dot products straight from the row (a 32-bit lane of the row is two neighbouring samples, so the row from column `c` gives the even outputs' sums and the row from `c + 1` the odd ones': no interleaving), and the NEON one is widening multiply-accumulates.
+
+The kernels were timed against each other in V8 on blocks of 8x8 to 64x64 before being wired in: the kernel that was there 0.63 to 0.82 ns a sample, dot products from the row 0.32 to 0.34, the 16-bit sums 0.12 to 0.18. Inter prediction on mandelbrot 720p: simd 1.99 to 1.47 ms a frame, baseline 4.39 to 4.12, native 1.73 to 1.62 (the vertical filter is the larger part there, and it is the next step). Two native rows of the table's run read flat and down (the fixture and 10-bit mandelbrot); measured again over 15 turns they are 1252 to 1265 and 154.5 to 157.1 fps.
+
 `tools/wasm-perf/` has the scripts every number here came from.
