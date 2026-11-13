@@ -151,6 +151,14 @@ pub(crate) struct TileDecoder<'a, 'b> {
     pub(crate) color_map_uv: Box<[[u8; 64]; 64]>,
     // Coefficient decoding.
     pub(crate) quant: Box<[i32; 1024]>,
+    /// The decode-only coefficient reader's map of the levels read so far
+    /// in the transform block (at most 15 each), with four zero columns to
+    /// the right of each row and four zero rows below, so that a context
+    /// neighbour past the block's edge reads as the zero the specification
+    /// gives it, without a test.
+    pub(crate) levels: Box<[u8; 36 * 36]>,
+    /// Which coefficient reader decodes (see `residual.rs`).
+    pub(crate) coeff_reader: crate::decoder::CoefficientReader,
     pub(crate) dequant: Box<[i32; 64 * 64]>,
     pub(crate) residual: Box<[i32; 64 * 64]>,
     pub(crate) plane_tx_type: usize,
@@ -220,6 +228,8 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             color_map_y: Box::new([[0; 64]; 64]),
             color_map_uv: Box::new([[0; 64]; 64]),
             quant: Box::new([0; 1024]),
+            levels: Box::new([0; 36 * 36]),
+            coeff_reader: crate::decoder::CoefficientReader::Fast,
             dequant: Box::new([0; 64 * 64]),
             residual: Box::new([0; 64 * 64]),
             plane_tx_type: 0,

@@ -19,6 +19,7 @@ fn streams() -> Vec<Vec<Vec<u8>>> {
 
 fn decode_all(packets: &[Vec<u8>]) {
     let mut d = av1::Decoder::new();
+    d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
     d.set_max_pixels(1 << 20);
     for p in packets {
         let _ = d.decode(p);
@@ -31,11 +32,13 @@ proptest! {
     #[test]
     fn arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
         let mut d = av1::Decoder::new();
+        d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
         d.set_max_pixels(1 << 20);
         let _ = d.decode(&data);
         // Also as the second frame of a stream, after a valid key frame.
         let s = &streams()[0];
         let mut d = av1::Decoder::new();
+        d.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
         d.set_max_pixels(1 << 20);
         let _ = d.decode(&s[0]);
         let _ = d.decode(&data);

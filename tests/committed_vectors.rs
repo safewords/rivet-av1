@@ -54,3 +54,25 @@ fn film_grain_can_be_switched_off() {
     let plain = "av1-1-b8-05-mv.ivf";
     assert_eq!(decode(plain, false), decode(plain, true));
 }
+
+/// The two coefficient readers (the shared walker's, which is the
+/// reference, and the decode-only one decoding uses) give the same frames,
+/// each on its own and with every block checked one against the other.
+#[test]
+fn coefficient_readers_agree() {
+    use av1::decoder::CoefficientReader::{Checked, Fast, Reference};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for path in common::vectors_in(&dir) {
+        let expected = common::expected_md5s(&path);
+        for reader in [Fast, Reference, Checked] {
+            let mut dec = av1::Decoder::new();
+            dec.set_coefficient_reader(reader);
+            let got: Vec<String> = common::packets(&path)
+                .iter()
+                .filter_map(|p| dec.decode(p).unwrap())
+                .map(|f| common::frame_md5(&f))
+                .collect();
+            assert_eq!(got, expected, "{} with {reader:?}", path.display());
+        }
+    }
+}

@@ -30,7 +30,7 @@ macro_rules! cdf_context {
         /// Every CDF array of 6.8.2's `init_non_coeff_cdfs` and
         /// `init_coeff_cdfs`, the coefficient CDFs for one quantiser
         /// context.
-        #[derive(Clone)]
+        #[derive(Clone, PartialEq)]
         pub(crate) struct CdfContext {
             $( pub(crate) $field: $ty, )*
         }

@@ -84,6 +84,8 @@ fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
     let mut enc = Encoder::new(cfg);
     let mut dec = Decoder::new();
     dec.set_strict(true);
+    // Both coefficient readers on every block, held to each other.
+    dec.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
     let mut out = Vec::new();
     let mut sizes = Vec::new();
     for (i, f) in frames.iter().enumerate() {

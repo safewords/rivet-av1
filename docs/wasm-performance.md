@@ -190,3 +190,20 @@ locally built std, run under Rosetta, which reports no AVX2, so those runs
 take x86-64's scalar paths. At the end: all 244 AOM vectors natively on 1
 and 4 threads (244 of 244), and the 242 that are IVF through both wasm
 builds against rav1d (242 of 242 agree).
+
+## Steps after the first round
+
+As above: the state after each step, fps and the ratio to rav1d's.
+
+| step | clip | baseline | simd | native |
+|---|---|---|---|---|
+| 6. a decode-only coefficient reader, held to the shared walker by a test | fixture 320x180 | 738 (0.62x) | 1062 (0.60x) | 1242 |
+|  | testsrc2 720p | 115 (0.65x) | 172 (0.59x) | 209 |
+|  | mandelbrot 720p | 48.7 (0.74x) | 95.9 (0.66x) | 114 |
+|  | mandelbrot 720p 10-bit | 62.0 (0.80x) | 130 (1.55x) | 152 |
+|  | mandelbrot 1080p | 24.4 (0.73x) | 50.2 (0.65x) | 61.2 |
+
+
+### 6. A decode-only coefficient reader, held to the shared walker by a test
+
+The coefficient reader was the tile walker's, which the encoder runs too: every symbol through `Coder` with the value the encoder would write, every context from the 32-bit `Quant` array with an edge test per neighbour. `coeffs_decode` reads the same syntax for a decoder alone: the levels in a padded byte map so that a context is a sum of five loads, the level symbols read with their CDF size known so that the search and the adaptation are fixed-length loops, an equiprobable bit as the two comparisons it is. The shared reader stays, untouched, as the reference the encoder uses. `CoefficientReader::Checked` runs both on every transform block from the same state and panics unless the coefficients, the end-of-block position, every CDF, the symbol decoder's state and the neighbour contexts are identical; the committed vectors, the 244 AOM vectors, the fuzz tests and the encoder round trips all decode in that mode, and a planted difference (a context clamp of 2 for 3) fails them. Worth 3 to 5 %.

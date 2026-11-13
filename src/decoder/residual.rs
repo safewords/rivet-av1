@@ -1,9 +1,32 @@
 //! Residual decoding (5.11.34 to 5.11.39): transform blocks and trees,
 //! coefficients and their contexts (8.3.2), transform types, and the
 //! reconstruct process (7.12.3).
+//!
+//! # Two coefficient readers
+//!
+//! `coeffs()` (5.11.39) is implemented twice.
+//!
+//! `coeffs_shared` is **the reference**. It is part of the tile walker the
+//! encoder runs too: every symbol goes through `Coder`, which reads it
+//! when decoding and writes the value the encoder planted when encoding,
+//! and every context is derived from `Quant` as the specification writes
+//! it. The encoder always uses it, and it is not to be bent for speed.
+//!
+//! `coeffs_decode` is the same syntax for decoding alone, where most of a
+//! decode's symbols are read: no encoder values to carry, the levels kept
+//! in a padded byte map so that the contexts are sums without edge tests,
+//! the level symbols read with their CDF size known. Decoding uses it.
+//!
+//! They must never differ, and a test holds them to that:
+//! `CoefficientReader::Checked` runs both on every transform block from
+//! the same state and panics unless the coefficients, the end-of-block
+//! position, every CDF, the symbol decoder's state (bit position included)
+//! and the contexts left for later blocks are identical. The vector, fuzz
+//! and encoder round-trip tests all decode that way.
 
 use crate::Result;
 use crate::consts::*;
+use crate::decoder::CoefficientReader;
 use crate::decoder::tile::{TileDecoder, find_tx_size};
 use crate::dsp::itx::inverse_transform_2d;
 use crate::tables::*;
@@ -356,7 +379,241 @@ impl TileDecoder<'_, '_> {
     }
 
     /// `coeffs( plane, startX, startY, txSz )`: returns `eob`.
+    /// `coeffs()` (5.11.39): reads the coefficients of a transform block
+    /// into `Quant` and returns `eob`. See the module documentation for the
+    /// two readers behind it.
     pub(crate) fn coeffs(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> usize {
+        if self.sd.encoding() || self.coeff_reader == CoefficientReader::Reference {
+            return self.coeffs_shared(plane, start_x, start_y, tx_sz);
+        }
+        if self.coeff_reader == CoefficientReader::Fast {
+            return self.coeffs_decode(plane, start_x, start_y, tx_sz);
+        }
+        // Checked: the reference first, then the fast reader from the same
+        // state; everything either leaves behind must be the same.
+        let (x4, y4) = (start_x >> 2, start_y >> 2);
+        let (w4, h4) = (TX_WIDTH[tx_sz] >> 2, TX_HEIGHT[tx_sz] >> 2);
+        type Ctx = [Vec<u8>; 4];
+        fn contexts(t: &TileDecoder, plane: usize, x: (usize, usize), y: (usize, usize)) -> Ctx {
+            [
+                t.above_level_ctx[plane][x.0..x.0 + x.1].to_vec(),
+                t.above_dc_ctx[plane][x.0..x.0 + x.1].to_vec(),
+                t.left_level_ctx[plane][y.0..y.0 + y.1].to_vec(),
+                t.left_dc_ctx[plane][y.0..y.0 + y.1].to_vec(),
+            ]
+        }
+        let sd0 = self.sd.dec().clone();
+        let cdf0 = self.cdf.clone();
+        let ctx0 = contexts(self, plane, (x4, w4), (y4, h4));
+        let tx0 = self.plane_tx_type;
+        let eob_ref = self.coeffs_shared(plane, start_x, start_y, tx_sz);
+        let quant_ref = self.quant.clone();
+        let sd_ref = std::mem::replace(self.sd.dec(), sd0);
+        let cdf_ref = std::mem::replace(&mut self.cdf, cdf0);
+        let ctx_ref = contexts(self, plane, (x4, w4), (y4, h4));
+        let tx_ref = std::mem::replace(&mut self.plane_tx_type, tx0);
+        self.above_level_ctx[plane][x4..x4 + w4].copy_from_slice(&ctx0[0]);
+        self.above_dc_ctx[plane][x4..x4 + w4].copy_from_slice(&ctx0[1]);
+        self.left_level_ctx[plane][y4..y4 + h4].copy_from_slice(&ctx0[2]);
+        self.left_dc_ctx[plane][y4..y4 + h4].copy_from_slice(&ctx0[3]);
+        let eob = self.coeffs_decode(plane, start_x, start_y, tx_sz);
+        let same = eob == eob_ref
+            && self.quant == quant_ref
+            && *self.sd.dec() == sd_ref
+            && self.cdf == cdf_ref
+            && contexts(self, plane, (x4, w4), (y4, h4)) == ctx_ref
+            && self.plane_tx_type == tx_ref;
+        assert!(
+            same,
+            "the decode-only coefficient reader differs from the shared walker: plane {plane}, \
+             block at ({start_x}, {start_y}), transform size {tx_sz}, eob {eob} against {eob_ref}"
+        );
+        eob
+    }
+
+    /// The decode-only reader (see the module documentation): `coeffs()`
+    /// as `coeffs_shared` reads it, for a decoder alone.
+    fn coeffs_decode(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> usize {
+        let x4 = start_x >> 2;
+        let y4 = start_y >> 2;
+        let w4 = TX_WIDTH[tx_sz] >> 2;
+        let h4 = TX_HEIGHT[tx_sz] >> 2;
+        let tx_sz_ctx = (TX_SIZE_SQR[tx_sz] + TX_SIZE_SQR_UP[tx_sz] + 1) >> 1;
+        let ptype = (plane > 0) as usize;
+        let seg_eob: usize = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
+            512
+        } else {
+            1024.min(TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz])
+        };
+        self.quant[..seg_eob].fill(0);
+        let mut eob = 0usize;
+        let mut cul_level: u32 = 0;
+        let mut dc_category = 0u8;
+        let ctx = self.all_zero_ctx(plane, tx_sz, x4, y4, w4, h4);
+        let all_zero = self
+            .sd
+            .dec()
+            .read_symbol(&mut self.cdf.txb_skip[tx_sz_ctx][ctx])
+            != 0;
+        if all_zero {
+            if plane == 0 {
+                self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
+            }
+        } else {
+            if plane == 0 {
+                self.transform_type(x4, y4, tx_sz);
+            }
+            self.plane_tx_type = self.compute_tx_type(plane, tx_sz, x4, y4);
+            let scan = self.get_scan(tx_sz);
+            let eob_multisize = TX_WIDTH_LOG2[tx_sz].min(5) + TX_HEIGHT_LOG2[tx_sz].min(5) - 4;
+            let tx_class = get_tx_class(self.plane_tx_type);
+            let ectx = if tx_class == TX_CLASS_2D { 0 } else { 1 };
+            // The context of the DC sign looks at the neighbouring blocks,
+            // not at this one: taken before the decoder is borrowed.
+            let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+            let d = self.sd.dec();
+            let cdf = &mut *self.cdf;
+            let eob_pt = 1 + match eob_multisize {
+                0 => d.read_symbol(&mut cdf.eob_pt_16[ptype][ectx]),
+                1 => d.read_symbol(&mut cdf.eob_pt_32[ptype][ectx]),
+                2 => d.read_symbol(&mut cdf.eob_pt_64[ptype][ectx]),
+                3 => d.read_symbol(&mut cdf.eob_pt_128[ptype][ectx]),
+                4 => d.read_symbol(&mut cdf.eob_pt_256[ptype][ectx]),
+                5 => d.read_symbol(&mut cdf.eob_pt_512[ptype]),
+                _ => d.read_symbol(&mut cdf.eob_pt_1024[ptype]),
+            };
+            eob = if eob_pt < 2 {
+                eob_pt
+            } else {
+                (1 << (eob_pt - 2)) + 1
+            };
+            let eob_shift = eob_pt as i32 - 3;
+            if eob_shift >= 0 {
+                if d.read_symbol(&mut cdf.eob_extra[tx_sz_ctx][ptype][eob_pt - 3]) != 0 {
+                    eob += 1 << eob_shift;
+                }
+                let lim = (eob_pt as i32 - 2).max(0);
+                for i in 1..lim {
+                    if d.read_bool() != 0 {
+                        eob += 1 << (lim - 1 - i);
+                    }
+                }
+            }
+            let adj = ADJUSTED_TX_SIZE[tx_sz];
+            let bwl = TX_WIDTH_LOG2[adj];
+            let height = TX_HEIGHT[adj];
+            // The padded level map and where the context neighbours of
+            // this transform class lie in it (all at or after the
+            // coefficient, at most four rows or columns away).
+            let width = 1usize << bwl;
+            let lstride = width + 4;
+            let levels = &mut self.levels[..(height + 4) * lstride];
+            levels.fill(0);
+            let base_off: [usize; SIG_REF_DIFF_OFFSET_NUM] = std::array::from_fn(|i| {
+                let o = SIG_REF_DIFF_OFFSET[tx_class][i];
+                o[0] as usize * lstride + o[1] as usize
+            });
+            let br_off: [usize; 3] = std::array::from_fn(|i| {
+                let o = MAG_REF_OFFSET_WITH_TX_CLASS[tx_class][i];
+                o[0] as usize * lstride + o[1] as usize
+            });
+            let quant = &mut self.quant;
+            let cdf_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
+            let cdf_base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
+            let cdf_br = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
+            for c in (0..eob).rev() {
+                let pos = scan[c] as usize;
+                let (row, col) = (pos >> bwl, pos & (width - 1));
+                let lpos = row * lstride + col;
+                let mut level;
+                if c == eob - 1 {
+                    let ctx = coeff_base_eob_ctx(c, bwl, height);
+                    level = d.read_symbol_fixed(&mut cdf_eob[ctx]) as u32 + 1;
+                } else {
+                    let near = &levels[lpos..];
+                    let mag: u32 = base_off.iter().map(|&o| near[o].min(3) as u32).sum();
+                    let ctx = coeff_base_ctx_of(tx_sz, tx_class, row, col, mag);
+                    level = d.read_symbol_fixed(&mut cdf_base[ctx]) as u32;
+                }
+                if level > NUM_BASE_LEVELS {
+                    let near = &levels[lpos..];
+                    let mag: u32 = br_off.iter().map(|&o| near[o] as u32).sum();
+                    let br_ctx = coeff_br_ctx_of(tx_class, row, col, mag);
+                    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
+                        let coeff_br = d.read_symbol_fixed(&mut cdf_br[br_ctx]) as u32;
+                        level += coeff_br;
+                        if coeff_br < BR_CDF_SIZE - 1 {
+                            break;
+                        }
+                    }
+                }
+                quant[pos] = level as i32;
+                // At most NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15 here
+                // (the Golomb part comes with the signs, below).
+                levels[lpos] = level as u8;
+            }
+            for c in 0..eob {
+                let pos = scan[c] as usize;
+                let sign = if quant[pos] != 0 {
+                    if c == 0 {
+                        d.read_symbol_fixed(&mut cdf.dc_sign[ptype][dc_ctx]) as u32
+                    } else {
+                        d.read_bool()
+                    }
+                } else {
+                    0
+                };
+                if quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                    let mut length = 0;
+                    loop {
+                        length += 1;
+                        if d.read_bool() != 0 {
+                            break;
+                        }
+                        if length > 32 {
+                            break;
+                        }
+                    }
+                    let mut x: u32 = 1;
+                    for _ in 0..length - 1 {
+                        x = (x << 1) | d.read_bool();
+                    }
+                    quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64)
+                        .min(i32::MAX as u64) as i32;
+                }
+                if pos == 0 && quant[pos] > 0 {
+                    dc_category = if sign != 0 { 1 } else { 2 };
+                }
+                quant[pos] &= 0xFFFFF;
+                cul_level += quant[pos] as u32;
+                if sign != 0 {
+                    quant[pos] = -quant[pos];
+                }
+            }
+            cul_level = cul_level.min(63);
+        }
+        self.above_level_ctx[plane][x4..x4 + w4].fill(cul_level as u8);
+        self.above_dc_ctx[plane][x4..x4 + w4].fill(dc_category);
+        self.left_level_ctx[plane][y4..y4 + h4].fill(cul_level as u8);
+        self.left_dc_ctx[plane][y4..y4 + h4].fill(dc_category);
+        eob
+    }
+
+    /// The tile walker's reader, shared with the encoder: the reference
+    /// (see the module documentation).
+    fn coeffs_shared(
         &mut self,
         plane: usize,
         start_x: usize,
@@ -923,6 +1180,46 @@ pub(crate) fn get_tx_class(tx_type: usize) -> usize {
         V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
         H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
         _ => TX_CLASS_2D,
+    }
+}
+
+/// `get_coeff_base_ctx()` for a coefficient that is not the last, given
+/// `mag`, the sum over its `SIG_REF_DIFF_OFFSET_NUM` neighbours of
+/// `Min( Abs( Quant ), 3 )` (the decode-only reader's form of
+/// `TileDecoder::coeff_base_ctx`).
+#[inline(always)]
+fn coeff_base_ctx_of(tx_sz: usize, tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
+    let ctx = mag.div_ceil(2).min(4) as usize;
+    if tx_class == TX_CLASS_2D {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        return ctx + COEFF_BASE_CTX_OFFSET[tx_sz][row.min(4)][col.min(4)];
+    }
+    let idx = if tx_class == TX_CLASS_VERT { row } else { col };
+    ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+}
+
+/// The context of `coeff_br`, given `mag`, the sum over its three
+/// neighbours of `Min( Quant, COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 )` (the
+/// decode-only reader's form of `TileDecoder::coeff_br_ctx`).
+#[inline(always)]
+fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
+    let mag = mag.div_ceil(2).min(6) as usize;
+    if row == 0 && col == 0 {
+        mag
+    } else if tx_class == 0 {
+        if row < 2 && col < 2 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    } else if tx_class == 1 {
+        if col == 0 { mag + 7 } else { mag + 14 }
+    } else if row == 0 {
+        mag + 7
+    } else {
+        mag + 14
     }
 }
 

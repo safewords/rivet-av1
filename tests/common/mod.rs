@@ -139,6 +139,8 @@ pub fn run_vector(path: &Path) -> Outcome {
     let name = path.file_name().unwrap().to_string_lossy().to_string();
     let expected = expected_md5s(path);
     let mut dec = av1::Decoder::new();
+    // Both coefficient readers on every block, held to each other.
+    dec.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
     // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
     if let Some(n) = std::env::var("AV1_DECODE_THREADS")
         .ok()

@@ -5,6 +5,7 @@ use crate::bits::floor_log2;
 use crate::consts::{EC_MIN_PROB, EC_PROB_SHIFT};
 
 /// Decodes the arithmetic-coded data of one tile.
+#[derive(Clone, PartialEq)]
 pub(crate) struct SymbolDecoder<'a> {
     data: &'a [u8],
     /// Next bit to read, from the start of `data`.
@@ -57,6 +58,20 @@ impl<'a> SymbolDecoder<'a> {
     /// `read_symbol( cdf )`: `cdf` holds N + 1 entries, the last being the
     /// adaptation counter.
     pub(crate) fn read_symbol(&mut self, cdf: &mut [u16]) -> usize {
+        self.read_symbol_inline(cdf)
+    }
+
+    /// [`Self::read_symbol`] for a CDF whose size is known where it is
+    /// read, compiled into its caller: the search and the adaptation are
+    /// then loops of a fixed length. For the few reads that are most of a
+    /// stream (the coefficient levels).
+    #[inline(always)]
+    pub(crate) fn read_symbol_fixed<const N: usize>(&mut self, cdf: &mut [u16; N]) -> usize {
+        self.read_symbol_inline(cdf)
+    }
+
+    #[inline(always)]
+    fn read_symbol_inline(&mut self, cdf: &mut [u16]) -> usize {
         let n = cdf.len() - 1;
         let mut cur = self.range;
         let mut symbol: usize = 0;
@@ -95,28 +110,23 @@ impl<'a> SymbolDecoder<'a> {
         self.max_bits -= bits as i64;
     }
 
-    /// `read_bool()`: an equiprobable bit.
+    /// `read_bool()`: an equiprobable bit. `read_symbol` on the CDF
+    /// `[1 << 14, 1 << 15, 0]`, worked out: with `r = range >> 8`, the
+    /// threshold for 0 is `(r << 7) + EC_MIN_PROB` and the one for 1 is
+    /// zero, and the throwaway CDF's adaptation has no effect.
+    #[inline]
     pub(crate) fn read_bool(&mut self) -> u32 {
-        let cdf = [1u16 << 14, 1 << 15, 0];
-        // The adaptation of this throwaway CDF has no effect.
-        let n = 2;
-        let mut cur = self.range;
-        let mut symbol = 0;
-        let mut prev;
-        loop {
-            prev = cur;
-            let f = (1u32 << 15) - cdf[symbol] as u32;
-            cur = ((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT);
-            cur += EC_MIN_PROB * (n - symbol - 1) as u32;
-            if self.value >= cur {
-                break;
-            }
-            symbol += 1;
-        }
-        self.range = prev - cur;
-        self.value -= cur;
+        let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
+        let bit = if self.value >= cur {
+            self.range -= cur;
+            self.value -= cur;
+            0
+        } else {
+            self.range = cur;
+            1
+        };
         self.renormalize();
-        symbol as u32
+        bit
     }
 
     /// `read_literal( n )` / `L(n)`.
@@ -357,7 +367,16 @@ pub(crate) enum Coder<'a> {
     Enc(SymbolEncoder),
 }
 
-impl Coder<'_> {
+impl<'a> Coder<'a> {
+    /// The decoder, where the caller has established that this is one.
+    #[inline(always)]
+    pub(crate) fn dec(&mut self) -> &mut SymbolDecoder<'a> {
+        match self {
+            Coder::Dec(d) => d,
+            Coder::Enc(_) => unreachable!("a decoding path in the encoder"),
+        }
+    }
+
     pub(crate) fn encoding(&self) -> bool {
         matches!(self, Coder::Enc(_))
     }

@@ -269,6 +269,24 @@ impl FrameCtx {
     }
 }
 
+/// Which of the two coefficient readers a [`Decoder`] uses (see
+/// `residual.rs`): for tests, which hold them to each other.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoefficientReader {
+    /// The decode-only reader. What decoding uses.
+    #[default]
+    Fast,
+    /// The tile walker's own reader, the one the encoder also runs: the
+    /// reference.
+    Reference,
+    /// Both, for every transform block, from the same state: a difference
+    /// in the coefficients, the end-of-block position, the CDFs, the symbol
+    /// decoder's state (its bit position included) or the contexts left for
+    /// later blocks panics.
+    Checked,
+}
+
 /// Decodes AV1 temporal units into frames.
 pub struct Decoder {
     pub(crate) seq: Option<Arc<SequenceHeader>>,
@@ -286,6 +304,7 @@ pub struct Decoder {
     threads: usize,
     /// Whether output frames get the film grain their stream asks for.
     apply_grain: bool,
+    coeff_reader: CoefficientReader,
 }
 
 impl Default for Decoder {
@@ -310,7 +329,14 @@ impl Decoder {
             hdr: HdrMetadata::default(),
             threads: 1,
             apply_grain: true,
+            coeff_reader: CoefficientReader::Fast,
         }
+    }
+
+    /// Chooses the coefficient reader; for tests.
+    #[doc(hidden)]
+    pub fn set_coefficient_reader(&mut self, reader: CoefficientReader) {
+        self.coeff_reader = reader;
     }
 
     /// Frames (upscaled width times height) larger than this are refused
@@ -689,8 +715,10 @@ impl Decoder {
         // Each tile: whether its padding checked out, and its CDFs when it is
         // the one whose CDFs the frame keeps.
         type TileResult = Result<(bool, Option<Box<CdfContext>>)>;
+        let coeff_reader = self.coeff_reader;
         let decode_one = |f: &mut FrameCtx, tile_num: usize, d: &[u8]| -> TileResult {
             let mut td = TileDecoder::new(f, d, tile_num / ti.cols, tile_num % ti.cols);
+            td.coeff_reader = coeff_reader;
             td.decode_tile()?;
             let ok = td.sd.trailing_ok();
             let saved = if !td.f.hdr.disable_frame_end_update_cdf
