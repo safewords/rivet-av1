@@ -215,3 +215,55 @@ The coefficient reader was the tile walker's, which the encoder runs too: every 
 ### 7. Inter prediction: no buffer clearing per block, no closure call per row
 
 Two costs around the prediction filters. `predict_inter` cleared and zero-filled its 32-bit prediction buffers for every block and every list, up to 64 KB each, before the filters overwrote all of it; the buffers now only grow. And the unscaled path fetched each reference row through a `&mut dyn FnMut`, a call the compiler cannot see through, once per row; it is a function returning the row. Worth 1 to 3 %, the same in two interleaved runs of each build on a quiet machine. Filtering a single-reference block straight into the frame, with no prediction buffer at all, was written and measured first: bit-exact, and no faster on any stream here (within 1 %), because these streams predict mostly from two references; it is not on the branch.
+
+## Where it stands after step 7 (`c733c23`)
+
+The same fourteen streams, median of 7, load average 3 to 4.
+
+| stream | native: rav1d | start | now | wasm baseline: rav1d | start | now | wasm simd: rav1d | start | now |
+|---|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1604 | 1049 | 1316 (0.82x) | 1261 | 615 | 773 (0.61x) | 1852 | 899 | 1119 (0.60x) |
+| fixture 160x90, 10-bit | 3772 | 2769 | 3338 (0.88x) | 3034 | 1792 | 2157 (0.71x) | 2998 | 2454 | 2988 (1.00x) |
+| fixture 128x72, film grain | 3025 | 2155 | 2447 (0.81x) | 2356 | 1454 | 1637 (0.70x) | 3227 | 1848 | 2114 (0.65x) |
+| fixture 177x99, 8-bit | 2416 | 2148 | 2710 (1.12x) | 1994 | 1198 | 1446 (0.73x) | 3406 | 1917 | 2351 (0.69x) |
+| fixture 96x64, 4:4:4 | 4412 | 3358 | 4069 (0.92x) | 3934 | 2169 | 2651 (0.67x) | 6102 | 3312 | 4056 (0.66x) |
+| fixture 96x64, mono | 11168 | 7821 | 9138 (0.82x) | 12040 | 6589 | 7628 (0.63x) | 16934 | 8419 | 10420 (0.62x) |
+| AOM b8-05-mv 352x288 | 210 | 178 | 248 (1.18x) | 165 | 94.1 | 146 (0.89x) | 268 | 155 | 209 (0.78x) |
+| AOM b10-00-quantizer-10, 10-bit | 94.8 | 76.1 | 101 (1.07x) | 73.4 | 39.6 | 62.7 (0.85x) | 77.2 | 66.2 | 83.3 (1.08x) |
+| AOM b8-23-film_grain-50 | 442 | 325 | 420 (0.95x) | 342 | 160 | 229 (0.67x) | 512 | 284 | 357 (0.70x) |
+| AOM b8-00-quantizer-20 | 248 | 207 | 265 (1.07x) | 206 | 106 | 158 (0.77x) | 299 | 184 | 232 (0.78x) |
+| SVT testsrc2 720p | 250 | 135 | 223 (0.89x) | 191 | 62.8 | 126 (0.66x) | 326 | 114 | 190 (0.58x) |
+| SVT mandelbrot 720p | 87.7 | 76.8 | 119 (1.36x) | 68.8 | 31.6 | 51.1 (0.74x) | 153 | 63.9 | 99.2 (0.65x) |
+| SVT mandelbrot 720p, 10-bit | 103 | 94.7 | 158 (1.53x) | 79.0 | 37.9 | 61.7 (0.78x) | 86.4 | 81.1 | 130 (1.51x) |
+| SVT mandelbrot 1080p | 42.7 | 39.1 | 62.7 (1.47x) | 33.8 | 16.1 | 25.3 (0.75x) | 80.0 | 33.3 | 53.4 (0.67x) |
+
+**Still not at parity on 8-bit streams in wasm.** One thread, against
+rav1d: baseline 0.61 to 0.89, simd 0.58 to 0.78 on 8-bit and 1.00 to 1.51 on
+10-bit, native aarch64 0.81 to 1.53. All 244 AOM vectors pass natively on 1
+and 4 threads with both coefficient readers checked against each other;
+the 242 IVF ones agree with rav1d in both wasm builds. The simd + threads
+build on 1 / 2 / 4 / 8 threads: mandelbrot 720p 99 / 112 / 120 / 121 fps,
+its eight-tile version 96 / 167 / 241 / 261.
+
+Steps 6 and 7 bought 3 to 5 % and 1 to 3 %. Two more changes were written
+in this round, verified bit-exact and measured to gain nothing (a
+single-reference prediction filtered straight into the frame; see
+`tools/wasm-perf/tried/`). The trims are used up: on mandelbrot 720p simd
+the decode is now about 10.1 ms a frame against rav1d's 6.6, and what
+separates them is four kernels' worth of work, each of which rav1d has in
+dav1d's form:
+
+| part | rav1d, ms | here, ms | what closing it takes |
+|---|---|---|---|
+| coefficient reading and the symbol decoder | 1.6 | 2.7 | the arithmetic decoder on a 64-bit window refilled a word at a time; the end-of-block position driving which contexts are computed |
+| inter prediction | 1.2 | 2.0 | compound prediction in 16-bit intermediates with a biased range for 10 bits, SIMD for the average, the masks and the distance weights |
+| loop filter | 0.6 | 1.4 | a kernel in 16-bit lanes that reads and writes the plane, eight edge units at a time, per filter size, for SIMD128 and NEON together (the scalar gather-filter-scatter stays as the reference) |
+| inverse transforms and reconstruction | 1.1 | 1.7 | one straight-line function per size and kind in place of the generic network, and rows and columns past the end-of-block position skipped |
+| CDEF | 1.2 | 1.0 | ahead |
+
+Done completely, those would bring the frame to roughly 7.5 to 8 ms: about
+0.85 of rav1d, not parity. The last 15 % is everything else being
+dav1d-shaped (the mode info walk, motion vector prediction, the frame
+buffers), which is not a list of kernels.
+
+`tools/wasm-perf/` has the scripts every number here came from.
