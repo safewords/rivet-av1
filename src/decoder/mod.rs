@@ -60,7 +60,7 @@ pub(crate) struct FrameCtx {
     pub(crate) ms: usize,
     pub(crate) mi: Shared<Mi>,
     pub(crate) tx_types: Vec<u8>,
-    pub(crate) lf_tx_sizes: [Vec<u8>; 3],
+    pub(crate) lf_tx_sizes: [Shared<u8>; 3],
     pub(crate) palette_colors: [Vec<[u16; 8]>; 2],
     pub(crate) segment_ids: Vec<u8>,
     pub(crate) prev_segment_ids: Arc<Vec<u8>>,
@@ -81,6 +81,9 @@ pub(crate) struct FrameCtx {
     pub(crate) tile_num: usize,
     /// Every tile's padding checked out (see `SymbolDecoder::trailing_ok`).
     pub(crate) tiles_ok: bool,
+    /// `LrFrame`, when the post-filters ran with the tile's rows
+    /// (`pipeline.rs`) and are not left to the decode frame wrapup.
+    pub(crate) filtered: Option<FrameBuf>,
 }
 
 impl FrameCtx {
@@ -102,7 +105,7 @@ impl FrameCtx {
             ms: self.ms,
             mi: vec![Mi::default(); n].into(),
             tx_types: vec![0; n],
-            lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
+            lf_tx_sizes: std::array::from_fn(|_| vec![0; n].into()),
             palette_colors: [
                 vec![[0; 8]; self.palette_colors[0].len()],
                 vec![[0; 8]; self.palette_colors[1].len()],
@@ -127,6 +130,7 @@ impl FrameCtx {
             mask: Box::new([0; 128 * 128]),
             tile_num: self.tile_num,
             tiles_ok: true,
+            filtered: None,
         }
     }
 
@@ -645,7 +649,7 @@ impl Decoder {
             ms,
             mi: vec![Mi::default(); n].into(),
             tx_types: vec![0; n],
-            lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
+            lf_tx_sizes: std::array::from_fn(|_| vec![0; n].into()),
             // Palettes need screen content tools.
             palette_colors: if screen_content {
                 [vec![[0; 8]; n], vec![[0; 8]; n]]
@@ -665,6 +669,7 @@ impl Decoder {
             mask: Box::new([0; 128 * 128]),
             tile_num: 0,
             tiles_ok: true,
+            filtered: None,
         };
         if f.hdr.use_ref_frame_mvs {
             self.motion_field_estimation(&mut f);
@@ -803,18 +808,23 @@ impl Decoder {
 
     /// The decode frame wrapup process (7.4) for a decoded frame.
     fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
-        if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
-            postfilter::loop_filter_threads(&mut f, self.threads);
-        }
-        let cdef = postfilter::cdef(&f, self.threads);
-        let up_cdef = match postfilter::upscale(&f, &cdef) {
-            Some(u) => u,
-            None => cdef,
+        let lr = match f.filtered.take() {
+            // The rows were filtered as they were reconstructed.
+            Some(lr) => lr,
+            None => {
+                if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
+                    postfilter::loop_filter_threads(&mut f, self.threads);
+                }
+                let cdef = postfilter::cdef(&f, self.threads);
+                let up_cdef = match postfilter::upscale(&f, &cdef) {
+                    Some(u) => u,
+                    None => cdef,
+                };
+                let up_cur_owned = postfilter::upscale(&f, &f.cur);
+                let up_cur = up_cur_owned.as_ref().unwrap_or(&f.cur);
+                postfilter::loop_restoration(&f, up_cur, up_cdef, self.threads)
+            }
         };
-        let up_cur_owned = postfilter::upscale(&f, &f.cur);
-        let up_cur = up_cur_owned.as_ref().unwrap_or(&f.cur);
-        let lr = postfilter::loop_restoration(&f, up_cur, up_cdef, self.threads);
-        drop(up_cur_owned);
         let (mf_ref_frames, mf_mvs) = self.motion_vector_storage(&f);
         if f.hdr.segmentation_enabled && !f.hdr.segmentation_update_map {
             let prev = f.prev_segment_ids.clone();

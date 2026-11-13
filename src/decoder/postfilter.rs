@@ -113,6 +113,29 @@ pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
     }
 }
 
+/// The loop filter process (7.14.1) for the mode info rows `r0..r1` of
+/// every plane, a superblock row: its vertical edges, then its horizontal
+/// edges (the one along its top among them). `f.cur` holds the rows the
+/// filters read and write: these, and the last rows of the superblock row
+/// above, whose vertical edges were filtered before.
+///
+/// That is the frame's filter as long as the rows are taken in order: an
+/// edge's filter touches only the samples of the two transform blocks it
+/// lies between, so the horizontal edges of a row leave the rows after it
+/// as their own vertical edges need them, unfiltered.
+pub(crate) fn loop_filter_rows(f: &mut FrameCtx, levels: &LfLevels, r0: usize, r1: usize) {
+    for plane in 0..f.num_planes {
+        if plane == 0 || f.hdr.loop_filter_level[1 + plane] != 0 {
+            let mut pb = std::mem::take(&mut f.cur.planes[plane]);
+            let sp = SharedPlane::new(&mut pb);
+            for pass in 0..2 {
+                filter_band(f, levels, sp, plane, pass, [r0, r1, 0, f.mi_cols]);
+            }
+            f.cur.planes[plane] = pb;
+        }
+    }
+}
+
 /// The filter levels of a frame (7.14.4) for a block with no `delta_lf`:
 /// they depend on the block's segment, its first reference frame and
 /// whether its mode is one of the `mode_deltas` kind, so there are 144 of
@@ -345,7 +368,7 @@ fn filter_band(
     // alone says: a row of sizes is scanned for the ones that are, and only
     // those go through `edge_unit`.
     let ms = f.ms;
-    let txs = &f.lf_tx_sizes[plane][..];
+    let txs = &f.lf_tx_sizes[plane];
     let tx_units = &levels.tx_units[pass];
     let on_tx_edge = |at: usize, tx_sz: u8| at & tx_units[(tx_sz & 31) as usize] as usize == 0;
     let unit = |on: bool, pr: usize, pc: usize| {
@@ -747,25 +770,11 @@ fn filter_strength(
 /// own samples).
 pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
     let mut out = f.cur.clone();
-    let h = &f.hdr;
-    if h.coded_lossless || h.allow_intrabc || !f.seq.enable_cdef {
+    if !cdef_applies(f) {
         return out;
     }
     let planes: Vec<SharedPlane> = out.planes.iter_mut().map(SharedPlane::new).collect();
-    let band = |b: usize| {
-        let mut r = b * 16;
-        while r < ((b + 1) * 16).min(f.mi_rows) {
-            let mut c = 0;
-            while c < f.mi_cols {
-                let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
-                if idx >= 0 {
-                    cdef_block(f, &planes, r, c, idx as usize);
-                }
-                c += 2;
-            }
-            r += 2;
-        }
-    };
+    let band = |b: usize| cdef_rows(f, &planes, b * 16, ((b + 1) * 16).min(f.mi_rows));
     let bands = f.mi_rows.div_ceil(16);
     if threads > 1 {
         crate::decoder::parallel_map(bands, threads, band);
@@ -773,6 +782,30 @@ pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
         (0..bands).for_each(band);
     }
     out
+}
+
+/// Whether the frame has CDEF at all (5.9.19).
+pub(crate) fn cdef_applies(f: &FrameCtx) -> bool {
+    let h = &f.hdr;
+    !(h.coded_lossless || h.allow_intrabc || !f.seq.enable_cdef)
+}
+
+/// The CDEF process for the 8x8 blocks of the mode info rows `r0..r1`,
+/// into `out`, which starts as a copy of `CurrFrame`: each block writes
+/// its own samples and reads `CurrFrame`'s up to two beyond them.
+pub(crate) fn cdef_rows(f: &FrameCtx, out: &[SharedPlane], r0: usize, r1: usize) {
+    let mut r = r0;
+    while r < r1 {
+        let mut c = 0;
+        while c < f.mi_cols {
+            let idx = f.cdef_idx[(r >> 4) * f.cdef_stride + (c >> 4)];
+            if idx >= 0 {
+                cdef_block(f, out, r, c, idx as usize);
+            }
+            c += 2;
+        }
+        r += 2;
+    }
 }
 
 /// The CDEF block process (7.15.1) for a block whose parameters are set.
@@ -1186,7 +1219,9 @@ pub(crate) fn lr_unit_cols(f: &FrameCtx, plane: usize, uc: usize) -> (i32, i32) 
     (x0, x1)
 }
 
-fn restore_stripe(
+/// Loop restoration of stripe `s` of a plane into `out`, which starts as
+/// a copy of `cdef`: each unit's rectangle of the stripe.
+pub(crate) fn restore_stripe(
     f: &FrameCtx,
     cur: &FrameBuf,
     cdef: &FrameBuf,
@@ -1703,7 +1738,7 @@ mod tests {
             ms,
             mi: mi.into(),
             tx_types: Vec::new(),
-            lf_tx_sizes,
+            lf_tx_sizes: lf_tx_sizes.map(Into::into),
             palette_colors: [Vec::new(), Vec::new()],
             segment_ids: Vec::new(),
             prev_segment_ids: Arc::new(Vec::new()),
@@ -1718,6 +1753,7 @@ mod tests {
             mask: Box::new([0; 128 * 128]),
             tile_num: 0,
             tiles_ok: true,
+            filtered: None,
         }
     }
 

@@ -337,16 +337,28 @@ impl<T> Shared<T> {
     }
 }
 
+/// The panics of indexing, out of line: an index site is a comparison and
+/// a call that does not return, as indexing a slice is.
+#[cold]
+#[inline(never)]
+fn outside_read() -> ! {
+    panic!("index outside a shared array's window (its read range)")
+}
+
+#[cold]
+#[inline(never)]
+fn outside_write() -> ! {
+    panic!("index outside a shared array's window (its write range)")
+}
+
 impl<T> Index<usize> for Shared<T> {
     type Output = T;
 
     #[inline(always)]
-    #[track_caller]
     fn index(&self, i: usize) -> &T {
-        assert!(
-            i.wrapping_sub(self.read_lo) < self.read_len,
-            "index outside the window's read range"
-        );
+        if i.wrapping_sub(self.read_lo) >= self.read_len {
+            outside_read();
+        }
         // SAFETY: `i` is in the read range, which lies inside the store's
         // `len` elements at `ptr`; no other window writes it (the
         // invariant), and this one writes only through `&mut self`.
@@ -356,12 +368,10 @@ impl<T> Index<usize> for Shared<T> {
 
 impl<T> IndexMut<usize> for Shared<T> {
     #[inline(always)]
-    #[track_caller]
     fn index_mut(&mut self, i: usize) -> &mut T {
-        assert!(
-            i.wrapping_sub(self.write_lo) < self.write_len,
-            "index outside the window's write range"
-        );
+        if i.wrapping_sub(self.write_lo) >= self.write_len {
+            outside_write();
+        }
         // SAFETY: `i` is in the write range, which lies inside the store's
         // `len` elements at `ptr`; no other window reads or writes it (the
         // invariant), and `&mut self` makes this the only reference
@@ -374,12 +384,10 @@ impl<T> Index<Range<usize>> for Shared<T> {
     type Output = [T];
 
     #[inline(always)]
-    #[track_caller]
     fn index(&self, r: Range<usize>) -> &[T] {
-        assert!(
-            r.start <= r.end && self.read_lo <= r.start && r.end <= self.read_lo + self.read_len,
-            "range outside the window's read range"
-        );
+        if r.start > r.end || self.read_lo > r.start || r.end > self.read_lo + self.read_len {
+            outside_read();
+        }
         // SAFETY: as for one element, for each element of `r`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(r.start), r.end - r.start) }
     }
@@ -387,12 +395,10 @@ impl<T> Index<Range<usize>> for Shared<T> {
 
 impl<T> IndexMut<Range<usize>> for Shared<T> {
     #[inline(always)]
-    #[track_caller]
     fn index_mut(&mut self, r: Range<usize>) -> &mut [T] {
-        assert!(
-            r.start <= r.end && self.write_lo <= r.start && r.end <= self.write_lo + self.write_len,
-            "range outside the window's write range"
-        );
+        if r.start > r.end || self.write_lo > r.start || r.end > self.write_lo + self.write_len {
+            outside_write();
+        }
         // SAFETY: as for one element, for each element of `r`.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(r.start), r.end - r.start) }
     }
@@ -403,7 +409,6 @@ impl<T> Index<RangeFrom<usize>> for Shared<T> {
 
     /// From `r.start` to the end of the window's read range.
     #[inline(always)]
-    #[track_caller]
     fn index(&self, r: RangeFrom<usize>) -> &[T] {
         &self[r.start..self.read_lo + self.read_len]
     }
@@ -412,7 +417,6 @@ impl<T> Index<RangeFrom<usize>> for Shared<T> {
 impl<T> IndexMut<RangeFrom<usize>> for Shared<T> {
     /// From `r.start` to the end of the window's write range.
     #[inline(always)]
-    #[track_caller]
     fn index_mut(&mut self, r: RangeFrom<usize>) -> &mut [T] {
         let end = self.write_lo + self.write_len;
         &mut self[r.start..end]

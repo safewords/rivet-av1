@@ -162,7 +162,14 @@ impl TileDecoder<'_, '_> {
             let (pr0, pr1, pc0, pc1) = plane_rect(r0, r1, c0, c1, ssx, ssy);
             let pr1 = pr1.min(f.mi_rows + 32);
             let pc1 = pc1.min(ms);
-            grab(&mut s.lf[p], &f.lf_tx_sizes[p], pr0, pr1, pc0, pc1);
+            grab(
+                &mut s.lf[p],
+                f.lf_tx_sizes[p].as_slice(),
+                pr0,
+                pr1,
+                pc0,
+                pc1,
+            );
             let pl = &f.cur.planes[p];
             let (x0, x1) = (pc0 * 4, (pc1 * 4).min(pl.w));
             let (y0, y1) = (pr0 * 4, (pr1 * 4).min(pl.h));
