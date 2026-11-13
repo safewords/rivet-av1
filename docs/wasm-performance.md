@@ -318,6 +318,11 @@ step before and after from one run.
 | | mandelbrot 720p | 52.9 (0.81x) | 110 (0.76x) | 135 |
 | | mandelbrot 720p 10-bit | 65.0 (0.87x) | 149 (1.84x) | 175 |
 | | mandelbrot 1080p | 25.9 (0.80x) | 58.3 (0.78x) | 70.1 |
+| 11. the 1D inverse transforms compiled for each size | fixture 320x180 | 767 (0.65x) | 1110 (0.65x) | 1284 |
+| | testsrc2 720p | 136 (0.78x) | 205 (0.69x) | 243 |
+| | mandelbrot 720p | 55.8 (0.86x) | 116 (0.80x) | 135 |
+| | mandelbrot 720p 10-bit | 67.0 (0.92x) | 154 (1.90x) | 171 |
+| | mandelbrot 1080p | 27.0 (0.84x) | 58.5 (0.78x) | 71.1 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -327,6 +332,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 | 8 | 2.40 | 2.42 | 1.98 | 1.60 | 2.94 | 0.97 |
 | 9 | 2.06 | 2.10 | 1.71 | 1.62 | 2.96 | 0.97 |
 | 10 | 1.45 | 1.47 | 1.08 | 1.61 | 2.98 | 0.98 |
+| 11 | 1.46 | 1.45 | 1.06 | 1.45 | 2.04 | 0.84 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -358,3 +364,9 @@ With the reads no longer mispredicted, what bounds the level pass is how many in
 A padded level map was measured in the first round at between -5 % and +6 % and left for later; step 6 then put one in. Measured again here, interleaved on the replay: the pass with the padded map of step 6 and searching reads is 14.2 ns a coefficient natively and 16.2 in wasm; this step's map, tables and bits bring that to 12.1 and 12.7, the reads of step 9 to 9.5 and 11.0, the `Min( level, 3 )` map with the CDF index in the table and `coeff_br` out of line to 8.1 and 10.5. A padded map pays, and more once nothing around it is mispredicted.
 
 In the decoder, from one run: the part 2.11 to 1.45 ms in wasm simd, 2.15 to 1.47 in baseline, 1.71 to 1.08 natively; mandelbrot 720p 103.3 to 110.3 fps simd, 51.2 to 52.9 baseline, 124.5 to 135.3 natively. The part is now below the 1.6 ms measured for rav1d's symbol decoder and coefficient reader in the first round. What it still costs is the reads themselves: the dependent chain of an adaptive read is about twenty cycles when the next read uses the same CDF, which it often does.
+
+### 11. The 1D inverse transforms compiled for each size
+
+A frame of mandelbrot 720p reconstructs 890 transform blocks, 367 000 samples; 184 of the blocks are DC only and take step 5's shortcut. The rest go through `run_lanes`, which called the processes of 7.13.2 with the size as a variable. The DCT of 7.13.2.3 is one process for 4 to 64 points, each stage guarded by the size, and compiled once for all sizes it tested `n` before every group of butterflies, worked out the bit-reversed index of every element of the permutation in a loop as it ran, and fetched each rotation's cosine and sine from the table through four comparisons. `run_lanes` now matches on the kind and the size and calls the same process with the size a constant in each arm, so each is compiled with its stages, permutation and angles decided: the "one function per size" that the list above asked for, got without writing any of them. Nothing in the arithmetic is touched; a test runs every kind and size against the process called with the size hidden from the compiler, eight lanes and one value at a time (a 16-point DCT arm calling the 32-point network, planted, fails it and three other tests; an identity arm of the wrong size fails it alone).
+
+The part, from one run: 1.60 to 1.45 ms in wasm simd, 2.95 to 2.04 in baseline (whose transforms are the scalar ones, a row or a column at a time), 0.95 to 0.84 natively. Mandelbrot 720p 110.0 to 116.2 fps simd, 53.2 to 55.8 baseline, 133.5 to 135.0 natively; the simd module is 118 KB larger (3.80 to 3.92 MB), the baseline one 8 KB.

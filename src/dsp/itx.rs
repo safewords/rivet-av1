@@ -626,10 +626,24 @@ fn run(t: &mut [i32], kind: Kind, n: u32, r: u32, lossless: bool, wht_shift: u32
 #[inline(always)]
 fn run_lanes<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
     let mut tx = Tx { t };
-    match kind {
-        Kind::Dct => tx.idct(n, r),
-        Kind::Adst => tx.iadst(n, r),
-        Kind::Identity => tx.iidentity(n),
+    // Each size on its own. The processes of 7.13.2 are written for any
+    // size, and compiled that way they test the size at every stage, find
+    // the permutation's indices bit by bit as they run and look their
+    // angles up; with the size a constant where each is compiled in, all
+    // of that is decided there.
+    match (kind, n) {
+        (Kind::Dct, 2) => tx.idct(2, r),
+        (Kind::Dct, 3) => tx.idct(3, r),
+        (Kind::Dct, 4) => tx.idct(4, r),
+        (Kind::Dct, 5) => tx.idct(5, r),
+        (Kind::Dct, _) => tx.idct(6, r),
+        (Kind::Adst, 2) => tx.iadst(2, r),
+        (Kind::Adst, 3) => tx.iadst(3, r),
+        (Kind::Adst, _) => tx.iadst(4, r),
+        (Kind::Identity, 2) => tx.iidentity(2),
+        (Kind::Identity, 3) => tx.iidentity(3),
+        (Kind::Identity, 4) => tx.iidentity(4),
+        (Kind::Identity, _) => tx.iidentity(5),
     }
 }
 
@@ -1005,6 +1019,65 @@ mod tests {
                         assert_eq!(a, b, "{bd}-bit size {tx_sz} type {tx_type} case {case}");
                         inverse_transform_2d_lanes(&dq, tx_sz, tx_type, bd, &mut b);
                         assert_eq!(a, b, "lanes, {bd}-bit size {tx_sz} type {tx_type}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 1D transforms compiled for each size give what the processes of
+    /// 7.13.2 give when called with the size as a variable, for every kind
+    /// and size, one value at a time and eight.
+    #[test]
+    fn sizes_match_the_general_processes() {
+        /// The dispatch as it was: one body for all sizes.
+        #[inline(never)]
+        fn general<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
+            let n = std::hint::black_box(n);
+            let mut tx = Tx { t };
+            match kind {
+                Kind::Dct => tx.idct(n, r),
+                Kind::Adst => tx.iadst(n, r),
+                Kind::Identity => tx.iidentity(n),
+            }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for (kind, sizes) in [
+            (Kind::Dct, 2..=6u32),
+            (Kind::Adst, 2..=4),
+            (Kind::Identity, 2..=5),
+        ] {
+            for n in sizes {
+                for r in [16u32, 18] {
+                    for _ in 0..200 {
+                        let mut a = [Lanes::zero(); 64];
+                        for v in a[..1 << n].iter_mut() {
+                            for l in 0..8 {
+                                v.0[l] = rnd(1 << (r - 1)) as i32 - (1 << (r - 2));
+                            }
+                        }
+                        let mut b = a;
+                        run_lanes(&mut a[..], kind, n, r);
+                        general(&mut b[..], kind, n, r);
+                        let name = ["DCT", "ADST", "identity"][kind as usize];
+                        for i in 0..1usize << n {
+                            assert_eq!(a[i].0, b[i].0, "{name} of {} at {i}", 1 << n);
+                        }
+                        // One value at a time: the first lane of each.
+                        let mut c = [0i32; 64];
+                        for (c, a) in c.iter_mut().zip(&b) {
+                            *c = a.0[0];
+                        }
+                        let mut d = c;
+                        run_lanes(&mut c[..], kind, n, r);
+                        general(&mut d[..], kind, n, r);
+                        assert_eq!(c, d, "{name} of {}, one value at a time", 1 << n);
                     }
                 }
             }
