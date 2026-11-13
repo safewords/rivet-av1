@@ -1,8 +1,11 @@
-//! The 8-tap interpolation filters of inter prediction (7.11.3.4) and the
-//! blends of compound prediction (7.11.3.1): scalar, and AVX2 versions of
-//! the 32-bit filters chosen at run time. The 16-bit filters and the blends
-//! have SIMD128 versions in a wasm32 module built with `simd128` and NEON
-//! versions on aarch64. All bit-exact.
+//! The 8-tap interpolation filters of inter prediction (7.11.3.4), the
+//! blends of compound prediction (7.11.3.1) and one output of the block
+//! warp's filters (7.11.3.5): scalar, and AVX2 versions of the 32-bit
+//! filters chosen at run time. The 16-bit filters, the blends and the
+//! warp's dot product have SIMD128 versions in a wasm32 module built with
+//! `simd128` and NEON versions on aarch64; where there is neither, the
+//! scalar 8-bit filter and the mean of two blocks take four samples at a
+//! time as the lanes of a 64-bit word. All bit-exact.
 
 /// The horizontal filter: `out[c] = Round2(sum_t f[t] * src[c + t],
 /// round0)`, `src` holding `out.len() + 7` samples.
@@ -286,7 +289,12 @@ pub(crate) fn taps8(
 const LIFT8: i32 = 16384;
 
 /// The scalar version of [`taps8`], in the 16-bit arithmetic the SIMD
-/// versions use.
+/// versions use, four outputs at a time: four neighbouring samples are the
+/// four 16-bit lanes of one 64-bit word, and a tap times that word is the
+/// tap times each of them, as long as no lane carries into the next. So the
+/// positive taps are summed in one word (with the lift: under 65536 a
+/// lane) and the negative ones in another (at most 14280 a lane, less than
+/// the lift, so the subtraction borrows nothing).
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn taps8_scalar<const N: usize>(
@@ -299,17 +307,52 @@ pub(crate) fn taps8_scalar<const N: usize>(
     shift: u32,
     out: &mut [i16],
 ) {
-    let taps: [u16; N] = std::array::from_fn(|t| taps[t] as u16);
-    let add = (LIFT8 + ((1 << shift) >> 1)) as u16;
-    let sub = (LIFT8 >> shift) as i16;
+    const LANES: u64 = 0x0001_0001_0001_0001;
+    let size: [u64; N] = std::array::from_fn(|t| taps[t].unsigned_abs() as u64);
+    let add = LIFT8 + ((1 << shift) >> 1);
+    let sub = LIFT8 >> shift;
+    // After the shift a lane's top bits are its neighbour's: masked off.
+    // Then `sub` comes off every lane with bit 15 set first, which keeps
+    // the borrow in the lane, and cleared again after.
+    let keep = (0xffff >> shift) as u64 * LANES;
+    let top = 0x8000 * LANES;
+    // (A lane has to have its bit 15 free for that.)
+    let words = if shift == 0 { 0 } else { w & !3 };
     for r in 0..rows {
         let s = &src[r * stride..][..(N - 1) * step + w];
-        for (c, o) in out[r * w..][..w].iter_mut().enumerate() {
-            let mut acc = add;
+        let o = &mut out[r * w..][..w];
+        for c in (0..words).step_by(4) {
+            let (mut pos, mut neg) = (add as u64 * LANES, 0u64);
+            // The samples under the taps of these four outputs (one bounds
+            // test for all of them).
+            let under = &s[c..c + (N - 1) * step + 4];
             for t in 0..N {
-                acc = acc.wrapping_add(taps[t].wrapping_mul(s[c + t * step]));
+                let q: &[u16; 4] = under[t * step..][..4].try_into().unwrap();
+                let word =
+                    q[0] as u64 | (q[1] as u64) << 16 | (q[2] as u64) << 32 | (q[3] as u64) << 48;
+                if taps[t] >= 0 {
+                    pos = pos.wrapping_add(size[t].wrapping_mul(word));
+                } else {
+                    neg = neg.wrapping_add(size[t].wrapping_mul(word));
+                }
             }
-            *o = (acc >> shift) as i16 - sub;
+            let v = ((pos.wrapping_sub(neg) >> shift) & keep | top)
+                .wrapping_sub(sub as u64 * LANES)
+                ^ top;
+            let q: &mut [i16; 4] = (&mut o[c..c + 4]).try_into().unwrap();
+            *q = [
+                v as i16,
+                (v >> 16) as i16,
+                (v >> 32) as i16,
+                (v >> 48) as i16,
+            ];
+        }
+        for c in words..w {
+            let mut acc = add as u16;
+            for t in 0..N {
+                acc = acc.wrapping_add((taps[t] as u16).wrapping_mul(s[c + t * step]));
+            }
+            o[c] = (acc >> shift) as i16 - sub as i16;
         }
     }
 }
@@ -593,6 +636,10 @@ pub(crate) fn compound_avg(
     compound_avg_scalar(a, b, c, w, h, dst, dst_stride)
 }
 
+/// The scalar version of [`avg_samples`], four samples at a time as the
+/// 16-bit lanes of a 64-bit word: `a + b` is `2 * (a | b) - (a ^ b)`, so
+/// the rounded mean is `(a | b) - ((a ^ b) >> 1)`, which no lane borrows
+/// for.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn avg_samples_scalar(
     a: &[u16],
@@ -604,10 +651,27 @@ pub(crate) fn avg_samples_scalar(
     dst: &mut [u16],
     dst_stride: usize,
 ) {
+    // What a shift right by one leaves of each lane.
+    const LOW: u64 = 0x7fff_7fff_7fff_7fff;
+    let word = |q: &[u16; 4]| {
+        q[0] as u64 | (q[1] as u64) << 16 | (q[2] as u64) << 32 | (q[3] as u64) << 48
+    };
     for r in 0..h {
         let (a, b) = (&a[r * a_stride..][..w], &b[r * b_stride..][..w]);
-        for ((o, &a), &b) in dst[r * dst_stride..][..w].iter_mut().zip(a).zip(b) {
-            *o = ((a as u32 + b as u32 + 1) >> 1) as u16;
+        let o = &mut dst[r * dst_stride..][..w];
+        let quads = a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0);
+        for (o, (a, b)) in o.as_chunks_mut::<4>().0.iter_mut().zip(quads) {
+            let (a, b) = (word(a), word(b));
+            let v = (a | b) - (((a ^ b) >> 1) & LOW);
+            *o = [
+                v as u16,
+                (v >> 16) as u16,
+                (v >> 32) as u16,
+                (v >> 48) as u16,
+            ];
+        }
+        for c in w & !3..w {
+            o[c] = ((a[c] as u32 + b[c] as u32 + 1) >> 1) as u16;
         }
     }
 }

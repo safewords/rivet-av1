@@ -325,6 +325,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 52.0 (0.81x) | 106 (0.74x) | 127 (1.52x) |
 |  | mandelbrot 720p 10-bit | 63.3 (0.86x) | 143 (1.79x) | 171 (1.76x) |
 |  | mandelbrot 1080p | 25.7 (0.81x) | 56.5 (0.75x) | 67.6 (1.66x) |
+| 15. the scalar filter and mean, four samples to a 64-bit word | fixture 320x180 | 799 (0.65x) | 1158 (0.65x) | 1302 (0.86x) |
+|  | testsrc2 720p | 132 (0.75x) | 196 (0.63x) | 225 (0.96x) |
+|  | mandelbrot 720p | 53.6 (0.83x) | 105 (0.74x) | 126 (1.51x) |
+|  | mandelbrot 720p 10-bit | 64.9 (0.87x) | 143 (1.76x) | 172 (1.76x) |
+|  | mandelbrot 1080p | 26.5 (0.83x) | 56.9 (0.76x) | 68.2 (1.66x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -361,5 +366,9 @@ Two costs a block paid before any sample. Its two filters' kept taps were found 
 ### 14. A warp output as one 16-bit dot product
 
 Each output of the warp's two passes has its own filter, so there is no row of outputs to share a tap between; what an output is, though, is eight 16-bit values times eight taps. `dot8` is that as one 16-bit dot product (`i32x4_dot_i16x8` and two adds across the lanes in SIMD128; `vmull_s16`, `vmlal_high_s16` and `vaddvq_s32` in NEON), over `Warped_Filters` narrowed to 16 bits when the crate is built. The intermediates fit 16 bits (tested over the table) and are kept a column at a time, since the vertical pass reads down a column. Inter prediction on mandelbrot 720p: native 0.83 to 0.79 ms a frame over nine turns, simd 0.97 to 0.89 over seven. The scalar version is what x86-64 takes.
+
+### 15. The scalar 8-bit filter and mean, four samples to a 64-bit word
+
+The baseline wasm build (no SIMD) and any target without a SIMD version take the scalar kernels, and LLVM has nothing to vectorise them with there. Two of them now work four samples at a time in a 64-bit word. Four neighbouring samples of a plane are the four 16-bit lanes of the word at their address (the compiler turns the four loads and shifts into one 64-bit load: checked in the wasm it emits), and a tap times that word is the tap times each sample as long as no lane carries into the next. For 8-bit samples that is the arithmetic of step 8 again: the positive taps are summed in one word with the lift (under 65536 a lane), the negative ones in another (at most 14280 a lane, less than the lift, so subtracting it borrows nothing), then one shift, one mask and the lift taken off with each lane's top bit set against a borrow. And the rounded mean of two whole-sample references is `(a | b) - ((a ^ b) >> 1)` in each lane. Inter prediction on mandelbrot 720p in the baseline build: 3.42 to 2.63 ms a frame (3.02 with the filter alone, 2.85 with one bounds test for the samples under all its taps, 2.63 with the mean). The simd and native builds take these only for blocks under eight wide, and do not move.
 
 `tools/wasm-perf/` has the scripts every number here came from.
