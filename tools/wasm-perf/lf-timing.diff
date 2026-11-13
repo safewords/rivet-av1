@@ -1,0 +1,24 @@
+diff --git a/src/decoder/mod.rs b/src/decoder/mod.rs
+index c788d44..e6fb861 100644
+--- a/src/decoder/mod.rs
++++ b/src/decoder/mod.rs
+@@ -787,7 +787,19 @@ impl Decoder {
+     /// The decode frame wrapup process (7.4) for a decoded frame.
+     fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
+         if f.hdr.loop_filter_level[0] != 0 || f.hdr.loop_filter_level[1] != 0 {
++            let lf_t0 = std::time::Instant::now();
+             postfilter::loop_filter_threads(&mut f, self.threads);
++            {
++                use std::sync::atomic::{AtomicU64, Ordering};
++                static NS: AtomicU64 = AtomicU64::new(0);
++                static FRAMES: AtomicU64 = AtomicU64::new(0);
++                let ns = NS.fetch_add(lf_t0.elapsed().as_nanos() as u64, Ordering::Relaxed)
++                    + lf_t0.elapsed().as_nanos() as u64;
++                let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
++                if std::env::var_os("AV1_LF_TIME").is_some() {
++                    eprintln!("LFTIME frames {n} total_ms {:.4}", ns as f64 / 1e6);
++                }
++            }
+         }
+         let cdef = postfilter::cdef(&f, self.threads);
+         let up_cdef = match postfilter::upscale(&f, &cdef) {

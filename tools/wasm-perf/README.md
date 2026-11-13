@@ -32,6 +32,12 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
 - `bench-native.py <runs> <threads> <decode_ivf>...`: the same natively,
   with wasm-av1's `decode_ivf` example.
 - `prof.sh <label> <variant> <clip>`: V8's CPU profile by function.
+- `lfprof.sh <runs> <clip> <label/variant>...`: the loop filter's
+  milliseconds a frame in wasm builds (its share of the profile times the
+  frame time of an unprofiled run), the builds taking turns.
+- `lf-timing.diff`: a clock around the loop filter, for the same figure
+  natively. Apply it to the tree, build `decode_ivf`, revert it, and run
+  with `AV1_LF_TIME=1`: the last `LFTIME` line is the total.
 - `gate.sh <label>`: this crate's gates (fmt, clippy on the host, wasm32
   with and without simd128, and x86-64 with a locally built std under
   Rosetta; doc; the tests), wasm-av1's tests on the tree, bit-exactness of

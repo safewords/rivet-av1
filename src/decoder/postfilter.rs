@@ -5,7 +5,8 @@
 use crate::bits::floor_log2;
 use crate::consts::*;
 use crate::decoder::FrameCtx;
-use crate::decoder::state::{FrameBuf, PlaneBuf};
+use crate::decoder::state::{FrameBuf, Mi, PlaneBuf};
+use crate::header::FrameHeader;
 use crate::tables::*;
 
 // ---------------------------------------------------------------------------
@@ -64,14 +65,19 @@ impl SharedPlane {
 /// `threads` threads. The first pass
 /// (vertical edges) filters along rows, so bands of rows are independent;
 /// the second (horizontal edges) along columns, so bands of columns are.
+///
+/// The specification visits every 4x4 unit of a plane and decides there
+/// whether its edge is filtered, how wide and how strongly (7.14.2 to
+/// 7.14.5); [`edge_unit`] is that decision, made in the order that costs
+/// least (most units are not on a transform edge, and that needs one byte),
+/// with the levels of 7.14.4 looked up in [`LfLevels`].
 pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
+    let levels = LfLevels::new(&f.hdr);
     for plane in 0..f.num_planes {
         if plane == 0 || f.hdr.loop_filter_level[1 + plane] != 0 {
             let mut pb = std::mem::take(&mut f.cur.planes[plane]);
             let sp = SharedPlane::new(&mut pb);
             let fr: &FrameCtx = f;
-            let row_step = if plane == 0 { 1 } else { 1 << fr.ssy };
-            let col_step = if plane == 0 { 1 } else { 1 << fr.ssx };
             for pass in 0..2 {
                 // Bands of 16 mode info units (64 luma samples).
                 let extent = if pass == 0 { fr.mi_rows } else { fr.mi_cols };
@@ -82,15 +88,7 @@ pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
                     } else {
                         (0, fr.mi_rows, b * 16, ((b + 1) * 16).min(fr.mi_cols))
                     };
-                    let mut row = r0;
-                    while row < r1 {
-                        let mut col = c0;
-                        while col < c1 {
-                            edge_loop_filter(fr, sp, plane, pass, row, col);
-                            col += col_step;
-                        }
-                        row += row_step;
-                    }
+                    filter_band(fr, &levels, sp, plane, pass, [r0, r1, c0, c1]);
                 };
                 if threads > 1 {
                     crate::decoder::parallel_map(bands, threads, band);
@@ -103,7 +101,345 @@ pub(crate) fn loop_filter_threads(f: &mut FrameCtx, threads: usize) {
     }
 }
 
-/// The edge loop filter process (7.14.2).
+/// The filter levels of a frame (7.14.4) for a block with no `delta_lf`:
+/// they depend on the block's segment, its first reference frame and
+/// whether its mode is one of the `mode_deltas` kind, so there are 144 of
+/// them for each of the four `i` (luma vertical edges, luma horizontal
+/// edges, U, V); and the limits that go with each level.
+pub(crate) struct LfLevels {
+    /// `[i][segment][ref_frame + 1][mode_type]`.
+    lvl: [[[[u8; 2]; 9]; 8]; 4],
+    /// `[lvl]`: `limit`, `blimit`, `thresh`.
+    limits: [[u8; 3]; 64],
+}
+
+impl LfLevels {
+    pub(crate) fn new(h: &FrameHeader) -> Self {
+        let mut lvl = [[[[0u8; 2]; 9]; 8]; 4];
+        for (i, per_i) in lvl.iter_mut().enumerate() {
+            for (segment, per_segment) in per_i.iter_mut().enumerate() {
+                for (r, per_ref) in per_segment.iter_mut().enumerate() {
+                    for (mode_type, l) in per_ref.iter_mut().enumerate() {
+                        *l = filter_level(h, i, segment, r as i32 - 1, mode_type, 0) as u8;
+                    }
+                }
+            }
+        }
+        let mut limits = [[0u8; 3]; 64];
+        for (l, lim) in limits.iter_mut().enumerate() {
+            let (limit, blimit, thresh) = filter_limits(h.loop_filter_sharpness, l as i32);
+            *lim = [limit as u8, blimit as u8, thresh as u8];
+        }
+        LfLevels { lvl, limits }
+    }
+
+    /// `lvl` of 7.14.4 for the block of `m`.
+    #[inline(always)]
+    fn level(&self, h: &FrameHeader, m: &Mi, i: usize) -> usize {
+        let segment = m.segment_id as usize;
+        let rf = m.ref_frame[0] as i32;
+        let mode = m.y_mode as usize;
+        let mode_type = (mode >= NEARESTMV && mode != GLOBALMV && mode != GLOBAL_GLOBALMV) as usize;
+        let delta_lf = if h.delta_lf_multi {
+            m.delta_lf[i]
+        } else {
+            m.delta_lf[0]
+        };
+        if delta_lf == 0 && segment < 8 && (-1..8).contains(&rf) {
+            self.lvl[i][segment][(rf + 1) as usize][mode_type] as usize
+        } else {
+            filter_level(h, i, segment, rf, mode_type, delta_lf as i32) as usize
+        }
+    }
+}
+
+/// `lvl` of the adaptive filter strength process (7.14.4, with the selection
+/// process 7.14.5): `i` is 0 and 1 for luma's vertical and horizontal
+/// edges, 2 for U and 3 for V.
+fn filter_level(
+    h: &FrameHeader,
+    i: usize,
+    segment: usize,
+    rf: i32,
+    mode_type: usize,
+    delta_lf: i32,
+) -> i32 {
+    let mut lvl_seg = clip3(0, MAX_LOOP_FILTER, delta_lf + h.loop_filter_level[i]);
+    let feature = SEG_LVL_ALT_LF_Y_V + i;
+    if h.segmentation_enabled && h.feature_enabled[segment][feature] {
+        lvl_seg = clip3(
+            0,
+            MAX_LOOP_FILTER,
+            h.feature_data[segment][feature] + lvl_seg,
+        );
+    }
+    if h.loop_filter_delta_enabled {
+        let n_shift = lvl_seg >> 5;
+        if rf == INTRA_FRAME {
+            lvl_seg += h.loop_filter_ref_deltas[INTRA_FRAME as usize] << n_shift;
+        } else if rf > INTRA_FRAME {
+            lvl_seg += (h.loop_filter_ref_deltas[rf as usize] << n_shift)
+                + (h.loop_filter_mode_deltas[mode_type] << n_shift);
+        }
+        lvl_seg = clip3(0, MAX_LOOP_FILTER, lvl_seg);
+    }
+    lvl_seg
+}
+
+/// `limit`, `blimit` and `thresh` of 7.14.4 for a level.
+fn filter_limits(sharp: i32, lvl: i32) -> (i32, i32, i32) {
+    let shift = if sharp > 4 {
+        2
+    } else if sharp > 0 {
+        1
+    } else {
+        0
+    };
+    let limit = if sharp > 0 {
+        clip3(1, 9 - sharp, lvl >> shift)
+    } else {
+        (lvl >> shift).max(1)
+    };
+    (limit, 2 * (lvl + 2) + limit, lvl >> 4)
+}
+
+/// One 4x4 unit's edge: the filter size of 7.14.3 (0 for an edge that is
+/// not filtered) and the level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EdgeUnit {
+    size: u8,
+    lvl: u8,
+}
+
+const NO_EDGE: EdgeUnit = EdgeUnit { size: 0, lvl: 0 };
+
+/// The edge loop filter process (7.14.2) up to its sample filtering, for
+/// the unit at row `pr`, column `pc` of the plane's 4x4 units: whether the
+/// unit's left (`pass` 0) or upper (`pass` 1) edge is filtered, and with
+/// what. The caller keeps to the units on screen (`pc` at least 1 in pass
+/// 0, `pr` at least 1 in pass 1).
+#[inline(always)]
+fn edge_unit(
+    f: &FrameCtx,
+    levels: &LfLevels,
+    plane: usize,
+    pass: usize,
+    pr: usize,
+    pc: usize,
+) -> EdgeUnit {
+    let ms = f.ms;
+    let txs = &f.lf_tx_sizes[plane];
+    let ti = pr * ms + pc;
+    let tx_sz = txs[ti] as usize;
+    // Transform sizes and block sizes are powers of two.
+    let (at, tx_dim) = if pass == 0 {
+        (pc * MI_SIZE, TX_WIDTH[tx_sz])
+    } else {
+        (pr * MI_SIZE, TX_HEIGHT[tx_sz])
+    };
+    if at & (tx_dim - 1) != 0 {
+        // Not a transform edge, as nearly every unit.
+        return NO_EDGE;
+    }
+    let (sub_x, sub_y) = f.plane_ss(plane);
+    let row = (pr << sub_y) | sub_y;
+    let col = (pc << sub_x) | sub_x;
+    let m = &f.mi[row * ms + col];
+    if m.skip && m.ref_frame[0] as i32 > INTRA_FRAME {
+        // A skipped inter block is filtered on its own edges alone.
+        let plane_size = f.plane_residual_size(m.mi_size as usize, plane);
+        let block_dim = if pass == 0 {
+            block_width(plane_size)
+        } else {
+            block_height(plane_size)
+        };
+        if at & (block_dim - 1) != 0 {
+            return NO_EDGE;
+        }
+    }
+    // The filter size process (7.14.3).
+    let (prev_tx_sz, prev_mi) = if pass == 0 {
+        (txs[ti - 1] as usize, row * ms + col - (1 << sub_x))
+    } else {
+        (txs[ti - ms] as usize, (row - (1 << sub_y)) * ms + col)
+    };
+    let base_size = if pass == 0 {
+        TX_WIDTH[prev_tx_sz].min(tx_dim)
+    } else {
+        TX_HEIGHT[prev_tx_sz].min(tx_dim)
+    };
+    let size = base_size.min(if plane == 0 { 16 } else { 8 });
+    let i = if plane == 0 { pass } else { plane + 1 };
+    let mut lvl = levels.level(&f.hdr, m, i);
+    if lvl == 0 {
+        lvl = levels.level(&f.hdr, &f.mi[prev_mi], i);
+    }
+    if lvl == 0 {
+        return NO_EDGE;
+    }
+    EdgeUnit {
+        size: size as u8,
+        lvl: lvl as u8,
+    }
+}
+
+/// The loop filter of one pass over the mode info rows `r0..r1` and columns
+/// `c0..c1` of a plane (`area`), a band no other thread is filtering.
+///
+/// Units are taken two at a time along their edge (two rows of units for
+/// the vertical edges of pass 0, two columns for the horizontal edges of
+/// pass 1), which is eight samples: what one call of a filter kernel takes.
+/// The pairs lie inside the band, whose first row and column are multiples
+/// of 16.
+fn filter_band(
+    f: &FrameCtx,
+    levels: &LfLevels,
+    p: SharedPlane,
+    plane: usize,
+    pass: usize,
+    area: [usize; 4],
+) {
+    let [r0, r1, c0, c1] = area;
+    let (sub_x, sub_y) = f.plane_ss(plane);
+    // On screen (7.14.2): the unit's luma position is inside the frame.
+    let r1 = r1.min((f.hdr.frame_height as usize).div_ceil(MI_SIZE));
+    let c1 = c1.min((f.hdr.frame_width as usize).div_ceil(MI_SIZE));
+    // The plane's units: every `1 << sub`-th mode info row and column.
+    let (pr0, pr1) = (r0 >> sub_y, (r1 + sub_y) >> sub_y);
+    let (pc0, pc1) = (c0 >> sub_x, (c1 + sub_x) >> sub_x);
+    let stride = p.stride;
+    let ctx = FilterCtx {
+        p,
+        limits: &levels.limits,
+        chroma: plane != 0,
+        bit_depth: f.bit_depth,
+    };
+    if pass == 0 {
+        let mut pr = pr0;
+        while pr < pr1 {
+            let second = pr + 1 < pr1;
+            // No edge at the frame's left.
+            for pc in pc0.max(1)..pc1 {
+                let a = edge_unit(f, levels, plane, 0, pr, pc);
+                let b = if second {
+                    edge_unit(f, levels, plane, 0, pr + 1, pc)
+                } else {
+                    NO_EDGE
+                };
+                if a != NO_EDGE || b != NO_EDGE {
+                    let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
+                    ctx.filter_pair(pos, 1, stride, a, b);
+                }
+            }
+            pr += 2;
+        }
+    } else {
+        // No edge at the frame's top.
+        for pr in pr0.max(1)..pr1 {
+            let mut pc = pc0;
+            while pc < pc1 {
+                let a = edge_unit(f, levels, plane, 1, pr, pc);
+                let b = if pc + 1 < pc1 {
+                    edge_unit(f, levels, plane, 1, pr, pc + 1)
+                } else {
+                    NO_EDGE
+                };
+                if a != NO_EDGE || b != NO_EDGE {
+                    let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
+                    ctx.filter_pair(pos, stride, 1, a, b);
+                }
+                pc += 2;
+            }
+        }
+    }
+}
+
+/// What the sample filtering of a plane's edges needs besides the edge.
+struct FilterCtx<'a> {
+    p: SharedPlane,
+    limits: &'a [[u8; 3]; 64],
+    chroma: bool,
+    bit_depth: u32,
+}
+
+impl FilterCtx<'_> {
+    /// Filters two units' edges (7.14.6 for each of their samples): `a` at
+    /// sample `pos`, `b` four samples further along the edge. `step` is the
+    /// distance between samples across the edge, `along` between samples
+    /// along it.
+    #[inline(always)]
+    fn filter_pair(&self, pos: usize, step: usize, along: usize, a: EdgeUnit, b: EdgeUnit) {
+        if a != NO_EDGE {
+            self.filter_unit_lanes(pos, step, along, a);
+        }
+        if b != NO_EDGE {
+            self.filter_unit_lanes(pos + 4 * along, step, along, b);
+        }
+    }
+
+    /// One unit's four samples along the edge through the lane filter: the
+    /// samples across the edge gathered, filtered together and written
+    /// back.
+    fn filter_unit_lanes(&self, pos: usize, step: usize, along: usize, e: EdgeUnit) {
+        let p = self.p;
+        let filter_size = e.size as usize;
+        let (base, step, along) = (pos as isize, step as isize, along as isize);
+        let reach: isize = if filter_size >= 16 { 7 } else { 4 };
+        let mut v: crate::dsp::lf::Edge = [[0; 4]; 14];
+        for l in 0..4isize {
+            for k in -reach..reach {
+                v[(7 + k) as usize][l as usize] =
+                    p.get((base + l * along + k * step) as usize) as i32;
+            }
+        }
+        let [limit, blimit, thresh] = self.limits[e.lvl as usize];
+        let params = crate::dsp::lf::Params {
+            limit: limit as i32,
+            blimit: blimit as i32,
+            thresh: thresh as i32,
+            filter_size,
+            chroma: self.chroma,
+            bit_depth: self.bit_depth,
+        };
+        crate::dsp::lf::filter(&mut v, &params);
+        let span: isize = if filter_size >= 16 { 6 } else { 3 };
+        for l in 0..4isize {
+            for k in -span..span {
+                p.set(
+                    (base + l * along + k * step) as usize,
+                    v[(7 + k) as usize][l as usize] as u16,
+                );
+            }
+        }
+    }
+}
+
+/// The loop filter as the specification walks it (7.14.1): every unit of
+/// every plane through [`edge_loop_filter`], vertical edges first. What
+/// [`loop_filter_threads`] is held to.
+#[cfg(test)]
+fn loop_filter_reference(f: &mut FrameCtx) {
+    for plane in 0..f.num_planes {
+        if plane == 0 || f.hdr.loop_filter_level[1 + plane] != 0 {
+            let mut pb = std::mem::take(&mut f.cur.planes[plane]);
+            let sp = SharedPlane::new(&mut pb);
+            let row_step = if plane == 0 { 1 } else { 1 << f.ssy };
+            let col_step = if plane == 0 { 1 } else { 1 << f.ssx };
+            for pass in 0..2 {
+                for row in (0..f.mi_rows).step_by(row_step) {
+                    for col in (0..f.mi_cols).step_by(col_step) {
+                        edge_loop_filter(f, sp, plane, pass, row, col);
+                    }
+                }
+            }
+            f.cur.planes[plane] = pb;
+        }
+    }
+}
+
+/// The edge loop filter process (7.14.2), as written: the reference for
+/// [`edge_unit`] and the kernels.
+#[cfg(test)]
 fn edge_loop_filter(
     f: &FrameCtx,
     p: SharedPlane,
@@ -203,7 +539,8 @@ fn edge_loop_filter(
 }
 
 /// The adaptive filter strength process (7.14.4): `lvl, limit, blimit,
-/// thresh`.
+/// thresh`. As written: the reference for [`LfLevels`].
+#[cfg(test)]
 fn filter_strength(
     f: &FrameCtx,
     row: usize,
@@ -1034,4 +1371,300 @@ fn wiener_coefficient(coeff: &[i32; 3]) -> [i32; 7] {
         filter[3] -= 2 * c;
     }
     filter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// xorshift: `rnd(n)` is below `n`.
+    struct Rng(u64);
+
+    impl Rng {
+        fn rnd(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        fn signed(&mut self, n: i64) -> i32 {
+            (self.rnd(2 * n as u64 + 1) as i64 - n) as i32
+        }
+    }
+
+    /// A frame for the loop filter alone: `w` x `h` luma samples of smooth
+    /// areas, steps and noise, tiled with random blocks and transform sizes
+    /// (and, with `scramble`, units whose mode info and transform size
+    /// belong to no tiling), under a random loop filter header.
+    fn random_frame(
+        r: &mut Rng,
+        (w, h): (usize, usize),
+        (ssx, ssy): (usize, usize),
+        num_planes: usize,
+        bit_depth: u32,
+        scramble: bool,
+    ) -> FrameCtx {
+        // A reduced still picture header, 1x1: the loop filter reads
+        // nothing of the sequence header.
+        let seq = crate::obu::SequenceHeader::parse(&[0x18, 0, 0, 0, 0, 0], 0).expect("header");
+        let mi_cols = 2 * ((w + 7) >> 3);
+        let mi_rows = 2 * ((h + 7) >> 3);
+        let ms = mi_cols + 32;
+        let n = (mi_rows + 32) * ms;
+        let mut hdr = FrameHeader {
+            frame_width: w as u32,
+            frame_height: h as u32,
+            upscaled_width: w as u32,
+            mi_cols,
+            mi_rows,
+            ..Default::default()
+        };
+        let top = [0, 1, 8, 20, 40, 63][r.rnd(6) as usize];
+        hdr.loop_filter_level = std::array::from_fn(|_| r.rnd(top + 1) as i32);
+        if r.rnd(8) == 0 {
+            // Levels that only the deltas raise.
+            hdr.loop_filter_level[r.rnd(2) as usize] = 0;
+        }
+        hdr.loop_filter_sharpness = r.rnd(8) as i32;
+        hdr.loop_filter_delta_enabled = r.rnd(2) == 0;
+        hdr.loop_filter_ref_deltas =
+            std::array::from_fn(|_| r.signed(if top > 8 { 63 } else { 3 }));
+        hdr.loop_filter_mode_deltas = std::array::from_fn(|_| r.signed(8));
+        hdr.segmentation_enabled = r.rnd(2) == 0;
+        for s in 0..8 {
+            for feature in 0..8 {
+                hdr.feature_enabled[s][feature] = r.rnd(3) == 0;
+                hdr.feature_data[s][feature] = r.signed(63);
+            }
+        }
+        hdr.delta_lf_present = r.rnd(3) == 0;
+        hdr.delta_lf_multi = hdr.delta_lf_present && r.rnd(2) == 0;
+        let mut mi = vec![Mi::default(); n];
+        let mut lf_tx_sizes = [vec![0u8; n], vec![0u8; n], vec![0u8; n]];
+        // Square blocks of 4 to 64 samples, or their two halves, with a
+        // transform size that fits.
+        let fitting_tx = |r: &mut Rng, bw: usize, bh: usize| loop {
+            let t = r.rnd(19) as usize;
+            if TX_WIDTH[t] <= bw && TX_HEIGHT[t] <= bh {
+                break t as u8;
+            }
+        };
+        let max_log2 = 1 + r.rnd(4) as usize;
+        let mut block = |r: &mut Rng, row: usize, col: usize, mi_size: usize| {
+            let (bw4, bh4) = (NUM_4X4_BLOCKS_WIDE[mi_size], NUM_4X4_BLOCKS_HIGH[mi_size]);
+            let intra = r.rnd(4) == 0;
+            let m = Mi {
+                mi_size: mi_size as u8,
+                y_mode: if intra {
+                    r.rnd(13) as u8
+                } else {
+                    (NEARESTMV as u64 + r.rnd(12)) as u8
+                },
+                ref_frame: [if intra { 0 } else { 1 + r.rnd(7) as i8 }, -1],
+                skip: r.rnd(2) == 0,
+                segment_id: r.rnd(8) as u8,
+                delta_lf: if hdr.delta_lf_present && r.rnd(2) == 0 {
+                    std::array::from_fn(|_| r.signed(40) as i8)
+                } else {
+                    [0; 4]
+                },
+                ..Default::default()
+            };
+            let tx = [
+                fitting_tx(r, 4 * bw4, 4 * bh4),
+                fitting_tx(r, ((4 * bw4) >> ssx).max(4), ((4 * bh4) >> ssy).max(4)),
+            ];
+            for i in 0..bh4 {
+                for j in 0..bw4 {
+                    let (rr, cc) = (row + i, col + j);
+                    mi[rr * ms + cc] = m;
+                    lf_tx_sizes[0][rr * ms + cc] = tx[0];
+                    for t in &mut lf_tx_sizes[1..] {
+                        t[(rr >> ssy) * ms + (cc >> ssx)] = tx[1];
+                    }
+                }
+            }
+        };
+        let sb = 16;
+        for sb_row in (0..mi_rows).step_by(sb) {
+            for sb_col in (0..mi_cols).step_by(sb) {
+                // Blocks of `1 << log2` units a side, each whole or halved.
+                let log2 = r.rnd(max_log2 as u64 + 1) as usize;
+                let side = 1usize << log2;
+                // BLOCK_4X4, 8X8, 16X16, 32X32, 64X64 are every third size.
+                let square = 3 * log2;
+                for row in (sb_row..sb_row + sb).step_by(side) {
+                    for col in (sb_col..sb_col + sb).step_by(side) {
+                        match if ssx == ssy { r.rnd(3) } else { 0 } {
+                            // The 2:1 sizes follow their square: tall, wide.
+                            1 if log2 > 0 => {
+                                block(r, row, col, square - 1);
+                                block(r, row + side / 2, col, square - 1);
+                            }
+                            2 if log2 > 0 => {
+                                block(r, row, col, square - 2);
+                                block(r, row, col + side / 2, square - 2);
+                            }
+                            _ => block(r, row, col, square),
+                        }
+                    }
+                }
+            }
+        }
+        if scramble {
+            for _ in 0..mi_rows * mi_cols / 6 {
+                let i = r.rnd(mi_rows as u64) as usize * ms + r.rnd(mi_cols as u64) as usize;
+                match r.rnd(3) {
+                    0 => lf_tx_sizes[r.rnd(3) as usize][i] = r.rnd(19) as u8,
+                    1 => mi[i].skip = !mi[i].skip,
+                    _ => mi[i].segment_id = r.rnd(8) as u8,
+                }
+            }
+        }
+        let aw = (mi_cols * MI_SIZE + 127) & !127;
+        let ah = (mi_rows * MI_SIZE + 127) & !127;
+        let maxv = (1u64 << bit_depth) - 1;
+        let mut planes = Vec::new();
+        for plane in 0..num_planes {
+            let (sx, sy) = if plane == 0 { (0, 0) } else { (ssx, ssy) };
+            let mut p = PlaneBuf::new((aw >> sx) + 32, (ah >> sy) + 32, 0);
+            // Areas of 16x16 samples around one value each, the noise of a
+            // size that sometimes passes every threshold and sometimes none.
+            let area = 16;
+            let across = p.w.div_ceil(area);
+            let bases: Vec<(u64, u64)> = (0..across * p.h.div_ceil(area))
+                .map(|_| {
+                    let noise = [1, 2, 3, 6, 24, 200][r.rnd(6) as usize] << (bit_depth - 8);
+                    (r.rnd(maxv + 1), noise)
+                })
+                .collect();
+            for y in 0..p.h {
+                for x in 0..p.w {
+                    let (base, noise) = bases[(y / area) * across + x / area];
+                    let v = (base + r.rnd(noise)).saturating_sub(noise / 2).min(maxv);
+                    p.set(x, y, v as u16);
+                }
+            }
+            planes.push(p);
+        }
+        FrameCtx {
+            seq: Arc::new(seq),
+            hdr,
+            bit_depth,
+            ssx,
+            ssy,
+            num_planes,
+            mi_rows,
+            mi_cols,
+            ms,
+            mi,
+            tx_types: Vec::new(),
+            lf_tx_sizes,
+            palette_colors: [Vec::new(), Vec::new()],
+            segment_ids: Vec::new(),
+            prev_segment_ids: Arc::new(Vec::new()),
+            cdef_idx: Vec::new(),
+            cdef_stride: 0,
+            lr: Default::default(),
+            motion_field: Arc::new(Vec::new()),
+            cur: FrameBuf { planes },
+            refs: Default::default(),
+            cdfs: crate::cdf::CdfContext::new(0),
+            saved_cdfs: None,
+            mask: Box::new([0; 128 * 128]),
+            tile_num: 0,
+            tiles_ok: true,
+        }
+    }
+
+    /// The tables hold what the adaptive filter strength process gives for
+    /// every segment, reference frame, mode and `i`, under random headers.
+    #[test]
+    fn levels_match_the_strength_process() {
+        let mut r = Rng(0x1f2e_3d4c_5b6a_7988);
+        for case in 0..300 {
+            let mut f = random_frame(&mut r, (16, 16), (1, 1), 3, 8, false);
+            let levels = LfLevels::new(&f.hdr);
+            for segment in 0..8 {
+                for rf in 0..8i8 {
+                    for y_mode in 0..26u8 {
+                        for with_delta in [false, true] {
+                            f.mi[0] = Mi {
+                                segment_id: segment,
+                                ref_frame: [rf, -1],
+                                y_mode,
+                                delta_lf: if with_delta {
+                                    std::array::from_fn(|_| r.signed(63) as i8)
+                                } else {
+                                    [0; 4]
+                                },
+                                ..Default::default()
+                            };
+                            for plane in 0..3 {
+                                for pass in 0..2 {
+                                    let i = if plane == 0 { pass } else { plane + 1 };
+                                    let (lvl, limit, blimit, thresh) =
+                                        filter_strength(&f, 0, 0, plane, pass);
+                                    let got = levels.level(&f.hdr, &f.mi[0], i);
+                                    assert_eq!(got as i32, lvl, "case {case} {:?}", f.mi[0]);
+                                    assert_eq!(
+                                        levels.limits[got].map(i32::from),
+                                        [limit, blimit, thresh],
+                                        "case {case} lvl {lvl}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole loop filter against the specification's walk with the
+    /// one-edge lane filter: random frames of every layout, depth and size
+    /// (with partial blocks at the right and bottom), on one thread and on
+    /// three.
+    #[test]
+    fn frames_match_the_reference_walk() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut filtered = 0usize;
+        for case in 0..160 {
+            let (ss, num_planes) = [((1, 1), 3), ((0, 0), 3), ((1, 0), 3), ((1, 1), 1)][case % 4];
+            let bit_depth = [8, 10, 12][case % 3];
+            let w = [64, 65, 100, 129, 200, 36][r.rnd(6) as usize];
+            let h = [64, 72, 90, 130, 37][r.rnd(5) as usize];
+            let scramble = case % 5 == 4;
+            let mut f = random_frame(&mut r, (w, h), ss, num_planes, bit_depth, scramble);
+            let before = f.cur.clone();
+            let mut want = FrameCtx {
+                cur: f.cur.clone(),
+                ..f.shard()
+            };
+            want.mi.clone_from(&f.mi);
+            want.lf_tx_sizes.clone_from(&f.lf_tx_sizes);
+            loop_filter_reference(&mut want);
+            loop_filter_threads(&mut f, if case % 2 == 0 { 1 } else { 3 });
+            for plane in 0..num_planes {
+                let (got, want) = (&f.cur.planes[plane], &want.cur.planes[plane]);
+                if let Some(i) = (0..got.data.len()).find(|&i| got.data[i] != want.data[i]) {
+                    panic!(
+                        "case {case} ({w}x{h}, {ss:?}, {bit_depth} bits) plane {plane}: \
+                         sample ({}, {}) is {}, the reference has {}",
+                        i % got.stride,
+                        i / got.stride,
+                        got.data[i],
+                        want.data[i]
+                    );
+                }
+                filtered += (0..got.data.len())
+                    .filter(|&i| got.data[i] != before.planes[plane].data[i])
+                    .count();
+            }
+        }
+        // The frames are such that the filter has work to do.
+        assert!(filtered > 200_000, "{filtered} samples filtered");
+    }
 }

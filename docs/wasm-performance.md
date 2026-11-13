@@ -267,3 +267,55 @@ dav1d-shaped (the mode info walk, motion vector prediction, the frame
 buffers), which is not a list of kernels.
 
 `tools/wasm-perf/` has the scripts every number here came from.
+
+## The loop filter
+
+From `829b1e1` (step 7 and the 16-bit average of two references that
+followed it). Written from the specification's loop filter process (7.14)
+and this crate's own filter, which stays as the reference every kernel here
+is tested against; rav1d's source was not read, only its profile.
+
+**Where its time went**, on mandelbrot 720p. The loop filter runs on 30 of
+the clip's 60 frames (the others have a level of zero), on chroma in 14 of
+those. In them, 12 % of luma's 4x4 units and 22 % of chroma's are on a
+transform edge at all, and every one of those is filtered; 90 % of the luma
+edges take the 16-sample filter size and 90 % of the chroma ones the
+6-sample one. A quarter of the samples along those edges fail the filter
+mask; of luma's that pass at size 16, 63 % go through the 13-tap filter.
+Natively (aarch64), with the sample filtering and then the carrying of
+samples taken out of a build in turn: 60 % of the loop filter's time was the
+filter arithmetic (every filter computed for every lane of every edge, then
+one selected), 23 % gathering the samples of an edge into a 14 x 4 array of
+32-bit values and scattering them back, 16 % deciding which edges to
+filter.
+
+The loop filter's own time is in milliseconds a shown frame of mandelbrot
+720p: in wasm, its share of V8's profile times the frame time of an
+unprofiled run (`tools/wasm-perf/lfprof.sh`); natively, a clock around the
+call (`tools/wasm-perf/lf-timing.diff`, not part of the crate), median of 5
+runs with the builds taking turns.
+
+| step | loop filter, ms a frame: wasm simd | wasm baseline | native |
+|---|---|---|---|
+| before (`829b1e1`) | 1.53 | 2.37 | 1.25 |
+| 8. edge decisions | 1.45 | 2.22 | 1.09 |
+
+The state after each step, fps and the ratio to rav1d's (median of 7, load
+average about 10):
+
+| step | clip | baseline | simd | native |
+|---|---|---|---|---|
+| before (`829b1e1`), same run as step 8 | fixture 320x180 | 742 (0.63x) | 1055 (0.62x) | 1218 |
+|  | testsrc2 720p | 120 (0.70x) | 181 (0.61x) | 203 |
+|  | mandelbrot 720p | 48.6 (0.76x) | 94.3 (0.66x) | 111 |
+|  | mandelbrot 720p 10-bit | 60.4 (0.82x) | 126 (1.57x) | 148 |
+|  | mandelbrot 1080p | 24.1 (0.86x) | 51.0 (0.69x) | 60.8 |
+| 8. the loop filter's edge decisions: the transform size first, levels from a table | fixture 320x180 | 750 (0.64x) | 1098 (0.65x) | 1272 |
+|  | testsrc2 720p | 119 (0.69x) | 180 (0.61x) | 207 |
+|  | mandelbrot 720p | 49.5 (0.77x) | 95.0 (0.67x) | 114 |
+|  | mandelbrot 720p 10-bit | 60.8 (0.82x) | 130 (1.61x) | 150 |
+|  | mandelbrot 1080p | 24.3 (0.86x) | 50.6 (0.68x) | 61.9 |
+
+### 8. The loop filter's edge decisions: the transform size first, levels from a table
+
+The edge loop of 7.14.2 ran as written for every 4x4 unit of every plane in both passes: the unit's mode info loaded, its block size looked up, and only then the question whether it is on a transform edge, which seven units in eight on this clip are not; for the ones that are, the level derived from the header for each unit (7.14.4: the segment's feature, the reference's and the mode's deltas, three clamps). `edge_unit` makes the same decision in the order that costs least: the transform size, one byte, first; the mode info only on a transform edge; the block size only for a skipped inter block, the one case it matters to. The level is a lookup: for a block with no `delta_lf` it depends on the segment, the first reference frame and the kind of mode alone, so the frame's 576 levels and the limits of each of the 64 level values are worked out once (`LfLevels`), and a block with a `delta_lf` goes through the same function the table was filled with. Units are handed on two at a time along their edge, which is what the kernels of the next steps take; the sample filtering itself is unchanged here. The specification's walk and its strength process stay in the tests as the reference: random frames of every layout, depth and odd size (tilings of blocks and transforms, and mode info that belongs to no tiling) are filtered both ways on one thread and on three and compared sample for sample, and ten planted errors (a wrong neighbour, a missing mode delta, an off-by-one at the frame's edge, ...) each fail them. Worth 5 to 13 % of the loop filter, which is 0 to 4 % of a frame and inside the noise on some rows.
