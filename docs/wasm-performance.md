@@ -323,6 +323,11 @@ step before and after from one run.
 | | mandelbrot 720p | 55.8 (0.86x) | 116 (0.80x) | 135 |
 | | mandelbrot 720p 10-bit | 67.0 (0.92x) | 154 (1.90x) | 171 |
 | | mandelbrot 1080p | 27.0 (0.84x) | 58.5 (0.78x) | 71.1 |
+| 12. the inverse transforms' lane arithmetic in SIMD128 operations | fixture 320x180 | 793 (0.66x) | 1159 (0.64x) | 1355 |
+| | testsrc2 720p | 144 (0.77x) | 225 (0.72x) | 260 |
+| | mandelbrot 720p | 57.4 (0.87x) | 122 (0.85x) | 146 |
+| | mandelbrot 720p 10-bit | 69.2 (0.90x) | 159 (1.90x) | 185 |
+| | mandelbrot 1080p | 27.9 (0.85x) | 63.4 (0.82x) | 74.7 |
 
 The two parts, in milliseconds a frame on mandelbrot 720p:
 
@@ -333,6 +338,7 @@ The two parts, in milliseconds a frame on mandelbrot 720p:
 | 9 | 2.06 | 2.10 | 1.71 | 1.62 | 2.96 | 0.97 |
 | 10 | 1.45 | 1.47 | 1.08 | 1.61 | 2.98 | 0.98 |
 | 11 | 1.46 | 1.45 | 1.06 | 1.45 | 2.04 | 0.84 |
+| 12 | 1.44 | 1.49 | 1.05 | 1.19 | 2.00 | 0.83 |
 
 ### 8. The symbol decoder keeps its value at the top of a 64-bit window
 
@@ -370,3 +376,11 @@ In the decoder, from one run: the part 2.11 to 1.45 ms in wasm simd, 2.15 to 1.4
 A frame of mandelbrot 720p reconstructs 890 transform blocks, 367 000 samples; 184 of the blocks are DC only and take step 5's shortcut. The rest go through `run_lanes`, which called the processes of 7.13.2 with the size as a variable. The DCT of 7.13.2.3 is one process for 4 to 64 points, each stage guarded by the size, and compiled once for all sizes it tested `n` before every group of butterflies, worked out the bit-reversed index of every element of the permutation in a loop as it ran, and fetched each rotation's cosine and sine from the table through four comparisons. `run_lanes` now matches on the kind and the size and calls the same process with the size a constant in each arm, so each is compiled with its stages, permutation and angles decided: the "one function per size" that the list above asked for, got without writing any of them. Nothing in the arithmetic is touched; a test runs every kind and size against the process called with the size hidden from the compiler, eight lanes and one value at a time (a 16-point DCT arm calling the 32-point network, planted, fails it and three other tests; an identity arm of the wrong size fails it alone).
 
 The part, from one run: 1.60 to 1.45 ms in wasm simd, 2.95 to 2.04 in baseline (whose transforms are the scalar ones, a row or a column at a time), 0.95 to 0.84 natively. Mandelbrot 720p 110.0 to 116.2 fps simd, 53.2 to 55.8 baseline, 133.5 to 135.0 natively; the simd module is 118 KB larger (3.80 to 3.92 MB), the baseline one 8 KB.
+
+### 12. The inverse transforms' lane arithmetic in SIMD128 operations
+
+The transforms run eight rows or columns at once on `Lanes`, eight 32-bit values whose arithmetic is written lane by lane for the compiler to turn into vectors. It does that for aarch64. For wasm32 it did it badly: the 2D transform alone, the same source timed natively and in wasm simd (`tools/wasm-perf/itxbench`), took 495 and 859 ns for a full 16x16 block, 1675 and 3268 for 32x32, 4915 and 11 111 for 64x64, twice the native time where the other kernels are within a third. With `simd128` the five operations of `Lane` (the rotation, the clamped butterfly, negation, the two scalings) are now written as SIMD128 operations on the two halves, the same wrapping 32-bit arithmetic: 646, 2125 and 5990 ns. Native code is the lane-by-lane form as before, which is why this has no NEON twin: nothing changed there, and the rows above agree.
+
+`cargo test` does not run on wasm32, so the comparison with the scalar reference that the unit test makes natively is made in the wasm module too: `itxbench` builds the tree's `dsp/itx.rs` into a module that runs every size and type against `inverse_transform_2d_scalar` (14 960 cases) before it times anything, and `gate.sh` runs it. An unsigned shift planted in the SIMD128 rotation fails it in the simd build alone.
+
+The part, from one run: 1.44 to 1.19 ms in wasm simd; mandelbrot 720p 117.5 to 121.8 fps, testsrc2 720p 213 to 225.

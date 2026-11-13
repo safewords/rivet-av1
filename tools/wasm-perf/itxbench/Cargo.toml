@@ -1,0 +1,15 @@
+[package]
+name = "itxbench"
+version = "0.0.0"
+edition = "2024"
+
+# Stands alone: not a member of anything above it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

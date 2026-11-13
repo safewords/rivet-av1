@@ -99,7 +99,9 @@ impl Lane for i32 {
 
 /// Eight independent values, transformed together: written lane by lane
 /// in 32-bit arithmetic, which the compiler turns into vector code (AVX2
-/// where the kernel is compiled for it, NEON on aarch64). 32 bits are
+/// where the kernel is compiled for it, NEON on aarch64; for wasm32 with
+/// `simd128` the same arithmetic is written out in SIMD128 operations,
+/// below). 32 bits are
 /// exact when the values stay in the ranges conformance requires at bit
 /// depths up to 10 (`8 + BitDepth` bits: products of at most 2^17 * 2^13);
 /// [`inverse_transform_2d`] uses it only there.
@@ -114,6 +116,7 @@ impl Lane for i32 {
 )]
 pub(crate) struct Lanes(pub(crate) [i32; 8]);
 
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 impl Lane for Lanes {
     const N: usize = 8;
     #[inline(always)]
@@ -165,6 +168,99 @@ impl Lane for Lanes {
             o[l] = a.0[l].wrapping_mul(c);
         }
         Lanes(o)
+    }
+    #[inline(always)]
+    fn get(&self, l: usize) -> i32 {
+        self.0[l]
+    }
+    #[inline(always)]
+    fn set(&mut self, l: usize, v: i32) {
+        self.0[l] = v;
+    }
+}
+
+/// The two halves of eight lanes as SIMD128 vectors.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn halves(a: &Lanes) -> (core::arch::wasm32::v128, core::arch::wasm32::v128) {
+    use core::arch::wasm32::*;
+    // SAFETY: eight `i32`s are two unaligned 128-bit loads.
+    unsafe {
+        (
+            v128_load(a.0.as_ptr() as *const v128),
+            v128_load(a.0.as_ptr().add(4) as *const v128),
+        )
+    }
+}
+
+/// Eight lanes from their two halves.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn whole(lo: core::arch::wasm32::v128, hi: core::arch::wasm32::v128) -> Lanes {
+    use core::arch::wasm32::*;
+    let mut o = Lanes([0; 8]);
+    // SAFETY: two unaligned 128-bit stores fill the eight `i32`s.
+    unsafe {
+        v128_store(o.0.as_mut_ptr() as *mut v128, lo);
+        v128_store(o.0.as_mut_ptr().add(4) as *mut v128, hi);
+    }
+    o
+}
+
+/// The same lane arithmetic as above (wrapping, 32 bits a lane), written
+/// with SIMD128 operations: the compiler does not turn the lane-by-lane
+/// form into them for wasm32 as it does for aarch64.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl Lane for Lanes {
+    const N: usize = 8;
+    #[inline(always)]
+    fn zero() -> Self {
+        Lanes([0; 8])
+    }
+    #[inline(always)]
+    fn rot(a: Self, ca: i32, b: Self, cb: i32) -> Self {
+        use core::arch::wasm32::*;
+        let (ca, cb, half) = (i32x4_splat(ca), i32x4_splat(cb), i32x4_splat(1 << 11));
+        let ((a0, a1), (b0, b1)) = (halves(&a), halves(&b));
+        let f = |x, y| {
+            i32x4_shr(
+                i32x4_add(i32x4_add(i32x4_mul(x, ca), i32x4_mul(y, cb)), half),
+                12,
+            )
+        };
+        whole(f(a0, b0), f(a1, b1))
+    }
+    #[inline(always)]
+    fn add_sub_clamp(a: Self, b: Self, lo: i32, hi: i32) -> (Self, Self) {
+        use core::arch::wasm32::*;
+        let (lo, hi) = (i32x4_splat(lo), i32x4_splat(hi));
+        let ((a0, a1), (b0, b1)) = (halves(&a), halves(&b));
+        let clamp = |x| i32x4_min(i32x4_max(x, lo), hi);
+        (
+            whole(clamp(i32x4_add(a0, b0)), clamp(i32x4_add(a1, b1))),
+            whole(clamp(i32x4_sub(a0, b0)), clamp(i32x4_sub(a1, b1))),
+        )
+    }
+    #[inline(always)]
+    fn neg(a: Self) -> Self {
+        use core::arch::wasm32::*;
+        let (a0, a1) = halves(&a);
+        whole(i32x4_neg(a0), i32x4_neg(a1))
+    }
+    #[inline(always)]
+    fn scale12(a: Self, c: i32) -> Self {
+        use core::arch::wasm32::*;
+        let (c, half) = (i32x4_splat(c), i32x4_splat(1 << 11));
+        let (a0, a1) = halves(&a);
+        let f = |x| i32x4_shr(i32x4_add(i32x4_mul(x, c), half), 12);
+        whole(f(a0), f(a1))
+    }
+    #[inline(always)]
+    fn mul(a: Self, c: i32) -> Self {
+        use core::arch::wasm32::*;
+        let c = i32x4_splat(c);
+        let (a0, a1) = halves(&a);
+        whole(i32x4_mul(a0, c), i32x4_mul(a1, c))
     }
     #[inline(always)]
     fn get(&self, l: usize) -> i32 {

@@ -53,6 +53,12 @@ For the residual path (steps 8 on):
   vectors, which decode with `CoefficientReader::Checked`, on a copy of
   the tree with one planted difference. They are expected to fail.
 
+- `itxbench/bench.sh [tree] [label] [check]`: the 2D inverse transform
+  alone, natively and in both wasm builds: the comparison with the scalar
+  reference for every size and type (the unit test of `dsp/itx.rs`, run
+  where the target is wasm32, which `cargo test` does not reach), then ns
+  a block. `gate.sh` runs the comparison.
+
 `tried/` holds changes that were written, verified bit-exact and measured
 to gain nothing, so that nobody measures them again without a reason:
 `direct-to-frame.diff` filters a single-reference prediction straight into
