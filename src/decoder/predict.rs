@@ -1240,6 +1240,24 @@ pub(crate) fn block_inter_prediction(
             filt_y = 5;
         }
     }
+    // An unscaled reference (every reference of the frame's own size) has
+    // its own version. x86-64 keeps the general one, whose row and column
+    // filters have AVX2 versions over 32-bit intermediates.
+    #[cfg(not(target_arch = "x86_64"))]
+    if x_step == 1 << SCALE_SUBPEL_BITS && y_step == 1 << SCALE_SUBPEL_BITS {
+        return block_inter_prediction_unscaled(
+            refp,
+            last_x,
+            last_y,
+            x,
+            y,
+            w,
+            h,
+            [filt_y, filt_x],
+            rv,
+            pred,
+        );
+    }
     // The intermediate array: a per-thread buffer, reused.
     thread_local! {
         static SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1265,6 +1283,103 @@ pub(crate) fn block_inter_prediction(
             pred,
             &mut buf[..inter_h * w],
         )
+    })
+}
+
+/// Block inter prediction from a reference of the frame's own size: the
+/// same arithmetic as the general process, with what a filter phase of
+/// zero makes of it taken directly. A phase of zero is the filter `128 *
+/// sample`, so its pass is a shift (`128 * s` is a multiple of `1 <<
+/// round0`, and the intermediate times 128 of `1 << round1`); and with a
+/// vertical phase of zero only the `h` rows that filter reads are computed,
+/// not the seven around them.
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn block_inter_prediction_unscaled(
+    refp: &PlaneBuf,
+    last_x: i32,
+    last_y: i32,
+    x: i64,
+    y: i64,
+    w: usize,
+    h: usize,
+    [filt_y, filt_x]: [usize; 2],
+    rv: RoundingVars,
+    pred: &mut [i32],
+) {
+    let phase_x = ((x >> 6) & SUBPEL_MASK as i64) as usize;
+    let phase_y = (((y & 1023) >> 6) & SUBPEL_MASK as i64) as usize;
+    let fx = &SUBPEL_FILTERS[filt_x][phase_x];
+    let fy = &SUBPEL_FILTERS[filt_y][phase_y];
+    let x0 = (x >> 10) - 3;
+    let y0 = (y >> 10) - 3;
+    let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
+    let mut padded = [0u16; 128 + 8];
+    // Row `r` of the intermediate array reads this row of the reference:
+    // `w + 7` samples from `x0`, the edges repeated.
+    let source = |r: usize, padded: &mut [u16; 128 + 8], out: &mut dyn FnMut(&[u16])| {
+        let yy = clip3(0, last_y, (y0 + r as i64) as i32) as usize;
+        let row = refp.row(yy);
+        if inside_x {
+            out(&row[x0 as usize..x0 as usize + w + 7])
+        } else {
+            for (c, v) in padded[..w + 7].iter_mut().enumerate() {
+                *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
+            }
+            out(&padded[..w + 7])
+        }
+    };
+    let (round0, round1) = (rv.round0, rv.round1);
+    if phase_y == 0 {
+        if phase_x == 0 {
+            let shift = 14 - round0 - round1;
+            for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
+                source(r + 3, &mut padded, &mut |src| {
+                    for (o, &s) in out.iter_mut().zip(&src[3..]) {
+                        *o = (s as i32) << shift;
+                    }
+                });
+            }
+        } else {
+            let add = (1 << round1) >> 1;
+            let mut line = [0i16; 128];
+            for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
+                source(r + 3, &mut padded, &mut |src| {
+                    crate::dsp::mc::filter_row16(src, fx, round0, &mut line[..w]);
+                });
+                for (o, &v) in out.iter_mut().zip(&line[..w]) {
+                    *o = (128 * v as i32 + add) >> round1;
+                }
+            }
+        }
+        return;
+    }
+    // The intermediate array: a per-thread buffer, reused.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<i16>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let inter_h = h + 7;
+    SCRATCH.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < inter_h * w {
+            buf.resize(inter_h * w, 0);
+        }
+        let intermediate = &mut buf[..inter_h * w];
+        for (r, out) in intermediate.chunks_exact_mut(w).enumerate() {
+            source(r, &mut padded, &mut |src| {
+                if phase_x == 0 {
+                    let shift = 7 - round0;
+                    for (o, &s) in out.iter_mut().zip(&src[3..]) {
+                        *o = (s << shift) as i16;
+                    }
+                } else {
+                    crate::dsp::mc::filter_row16(src, fx, round0, out);
+                }
+            });
+        }
+        for (r, out) in pred[..w * h].chunks_exact_mut(w).enumerate() {
+            crate::dsp::mc::filter_col16(&intermediate[r * w..], w, fy, round1, out);
+        }
     })
 }
 
