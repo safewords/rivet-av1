@@ -1,7 +1,8 @@
 //! The 8-tap interpolation filters of inter prediction (7.11.3.4), one
-//! row at a time: scalar, and AVX2 versions chosen at run time (NEON
-//! comes from the compiler: it is part of the aarch64 baseline and these
-//! loops vectorise), bit-exact.
+//! row at a time, and the blends of compound prediction (7.11.3.1): scalar,
+//! and AVX2 versions of the 32-bit filters chosen at run time. The 16-bit
+//! filters and the blends have SIMD128 versions in a wasm32 module built
+//! with `simd128` and NEON versions on aarch64. All bit-exact.
 
 /// The horizontal filter: `out[c] = Round2(sum_t f[t] * src[c + t],
 /// round0)`, `src` holding `out.len() + 7` samples.
@@ -92,23 +93,26 @@ pub(crate) fn filter_col_scalar(
 }
 
 /// The horizontal filter into 16-bit intermediates: `out[c] = Round2(sum_t
-/// f[t] * src[c + t], round0)`, `src` holding `out.len() + 7` samples.
+/// f[t] * src[c + t], round0) - bias`, `src` holding `out.len() + 7`
+/// samples.
 ///
 /// The intermediate of the prediction process fits 16 bits at every bit
 /// depth (a sample of at most `BitDepth` bits times taps whose positive
 /// part sums to at most 184, shifted down by `round0`: under 2^15; see the
 /// test), which halves what the vertical pass reads and lets both passes
-/// multiply 16-bit lanes.
+/// multiply 16-bit lanes. `bias` is zero for an intermediate; a compound
+/// prediction with no vertical phase is this filter's output as it stands,
+/// and takes its bias here (see [`Compound`]).
 #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
-pub(crate) fn filter_row16(src: &[u16], f: &[i32; 8], round0: u32, out: &mut [i16]) {
+pub(crate) fn filter_row16(src: &[u16], f: &[i32; 8], round0: u32, bias: i32, out: &mut [i16]) {
     debug_assert!(src.len() >= out.len() + 7);
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if out.len() >= 8 {
-        filter_row16_simd128(src, f, round0, out);
+        filter_row16_simd128(src, f, round0, bias, out);
         return;
     }
-    filter_row16_scalar(src, f, round0, out)
+    filter_row16_scalar(src, f, round0, bias, out)
 }
 
 /// The vertical filter over eight rows of 16-bit intermediates, `rows`
@@ -126,8 +130,38 @@ pub(crate) fn filter_col16(rows: &[i16], w: usize, f: &[i32; 8], round1: u32, ou
     filter_col16_scalar(rows, w, f, round1, out)
 }
 
-pub(crate) fn filter_row16_scalar(src: &[u16], f: &[i32; 8], round0: u32, out: &mut [i16]) {
-    let add = (1 << round0) >> 1;
+/// The vertical filter of a compound prediction, which stays in 16 bits:
+/// `out[c] = Round2(sum_t f[t] * rows[t][c], round1) - bias` (see
+/// [`Compound`] for why that fits).
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+pub(crate) fn filter_col16_compound(
+    rows: &[i16],
+    w: usize,
+    f: &[i32; 8],
+    round1: u32,
+    bias: i32,
+    out: &mut [i16],
+) {
+    debug_assert!(rows.len() >= 8 * w && out.len() == w);
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if w >= 4 {
+        filter_col16_compound_simd128(rows, w, f, round1, bias, out);
+        return;
+    }
+    filter_col16_compound_scalar(rows, w, f, round1, bias, out)
+}
+
+pub(crate) fn filter_row16_scalar(
+    src: &[u16],
+    f: &[i32; 8],
+    round0: u32,
+    bias: i32,
+    out: &mut [i16],
+) {
+    // `Round2(s, round0) - bias` is `(s + add) >> round0` with the bias
+    // taken off the rounding constant.
+    let add = ((1 << round0) >> 1) - (bias << round0);
     for (o, s) in out.iter_mut().zip(src.windows(8)) {
         let mut acc = add;
         for t in 0..8 {
@@ -155,6 +189,116 @@ pub(crate) fn filter_col16_scalar(
     }
 }
 
+pub(crate) fn filter_col16_compound_scalar(
+    rows: &[i16],
+    w: usize,
+    f: &[i32; 8],
+    round1: u32,
+    bias: i32,
+    out: &mut [i16],
+) {
+    let add = ((1 << round1) >> 1) - (bias << round1);
+    let rows = &rows[..8 * w];
+    for (c, o) in out.iter_mut().enumerate() {
+        let mut acc = add;
+        for t in 0..8 {
+            acc += f[t] * rows[t * w + c] as i32;
+        }
+        *o = (acc >> round1) as i16;
+    }
+}
+
+/// How the two predictions of a compound block are kept in 16 bits, and
+/// what blending them needs.
+///
+/// A compound prediction is `Round2(.., InterRound1)` with `InterRound1 =
+/// 7`: the sample scaled by `1 << InterPostRound` (16 for 8 and 10 bits, 4
+/// for 12), with the filters' overshoot on both sides. At 8 bits that is
+/// within -2800..9300. At 10 and 12 bits it reaches -20600..37000, which
+/// 16 bits do not hold, so `bias` (8192) is taken off as the value is
+/// stored: -28800..28800 (the tests compute the bounds). A blend's weights
+/// sum to a constant, so the bias comes back as one term in its rounding
+/// constant.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Compound {
+    /// What every stored prediction is short of its value.
+    pub(crate) bias: i32,
+    /// `InterPostRound`.
+    pub(crate) post: u32,
+    /// The largest sample, `(1 << BitDepth) - 1`.
+    pub(crate) maxv: i32,
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+impl Compound {
+    /// For a frame of `bit_depth` bits and a compound block's
+    /// `InterPostRound`.
+    pub(crate) fn new(bit_depth: u32, post: u32) -> Self {
+        Compound {
+            bias: if bit_depth == 8 { 0 } else { 8192 },
+            post,
+            maxv: (1 << bit_depth) - 1,
+        }
+    }
+}
+
+/// The average of two predictions that are both whole samples of their
+/// references: `(a + b + 1) >> 1`. (Each is the sample times `1 <<
+/// InterPostRound`, and `Round2(a + b, 1 + InterPostRound)` of those is
+/// this; it needs no clip.)
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+pub(crate) fn avg_samples(a: &[u16], b: &[u16], dst: &mut [u16]) {
+    debug_assert!(a.len() >= dst.len() && b.len() >= dst.len());
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if dst.len() >= 8 {
+        avg_samples_simd128(a, b, dst);
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if dst.len() >= 8 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { avg_samples_neon(a, b, dst) };
+        return;
+    }
+    avg_samples_scalar(a, b, dst)
+}
+
+/// The average of a compound block's two predictions (7.11.3.1), as
+/// samples: `Clip1(Round2(a + b, 1 + InterPostRound))`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+pub(crate) fn compound_avg(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+    debug_assert!(a.len() >= dst.len() && b.len() >= dst.len());
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if dst.len() >= 8 {
+        compound_avg_simd128(a, b, c, dst);
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if dst.len() >= 8 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { compound_avg_neon(a, b, c, dst) };
+        return;
+    }
+    compound_avg_scalar(a, b, c, dst)
+}
+
+pub(crate) fn avg_samples_scalar(a: &[u16], b: &[u16], dst: &mut [u16]) {
+    for ((o, &a), &b) in dst.iter_mut().zip(a).zip(b) {
+        *o = ((a as u32 + b as u32 + 1) >> 1) as u16;
+    }
+}
+
+pub(crate) fn compound_avg_scalar(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+    let shift = 1 + c.post;
+    let add = (1 << c.post) + 2 * c.bias;
+    for ((o, &a), &b) in dst.iter_mut().zip(a).zip(b) {
+        *o = ((a as i32 + b as i32 + add) >> shift).clamp(0, c.maxv) as u16;
+    }
+}
+
 /// The taps as four pairs of 16-bit lanes, for `i32x4_dot_i16x8`, and
 /// which pairs are not both zero.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -174,12 +318,12 @@ fn tap_pairs(f: &[i32; 8]) -> ([std::arch::wasm32::v128; 4], [bool; 4]) {
 /// Eight outputs at a time: taps two by two, the samples under each pair
 /// interleaved so that one 16-bit dot product gives four sums.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn filter_row16_simd128(src: &[u16], f: &[i32; 8], round0: u32, out: &mut [i16]) {
+fn filter_row16_simd128(src: &[u16], f: &[i32; 8], round0: u32, bias: i32, out: &mut [i16]) {
     use std::arch::wasm32::*;
     let w = out.len();
     assert!(w >= 8 && src.len() >= w + 7);
     let (coef, used) = tap_pairs(f);
-    let add = i32x4_splat((1 << round0) >> 1);
+    let add = i32x4_splat(((1 << round0) >> 1) - (bias << round0));
     let sp = src.as_ptr();
     let op = out.as_mut_ptr();
     let mut c = 0;
@@ -211,16 +355,25 @@ fn filter_row16_simd128(src: &[u16], f: &[i32; 8], round0: u32, out: &mut [i16])
     }
 }
 
-/// Eight (or, for a block four wide, four) outputs at a time: rows two by
-/// two, interleaved as in the horizontal filter.
+/// The vertical filter's sums, `(acc + add) >> round1` in 32-bit lanes,
+/// eight (or, for a block four wide, four) columns at a time: rows two by
+/// two, interleaved as in the horizontal filter. `store(c0, lo, hi)` gets
+/// columns `c0..c0 + 4` in `lo` and, when `w >= 8`, the next four in `hi`.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn filter_col16_simd128(rows: &[i16], w: usize, f: &[i32; 8], round1: u32, out: &mut [i32]) {
+#[inline(always)]
+fn filter_col16_sums_simd128(
+    rows: &[i16],
+    w: usize,
+    f: &[i32; 8],
+    add: i32,
+    round1: u32,
+    mut store: impl FnMut(usize, std::arch::wasm32::v128, std::arch::wasm32::v128),
+) {
     use std::arch::wasm32::*;
-    assert!(w >= 4 && rows.len() >= 8 * w && out.len() == w);
+    assert!(w >= 4 && rows.len() >= 8 * w);
     let (coef, used) = tap_pairs(f);
-    let add = i32x4_splat((1 << round1) >> 1);
+    let add = i32x4_splat(add);
     let rp = rows.as_ptr();
-    let op = out.as_mut_ptr();
     if w < 8 {
         // Four columns: the low halves alone. (Blocks are 4, 8, 16, ...
         // wide; anything else below 8 goes four at a time from each end.)
@@ -242,8 +395,8 @@ fn filter_col16_simd128(rows: &[i16], w: usize, f: &[i32; 8], round1: u32, out: 
                 let l = i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(a, b);
                 lo = i32x4_add(lo, i32x4_dot_i16x8(l, coef[k]));
             }
-            // SAFETY: c0 + 4 <= w = out.len().
-            unsafe { v128_store(op.add(c0) as *mut v128, i32x4_shr(lo, round1)) };
+            let lo = i32x4_shr(lo, round1);
+            store(c0, lo, lo);
             c = c0 + 4;
         }
         return;
@@ -268,12 +421,148 @@ fn filter_col16_simd128(rows: &[i16], w: usize, f: &[i32; 8], round1: u32, out: 
             lo = i32x4_add(lo, i32x4_dot_i16x8(l, coef[k]));
             hi = i32x4_add(hi, i32x4_dot_i16x8(h, coef[k]));
         }
-        // SAFETY: c0 + 8 <= w = out.len().
+        store(c0, i32x4_shr(lo, round1), i32x4_shr(hi, round1));
+        c = c0 + 8;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn filter_col16_simd128(rows: &[i16], w: usize, f: &[i32; 8], round1: u32, out: &mut [i32]) {
+    use std::arch::wasm32::*;
+    assert!(out.len() == w);
+    let op = out.as_mut_ptr();
+    filter_col16_sums_simd128(rows, w, f, (1 << round1) >> 1, round1, |c0, lo, hi| {
+        // SAFETY: c0 + 4 <= w = out.len(), and c0 + 8 <= w when w >= 8.
         unsafe {
-            v128_store(op.add(c0) as *mut v128, i32x4_shr(lo, round1));
-            v128_store(op.add(c0 + 4) as *mut v128, i32x4_shr(hi, round1));
+            v128_store(op.add(c0) as *mut v128, lo);
+            if w >= 8 {
+                v128_store(op.add(c0 + 4) as *mut v128, hi);
+            }
+        }
+    });
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn filter_col16_compound_simd128(
+    rows: &[i16],
+    w: usize,
+    f: &[i32; 8],
+    round1: u32,
+    bias: i32,
+    out: &mut [i16],
+) {
+    use std::arch::wasm32::*;
+    assert!(out.len() == w);
+    let op = out.as_mut_ptr();
+    let add = ((1 << round1) >> 1) - (bias << round1);
+    filter_col16_sums_simd128(rows, w, f, add, round1, |c0, lo, hi| {
+        // The sums fit 16 bits (see `Compound`): the narrowing changes
+        // nothing.
+        let v = i16x8_narrow_i32x4(lo, hi);
+        // SAFETY: c0 + 4 <= w = out.len(), and c0 + 8 <= w when w >= 8.
+        unsafe {
+            if w >= 8 {
+                v128_store(op.add(c0) as *mut v128, v);
+            } else {
+                v128_store64_lane::<0>(v, op.add(c0) as *mut u64);
+            }
+        }
+    });
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn avg_samples_simd128(a: &[u16], b: &[u16], dst: &mut [u16]) {
+    use std::arch::wasm32::*;
+    let w = dst.len();
+    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
+    let mut c = 0;
+    while c < w {
+        let c0 = c.min(w - 8);
+        // SAFETY: c0 + 8 <= w, which none of the three slices is shorter
+        // than.
+        unsafe {
+            let va = v128_load(ap.add(c0) as *const v128);
+            let vb = v128_load(bp.add(c0) as *const v128);
+            v128_store(dp.add(c0) as *mut v128, u16x8_avgr(va, vb));
         }
         c = c0 + 8;
+    }
+}
+
+/// Eight samples at a time, in 16-bit lanes with saturation doing the
+/// clip: the sum saturates only where the result is past the largest
+/// sample anyway, `max` with `-add` and a saturating `+ add` leave 0..32767,
+/// and that shifted down is at most the largest sample at 10 and 12 bits
+/// (at 8 it is clipped).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn compound_avg_simd128(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+    use std::arch::wasm32::*;
+    let w = dst.len();
+    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    let shift = 1 + c.post;
+    let neg_add = i16x8_splat(-((1 << c.post) + 2 * c.bias) as i16);
+    let maxv = i16x8_splat(c.maxv as i16);
+    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
+    let mut col = 0;
+    while col < w {
+        let c0 = col.min(w - 8);
+        // SAFETY: c0 + 8 <= w, which neither `a` nor `b` is shorter than.
+        let (va, vb) = unsafe {
+            (
+                v128_load(ap.add(c0) as *const v128),
+                v128_load(bp.add(c0) as *const v128),
+            )
+        };
+        let s = i16x8_max(i16x8_add_sat(va, vb), neg_add);
+        let v = i16x8_min(i16x8_shr(i16x8_sub_sat(s, neg_add), shift), maxv);
+        // SAFETY: c0 + 8 <= w = dst.len().
+        unsafe { v128_store(dp.add(c0) as *mut v128, v) };
+        col = c0 + 8;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn avg_samples_neon(a: &[u16], b: &[u16], dst: &mut [u16]) {
+    use std::arch::aarch64::*;
+    let w = dst.len();
+    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
+    let mut c = 0;
+    while c < w {
+        let c0 = c.min(w - 8);
+        // SAFETY: c0 + 8 <= w, which none of the three slices is shorter
+        // than.
+        unsafe {
+            let v = vrhaddq_u16(vld1q_u16(ap.add(c0)), vld1q_u16(bp.add(c0)));
+            vst1q_u16(dp.add(c0), v);
+        }
+        c = c0 + 8;
+    }
+}
+
+/// The SIMD128 version's arithmetic: 16-bit lanes, saturation as the clip.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn compound_avg_neon(a: &[i16], b: &[i16], c: Compound, dst: &mut [u16]) {
+    use std::arch::aarch64::*;
+    let w = dst.len();
+    assert!(w >= 8 && a.len() >= w && b.len() >= w);
+    let shift = vdupq_n_s16(-(1 + c.post as i16));
+    let neg_add = vdupq_n_s16(-((1 << c.post) + 2 * c.bias) as i16);
+    let maxv = vdupq_n_s16(c.maxv as i16);
+    let (ap, bp, dp) = (a.as_ptr(), b.as_ptr(), dst.as_mut_ptr());
+    let mut col = 0;
+    while col < w {
+        let c0 = col.min(w - 8);
+        // SAFETY: c0 + 8 <= w, which neither `a` nor `b` is shorter than.
+        let (va, vb) = unsafe { (vld1q_s16(ap.add(c0)), vld1q_s16(bp.add(c0))) };
+        let s = vmaxq_s16(vqaddq_s16(va, vb), neg_add);
+        let v = vminq_s16(vshlq_s16(vqsubq_s16(s, neg_add), shift), maxv);
+        // SAFETY: c0 + 8 <= w = dst.len().
+        unsafe { vst1q_u16(dp.add(c0), vreinterpretq_u16_s16(v)) };
+        col = c0 + 8;
     }
 }
 
@@ -405,8 +694,8 @@ mod tests {
                         // vertical pass over them the same as over 32-bit ones.
                         let mut a16 = vec![0i16; w];
                         let mut b16 = vec![0i16; w];
-                        filter_row16_scalar(&src, f, round0, &mut a16);
-                        filter_row16(&src, f, round0, &mut b16);
+                        filter_row16_scalar(&src, f, round0, 0, &mut a16);
+                        filter_row16(&src, f, round0, 0, &mut b16);
                         assert_eq!(a16, b16, "row16 {bd}-bit w {w} {f:?}");
                         let wide: Vec<i32> = a16.iter().map(|&v| v as i32).collect();
                         filter_row_scalar(&src, f, round0, &mut a);
@@ -422,7 +711,118 @@ mod tests {
                             filter_col16(&inter16[w..], w, f, round1, &mut b);
                             assert_eq!(a, b, "col16 {bd}-bit w {w} {f:?}");
                         }
+                        // A compound prediction's filters: the same values
+                        // less the bias, in 16 bits.
+                        let bias = Compound::new(bd, 0).bias;
+                        let less_bias =
+                            |v: &[i32]| v.iter().map(|&v| (v - bias) as i16).collect::<Vec<_>>();
+                        filter_row16(&src, f, round0, bias, &mut b16);
+                        assert_eq!(less_bias(&wide), b16, "row16 bias {bd}-bit w {w} {f:?}");
+                        // (The intermediates here are the horizontal
+                        // filter's range at this depth.)
+                        let inter16: Vec<i16> = (0..(w * 8))
+                            .map(|_| (rnd(31_000) as i32 - 7_400) as i16)
+                            .map(|v| if bd == 8 { v / 4 } else { v })
+                            .collect();
+                        let inter32: Vec<i32> = inter16.iter().map(|&v| v as i32).collect();
+                        filter_col_scalar(&inter32, 0, w, f, 7, &mut a);
+                        filter_col16_compound_scalar(&inter16, w, f, 7, bias, &mut a16);
+                        assert_eq!(less_bias(&a), a16, "col16 compound scalar {bd}-bit w {w}");
+                        filter_col16_compound(&inter16, w, f, 7, bias, &mut b16);
+                        assert_eq!(a16, b16, "col16 compound {bd}-bit w {w} {f:?}");
                     }
+                }
+            }
+        }
+    }
+
+    /// The range of a compound prediction at each bit depth, as `(min,
+    /// max)`: the extremes of the horizontal filter (all-maximum samples
+    /// under the positive taps or under the negative ones) put through the
+    /// vertical one the same way.
+    fn compound_range(bd: u32) -> (i32, i32) {
+        let round0 = if bd == 12 { 5 } else { 3 };
+        let max = (1i32 << bd) - 1;
+        let (mut lo, mut hi) = (0, 0);
+        for fx in SUBPEL_FILTERS.iter().flatten() {
+            let pos: i32 = fx.iter().filter(|&&t| t > 0).sum();
+            let neg: i32 = fx.iter().filter(|&&t| t < 0).sum();
+            let h_max = (max * pos + ((1 << round0) >> 1)) >> round0;
+            let h_min = (max * neg + ((1 << round0) >> 1)) >> round0;
+            for fy in SUBPEL_FILTERS.iter().flatten() {
+                let pos: i32 = fy.iter().filter(|&&t| t > 0).sum();
+                let neg: i32 = fy.iter().filter(|&&t| t < 0).sum();
+                hi = hi.max((h_max * pos + h_min * neg + 64) >> 7);
+                lo = lo.min((h_min * pos + h_max * neg + 64) >> 7);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// A compound prediction less its bias fits 16 bits at every depth.
+    #[test]
+    fn compound_predictions_fit_sixteen_bits() {
+        for bd in [8u32, 10, 12] {
+            let (lo, hi) = compound_range(bd);
+            let bias = Compound::new(bd, 0).bias;
+            assert!(lo - bias >= i16::MIN as i32, "{bd}-bit: {lo}");
+            assert!(hi - bias <= i16::MAX as i32, "{bd}-bit: {hi}");
+        }
+    }
+
+    /// The blends agree with the specification's arithmetic on 32-bit
+    /// predictions, over the whole range a prediction can take, its
+    /// extremes together included, at every depth and width.
+    #[test]
+    fn blends_match_the_specification() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for bd in [8u32, 10, 12] {
+            let post = if bd == 12 { 2 } else { 4 };
+            let c = Compound::new(bd, post);
+            let (lo, hi) = compound_range(bd);
+            for w in [4usize, 8, 12, 16, 32, 64, 128] {
+                for round in 0..40 {
+                    // Predictions as the specification has them, and as
+                    // they are stored.
+                    let mut pick = || match (round, rnd(8)) {
+                        (0, _) | (_, 0) => hi,
+                        (1, _) | (_, 1) => lo,
+                        _ => lo + rnd((hi - lo + 1) as u64) as i32,
+                    };
+                    let p0: Vec<i32> = (0..w).map(|_| pick()).collect();
+                    let p1: Vec<i32> = (0..w).map(|_| pick()).collect();
+                    let a: Vec<i16> = p0.iter().map(|&v| (v - c.bias) as i16).collect();
+                    let b: Vec<i16> = p1.iter().map(|&v| (v - c.bias) as i16).collect();
+                    let spec = |f: &dyn Fn(usize) -> i32| -> Vec<u16> {
+                        (0..w).map(|j| f(j).clamp(0, c.maxv) as u16).collect()
+                    };
+                    let mut out = vec![0u16; w];
+                    let mut out_scalar = vec![0u16; w];
+
+                    let want = spec(&|j| (p0[j] + p1[j] + (1 << post)) >> (1 + post));
+                    compound_avg_scalar(&a, &b, c, &mut out_scalar);
+                    compound_avg(&a, &b, c, &mut out);
+                    assert_eq!(want, out_scalar, "avg scalar {bd}-bit w {w}");
+                    assert_eq!(want, out, "avg {bd}-bit w {w}");
+
+                    // Whole samples: the predictions are the samples times
+                    // `1 << post`.
+                    let s0: Vec<u16> = (0..w).map(|_| rnd(1 << bd) as u16).collect();
+                    let s1: Vec<u16> = (0..w).map(|_| rnd(1 << bd) as u16).collect();
+                    let want = spec(&|j| {
+                        let (p0, p1) = ((s0[j] as i32) << post, (s1[j] as i32) << post);
+                        (p0 + p1 + (1 << post)) >> (1 + post)
+                    });
+                    avg_samples_scalar(&s0, &s1, &mut out_scalar);
+                    avg_samples(&s0, &s1, &mut out);
+                    assert_eq!(want, out_scalar, "whole samples scalar {bd}-bit w {w}");
+                    assert_eq!(want, out, "whole samples {bd}-bit w {w}");
                 }
             }
         }
