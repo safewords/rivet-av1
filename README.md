@@ -58,6 +58,8 @@ layers that is the last (highest) one, as the specification's output
 process recommends, and `Decoder::decode_all` returns every one.
 `Decoder::decode_annexb` takes an Annex B temporal unit
 (`annexb_temporal_units` splits a stream into them).
+`Decoder::set_apply_grain(false)` leaves film grain synthesis out: frames
+come out as decoded, for a player that cannot afford the grain.
 
 Not there yet:
 

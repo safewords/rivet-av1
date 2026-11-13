@@ -284,6 +284,8 @@ pub struct Decoder {
     hdr: HdrMetadata,
     /// Worker threads for tiles and the post-filters (1: none).
     threads: usize,
+    /// Whether output frames get the film grain their stream asks for.
+    apply_grain: bool,
 }
 
 impl Default for Decoder {
@@ -307,6 +309,7 @@ impl Decoder {
             max_pixels: 1 << 26,
             hdr: HdrMetadata::default(),
             threads: 1,
+            apply_grain: true,
         }
     }
 
@@ -326,6 +329,16 @@ impl Decoder {
         } else {
             n
         };
+    }
+
+    /// Whether the output process synthesises film grain (7.18.3) on the
+    /// frames of a stream that carries grain parameters. On by default, as
+    /// the specification has it; off, a frame comes out as it was decoded
+    /// (the reference frames, which never carry grain, are the same either
+    /// way), which costs less and is what a player without the budget for
+    /// grain shows.
+    pub fn set_apply_grain(&mut self, apply: bool) {
+        self.apply_grain = apply;
     }
 
     /// Makes the decoder report a tile whose arithmetic-coded data does not
@@ -862,7 +875,7 @@ impl Decoder {
         frame.render_height = data.render_height;
         frame.color = color_info(&seq.color);
         frame.hdr = self.hdr;
-        let grain_on = seq.film_grain_params_present && grain.apply_grain;
+        let grain_on = self.apply_grain && seq.film_grain_params_present && grain.apply_grain;
         let mut planes: Vec<Vec<u16>> = Vec::new();
         if grain_on {
             for (p, pl) in data.frame.planes.iter().enumerate() {
