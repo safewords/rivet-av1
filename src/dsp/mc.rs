@@ -440,6 +440,64 @@ pub(crate) fn cols16_scalar<T: Lane16, const N: usize>(
     }
 }
 
+/// `Warped_Filters` in 16 bits, as [`dot8`] takes a filter.
+pub(crate) static WARPED_FILTERS16: [[i16; 8]; 193] = {
+    let mut filters = [[0i16; 8]; 193];
+    let mut i = 0;
+    while i < 193 {
+        let mut t = 0;
+        while t < 8 {
+            filters[i][t] = crate::tables::WARPED_FILTERS[i][t] as i16;
+            t += 1;
+        }
+        i += 1;
+    }
+    filters
+};
+
+/// The sum of the first eight of `v`, each times its tap: one output of
+/// either pass of the block warp process (7.11.3.5), where the filter
+/// changes from one output to the next and a filter over a row at a time
+/// has nothing to share.
+#[inline(always)]
+pub(crate) fn dot8<T: Lane16>(v: &[T], taps: &[i16; 8]) -> i32 {
+    let v = &v[..8];
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use std::arch::wasm32::*;
+        const { assert!(size_of::<T>() == 2) };
+        // SAFETY: eight 16-bit values each.
+        let (a, f) = unsafe {
+            (
+                v128_load(v.as_ptr() as *const v128),
+                v128_load(taps.as_ptr() as *const v128),
+            )
+        };
+        let d = i32x4_dot_i16x8(a, f);
+        let d = i32x4_add(d, i32x4_shuffle::<2, 3, 0, 1>(d, d));
+        let d = i32x4_add(d, i32x4_shuffle::<1, 0, 3, 2>(d, d));
+        #[allow(clippy::needless_return)]
+        return i32x4_extract_lane::<0>(d);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        #[allow(clippy::needless_return)]
+        return unsafe { dot8_neon(v, taps) };
+    }
+    #[allow(unreachable_code)]
+    dot8_scalar(v, taps)
+}
+
+/// The reference version of [`dot8`].
+pub(crate) fn dot8_scalar<T: Lane16>(v: &[T], taps: &[i16; 8]) -> i32 {
+    let mut sum = 0;
+    for (&v, &t) in v[..8].iter().zip(taps) {
+        sum += v.value() * t as i32;
+    }
+    sum
+}
+
 /// How the two predictions of a compound block are kept in 16 bits, and
 /// what blending them needs.
 ///
@@ -1034,6 +1092,24 @@ unsafe fn rows16_neon<const N: usize>(
             }
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn dot8_neon<T: Lane16>(v: &[T], taps: &[i16; 8]) -> i32 {
+    use std::arch::aarch64::*;
+    const { assert!(size_of::<T>() == 2) };
+    assert!(v.len() >= 8);
+    // SAFETY: eight 16-bit values each.
+    let (a, f) = unsafe {
+        (
+            vld1q_s16(v.as_ptr() as *const i16),
+            vld1q_s16(taps.as_ptr()),
+        )
+    };
+    let lo = vmull_s16(vget_low_s16(a), vget_low_s16(f));
+    vaddvq_s32(vmlal_high_s16(lo, a, f))
 }
 
 /// [`filter_cols16`] a strip of eight columns at a time (four for a block
@@ -1788,6 +1864,65 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The warp's intermediates fit 16 bits at every depth: the extremes
+    /// are all-maximum samples under a filter's positive taps or under its
+    /// negative ones.
+    #[test]
+    fn warp_intermediates_fit_sixteen_bits() {
+        use crate::tables::WARPED_FILTERS;
+        for (bd, round0) in [(8u32, 3u32), (10, 3), (12, 5)] {
+            let max = (1i32 << bd) - 1;
+            for f in WARPED_FILTERS.iter() {
+                let pos: i32 = f.iter().filter(|&&t| t > 0).sum();
+                let neg: i32 = f.iter().filter(|&&t| t < 0).sum();
+                let add = (1 << round0) >> 1;
+                assert!((max * pos + add) >> round0 <= i16::MAX as i32, "{bd} {f:?}");
+                assert!((max * neg + add) >> round0 >= i16::MIN as i32, "{bd} {f:?}");
+            }
+        }
+    }
+
+    /// One output of the warp filters, every version, against the 32-bit
+    /// sum over the specification's table: every filter, over samples of
+    /// each depth and over intermediates of the whole 16-bit range.
+    #[test]
+    fn warp_dot_matches_the_specification() {
+        use crate::tables::WARPED_FILTERS;
+        let mut seed = 0xbb67_ae85_84ca_a73bu64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for (i, f) in WARPED_FILTERS.iter().enumerate() {
+            assert_eq!(f.map(|t| t as i16), WARPED_FILTERS16[i]);
+            for round in 0..40 {
+                let bd = [8u64, 10, 12][round % 3];
+                let samples: [u16; 9] = std::array::from_fn(|_| match rnd(6) {
+                    0 => (1 << bd) - 1,
+                    1 => 0,
+                    _ => rnd(1 << bd) as u16,
+                });
+                let want: i32 = (0..8).map(|t| f[t] * samples[t] as i32).sum();
+                assert_eq!(
+                    dot8(&samples, &WARPED_FILTERS16[i]),
+                    want,
+                    "{f:?} {samples:?}"
+                );
+                assert_eq!(dot8_scalar(&samples, &WARPED_FILTERS16[i]), want);
+                let inter: [i16; 9] = std::array::from_fn(|_| match rnd(6) {
+                    0 => i16::MAX,
+                    1 => i16::MIN,
+                    _ => rnd(1 << 16) as u16 as i16,
+                });
+                let want: i32 = (0..8).map(|t| f[t] * inter[t] as i32).sum();
+                assert_eq!(dot8(&inter, &WARPED_FILTERS16[i]), want, "{f:?} {inter:?}");
+                assert_eq!(dot8_scalar(&inter, &WARPED_FILTERS16[i]), want);
             }
         }
     }

@@ -320,6 +320,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 52.6 (0.81x) | 106 (0.72x) | 127 (1.53x) |
 |  | mandelbrot 720p 10-bit | 64.1 (0.87x) | 141 (1.74x) | 173 (1.77x) |
 |  | mandelbrot 1080p | 25.8 (0.80x) | 57.0 (0.75x) | 68.7 (1.67x) |
+| 14. a warp output as one 16-bit dot product | fixture 320x180 | 754 (0.65x) | 1101 (0.66x) | 1308 (0.87x) |
+|  | testsrc2 720p | 126 (0.73x) | 191 (0.65x) | 226 (0.97x) |
+|  | mandelbrot 720p | 52.0 (0.81x) | 106 (0.74x) | 127 (1.52x) |
+|  | mandelbrot 720p 10-bit | 63.3 (0.86x) | 143 (1.79x) | 171 (1.76x) |
+|  | mandelbrot 1080p | 25.7 (0.81x) | 56.5 (0.75x) | 67.6 (1.66x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -352,5 +357,9 @@ The two averages (of two whole-sample references, and of a compound block's two 
 ### 13. A block's taps looked up, its buffers borrowed once
 
 Two costs a block paid before any sample. Its two filters' kept taps were found by scanning the eight taps of each (`Taps::new`, 2 to 4 % of the prediction's time in V8's profile): they come from a table built with the crate (`Taps::of`). And the per-thread buffers (the intermediate array, the 16-bit predictions, the copy of a reference's edge) were three thread-locals, each taken out of its cell and put back around every use: five pairs of those for a compound block, one for every 8x8 of a warped block. They are one structure, borrowed once for a block and handed down. Inter prediction on mandelbrot 720p natively, nine turns: 0.87 to 0.83 ms a frame (0.85 with the table alone). In wasm, where a thread-local is a static, V8's profile does not resolve it (0.94 and 0.97 over seven turns, within its noise here).
+
+### 14. A warp output as one 16-bit dot product
+
+Each output of the warp's two passes has its own filter, so there is no row of outputs to share a tap between; what an output is, though, is eight 16-bit values times eight taps. `dot8` is that as one 16-bit dot product (`i32x4_dot_i16x8` and two adds across the lanes in SIMD128; `vmull_s16`, `vmlal_high_s16` and `vaddvq_s32` in NEON), over `Warped_Filters` narrowed to 16 bits when the crate is built. The intermediates fit 16 bits (tested over the table) and are kept a column at a time, since the vertical pass reads down a column. Inter prediction on mandelbrot 720p: native 0.83 to 0.79 ms a frame over nine turns, simd 0.97 to 0.89 over seven. The scalar version is what x86-64 takes.
 
 `tools/wasm-perf/` has the scripts every number here came from.

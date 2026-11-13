@@ -1285,6 +1285,7 @@ impl TileDecoder<'_, '_> {
         rv: RoundingVars,
         edge: &mut Vec<u16>,
     ) {
+        use crate::dsp::mc;
         let r = self.f.refs[ref_idx]
             .as_ref()
             .expect("reference checked at header");
@@ -1317,21 +1318,19 @@ impl TileDecoder<'_, '_> {
             last_y as i32,
             edge,
         );
-        let mut intermediate = [[0i32; 8]; 15];
-        for (r, out) in intermediate.iter_mut().enumerate() {
+        // The intermediates, a column at a time (the vertical filter reads
+        // down a column) and in 16 bits, which they fit.
+        let mut columns = [[0i16; 16]; 8];
+        for r in 0..15 {
             let row = &src[r * stride..][..15];
             let i1 = r as i64 - 7;
-            for (c, o) in out.iter_mut().enumerate() {
+            for (c, column) in columns.iter_mut().enumerate() {
                 let i2 = c as i64 - 4;
                 let sx = sx4 + alpha as i64 * i2 + beta as i64 * i1;
                 let offs = (round2_64(sx, WARPEDDIFF_PREC_BITS as u32)
                     + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
-                let f = &WARPED_FILTERS[offs];
-                let mut s = 0i32;
-                for (t, &v) in row[c..c + 8].iter().enumerate() {
-                    s += f[t] * v as i32;
-                }
-                *o = round2(s, rv.round0);
+                let s = mc::dot8(&row[c..], &mc::WARPED_FILTERS16[offs]);
+                column[r] = round2(s, rv.round0) as i16;
             }
         }
         let lim_i = 4.min(h as i64 - i8 as i64 * 8 - 4);
@@ -1341,11 +1340,8 @@ impl TileDecoder<'_, '_> {
                 let sy = sy4 + gamma as i64 * i2 + delta as i64 * i1;
                 let offs = (round2_64(sy, WARPEDDIFF_PREC_BITS as u32)
                     + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
-                let mut s = 0i32;
-                for i3 in 0..8 {
-                    s += WARPED_FILTERS[offs][i3]
-                        * intermediate[(i1 + i3 as i64 + 4) as usize][(i2 + 4) as usize];
-                }
+                let column = &columns[(i2 + 4) as usize];
+                let s = mc::dot8(&column[(i1 + 4) as usize..], &mc::WARPED_FILTERS16[offs]);
                 let py = (i8 as i64 * 8 + i1 + 4) as usize;
                 let px = (j8 as i64 * 8 + i2 + 4) as usize;
                 pred[py * w + px] = round2(s, rv.round1);
