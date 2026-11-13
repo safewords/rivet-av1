@@ -40,6 +40,11 @@ Each row is the state after the step: fps, and its ratio to rav1d's.
 | | mandelbrot 720p | 32.3 (0.50x) | 68.2 (0.47x) | 78.5 |
 | | mandelbrot 720p 10-bit | 38.4 (0.49x) | 81.4 (1.00x) | 85.6 |
 | | mandelbrot 1080p | 16.4 (0.50x) | 34.9 (0.46x) | 42.8 |
+| 2. the symbol decoder reads its bits from a 24-bit window, not one at a time | fixture 320x180 | 670 (0.54x) | 979 (0.54x) | 1143 |
+|  | testsrc2 720p | 70.4 (0.37x) | 130 (0.40x) | 145 |
+|  | mandelbrot 720p | 34.4 (0.50x) | 72.5 (0.47x) | 84.2 |
+|  | mandelbrot 720p 10-bit | 41.5 (0.52x) | 91.4 (1.06x) | 108 |
+|  | mandelbrot 1080p | 17.5 (0.52x) | 37.5 (0.47x) | 44.5 |
 
 ### 1. Inter prediction from an unscaled reference
 
@@ -54,3 +59,7 @@ of zero is a shift, not a filter; and with a vertical phase of zero only the
 `h` rows that are read need computing. After: 11 % of the decode. x86-64
 keeps the general path, whose filters have AVX2 versions that could not be
 measured where this was written.
+
+### 2. The symbol decoder reads its bits from a 24-bit window, not one at a time
+
+The symbol decoder followed the specification bit for bit: every renormalisation read its bits one at a time, each with its own byte index and bounds check, and the CDF update tested for the symbol at every entry. Bits now come out of the three bytes at the read position in one step (zeros past the end, as before), a renormalisation that shifts nothing returns at once, and the update runs as two loops, below the symbol and from it. Worth 1 to 3 %: `read_symbol` is 12 % of the simd decode and most of that is the search and the update, not the bits.

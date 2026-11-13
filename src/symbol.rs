@@ -35,19 +35,23 @@ impl<'a> SymbolDecoder<'a> {
         d
     }
 
+    /// The next `n` bits (at most 15), zeros past the end of the data.
+    #[inline]
     fn read_bits(&mut self, n: u32) -> u32 {
-        let mut x = 0u32;
-        for _ in 0..n {
-            let byte = self.pos >> 3;
-            let b = if byte < self.data.len() {
-                (self.data[byte] >> (7 - (self.pos & 7))) & 1
-            } else {
-                0
-            };
-            x = (x << 1) | b as u32;
-            self.pos += 1;
-        }
-        x
+        debug_assert!(n <= 15);
+        let byte = self.pos >> 3;
+        let off = (self.pos & 7) as u32;
+        // The 24 bits from the start of the current byte hold them all
+        // (7 + 15 bits at most).
+        let window = match self.data.get(byte..byte + 3) {
+            Some(b) => (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32,
+            None => {
+                let at = |i: usize| self.data.get(byte + i).copied().unwrap_or(0) as u32;
+                at(0) << 16 | at(1) << 8 | at(2)
+            }
+        };
+        self.pos += n as usize;
+        (window >> (24 - off - n)) & ((1 << n) - 1)
     }
 
     /// `read_symbol( cdf )`: `cdf` holds N + 1 entries, the last being the
@@ -76,8 +80,13 @@ impl<'a> SymbolDecoder<'a> {
         symbol
     }
 
+    #[inline]
     fn renormalize(&mut self) {
         let bits = 15 - floor_log2(self.range);
+        if bits == 0 {
+            // Nothing to shift in: the range still has its top bit.
+            return;
+        }
         self.range <<= bits;
         let num_bits = (bits as i64).min(self.max_bits.max(0)) as u32;
         let new_data = self.read_bits(num_bits);
@@ -161,17 +170,13 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: usize) {
     let n = cdf.len() - 1;
     let cnt = cdf[n];
     let rate = 3 + (cnt > 15) as u32 + (cnt > 31) as u32 + floor_log2(n as u32).min(2);
-    let mut tmp = 0u32;
-    for (i, c) in cdf.iter_mut().enumerate().take(n - 1) {
-        if i == symbol {
-            tmp = 1 << 15;
-        }
-        let v = *c as u32;
-        if tmp < v {
-            *c -= ((v - tmp) >> rate) as u16;
-        } else {
-            *c += ((tmp - v) >> rate) as u16;
-        }
+    // Below the symbol the target is 0, from it on 1 << 15.
+    let (below, from) = cdf[..n - 1].split_at_mut(symbol.min(n - 1));
+    for c in below {
+        *c -= *c >> rate;
+    }
+    for c in from {
+        *c += (((1u32 << 15) - *c as u32) >> rate) as u16;
     }
     if cnt < 32 {
         cdf[n] += 1;
