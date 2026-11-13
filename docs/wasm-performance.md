@@ -305,6 +305,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 51.2 (0.80x) | 102 (0.72x) | 131 (1.51x) |
 |  | mandelbrot 720p 10-bit | 64.7 (0.86x) | 145 (1.77x) | 176 (1.73x) |
 |  | mandelbrot 1080p | 25.9 (0.80x) | 56.6 (0.75x) | 68.9 (1.66x) |
+| 11. the block warp reads a window of the reference | fixture 320x180 | 747 (0.64x) | 1082 (0.64x) | 1288 (0.86x) |
+|  | testsrc2 720p | 126 (0.72x) | 191 (0.64x) | 215 (0.94x) |
+|  | mandelbrot 720p | 51.7 (0.80x) | 104 (0.72x) | 123 (1.50x) |
+|  | mandelbrot 720p 10-bit | 63.8 (0.86x) | 139 (1.72x) | 164 (1.70x) |
+|  | mandelbrot 1080p | 24.8 (0.79x) | 54.8 (0.74x) | 66.3 (1.62x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -325,5 +330,9 @@ Inter prediction on mandelbrot 720p: simd 1.47 to 1.23 ms a frame, baseline 4.12
 ### 10. Two whole-sample references averaged from windows of them
 
 Two thirds of the samples that mandelbrot 720p predicts from two references have whole-sample motion vectors into both, and are the rounded mean of the two blocks (`090bf70`). Those blocks still fetched every row of both references through `source_row`, with its clamp and its test for the columns. They take their two windows once (`source_window`, as the filters do), and `source_row` is gone. Inter prediction on mandelbrot 720p: simd 1.23 to 1.18 ms a frame, native 1.05 to 0.95; baseline within noise (3.55 to 3.51).
+
+### 11. The block warp reads a window of the reference
+
+The block warp process (7.11.3.5) read every sample under every tap of its horizontal filters through a clamp of both coordinates and a bounds-checked `get`: 960 of them for an 8x8 block. It takes the 15 rows of 15 samples it reads as a window, once (`source_window`, on every architecture: the reference itself unless the window reaches past an edge), and its filters run over slices of that. Inter prediction on mandelbrot 720p, where 1 % of the predicted samples are warped: simd 1.13 to 1.10 ms a frame, baseline 3.52 to 3.46, native 0.99 to 0.92.
 
 `tools/wasm-perf/` has the scripts every number here came from.

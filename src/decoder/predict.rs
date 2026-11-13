@@ -1300,21 +1300,38 @@ impl TileDecoder<'_, '_> {
         let sx4 = x4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
         let iy4 = y4 >> WARPEDMODEL_PREC_BITS;
         let sy4 = y4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
+        // The 15 rows and 15 columns the horizontal filters read, their
+        // coordinates clamped to the reference: from the reference itself
+        // unless they reach past its edges.
+        let mut edges = EDGES.take();
+        let (src, stride) = source_window(
+            refp,
+            ix4 - 7,
+            iy4 - 7,
+            15,
+            15,
+            last_x as i32,
+            last_y as i32,
+            &mut edges[0],
+        );
         let mut intermediate = [[0i32; 8]; 15];
-        for i1 in -7i64..8 {
-            for i2 in -4i64..4 {
+        for (r, out) in intermediate.iter_mut().enumerate() {
+            let row = &src[r * stride..][..15];
+            let i1 = r as i64 - 7;
+            for (c, o) in out.iter_mut().enumerate() {
+                let i2 = c as i64 - 4;
                 let sx = sx4 + alpha as i64 * i2 + beta as i64 * i1;
                 let offs = (round2_64(sx, WARPEDDIFF_PREC_BITS as u32)
                     + WARPEDPIXEL_PREC_SHIFTS as i64) as usize;
+                let f = &WARPED_FILTERS[offs];
                 let mut s = 0i32;
-                let yy = (iy4 + i1).clamp(0, last_y) as usize;
-                for i3 in 0..8 {
-                    let xx = (ix4 + i2 - 3 + i3).clamp(0, last_x) as usize;
-                    s += WARPED_FILTERS[offs][i3 as usize] * refp.get(xx, yy) as i32;
+                for (t, &v) in row[c..c + 8].iter().enumerate() {
+                    s += f[t] * v as i32;
                 }
-                intermediate[(i1 + 7) as usize][(i2 + 4) as usize] = round2(s, rv.round0);
+                *o = round2(s, rv.round0);
             }
         }
+        EDGES.set(edges);
         let lim_i = 4.min(h as i64 - i8 as i64 * 8 - 4);
         let lim_j = 4.min(w as i64 - j8 as i64 * 8 - 4);
         for i1 in -4i64..lim_i {
@@ -1503,7 +1520,6 @@ pub(crate) fn block_inter_prediction(
 /// cols`, the rows and columns outside it clamped to it (its edges
 /// repeated), and the stride they have: the plane itself where it holds
 /// them all, else a copy gathered into `edge`.
-#[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn source_window<'a>(
     refp: &'a PlaneBuf,
@@ -1578,14 +1594,16 @@ fn block_inter_prediction_unscaled(
 }
 
 // Per-thread buffers, reused from block to block (they only grow, and
-// every use writes what it reads): the intermediate array of an unscaled
-// prediction, the samples of a block's references where it reaches past
-// their edges, and a block's predictions in 16 bits.
+// every use writes what it reads): the samples of a block's references
+// where it reaches past their edges, the intermediate array of an unscaled
+// prediction, and a block's predictions in 16 bits.
+thread_local! {
+    static EDGES: std::cell::RefCell<[Vec<u16>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+}
 #[cfg(not(target_arch = "x86_64"))]
 thread_local! {
     static INTERMEDIATE: std::cell::RefCell<Vec<i16>> = const { std::cell::RefCell::new(Vec::new()) };
-    static EDGES: std::cell::RefCell<[Vec<u16>; 2]> =
-        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
     static PREDS16: std::cell::RefCell<[Vec<i16>; 2]> =
         const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
