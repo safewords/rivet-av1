@@ -507,7 +507,12 @@ pub(crate) fn cdef_filter_block(
             sec_off: [[off(d_lo, 0), off(d_hi, 0)], [off(d_lo, 1), off(d_hi, 1)]],
         }
     };
-    if x0 >= B && y0 >= B && x0 + w + B <= xlim.min(src.w) && y0 + h + B <= ylim.min(src.h) {
+    if crate::dsp::cdef::plane_filter_pays()
+        && x0 >= B
+        && y0 >= B
+        && x0 + w + B <= xlim.min(src.w)
+        && y0 + h + B <= ylim.min(src.h)
+    {
         // Every sample the filter reads is available: filter the plane
         // where it lies.
         let pos = y0 * src.stride + x0;

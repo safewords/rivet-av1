@@ -124,7 +124,114 @@ pub(crate) fn filter_plane(
         filter_plane_simd128(src, stride, pos, w, h, t, res);
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if w == 8 || w == 4 {
+        // SAFETY: NEON is part of the aarch64 baseline; the bounds are
+        // asserted above.
+        unsafe { filter_plane_neon(src, stride, pos, w, h, t, res) };
+        return;
+    }
     filter_plane_scalar(src, stride, pos, w, h, t, res)
+}
+
+/// Whether [`filter_plane`] is the faster way to filter a block that has
+/// its whole border: everywhere but on x86-64 with AVX2, whose version of
+/// the window filter ([`filter`]) has no counterpart here yet.
+#[inline]
+pub(crate) fn plane_filter_pays() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if crate::dsp::avx2() {
+        return false;
+    }
+    true
+}
+
+/// [`filter_plane`] with NEON: a row of the block at a time in 16-bit
+/// lanes, as the SIMD128 version.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_plane_neon(
+    src: &[u16],
+    stride: usize,
+    pos: usize,
+    w: usize,
+    h: usize,
+    t: &Taps,
+    res: &mut [u16; 64],
+) {
+    use std::arch::aarch64::*;
+    assert!((w == 8 || w == 4) && h <= 8 && pos >= 2 * stride + 2);
+    assert!(pos + (h + 1) * stride + w + 2 <= src.len());
+    let sp = src.as_ptr();
+    let wide = w == 8;
+    // SAFETY (every call): `i` is a sample of the block or one of its taps,
+    // at most two rows and two columns away, and `w` samples are read: all
+    // inside `src` by the assertions above.
+    let load = |i: isize| unsafe {
+        if wide {
+            vreinterpretq_s16_u16(vld1q_u16(sp.offset(i)))
+        } else {
+            let half = vld1_u16(sp.offset(i));
+            vreinterpretq_s16_u16(vcombine_u16(half, half))
+        }
+    };
+    let zero = vdupq_n_s16(0);
+    let pri_str = vdupq_n_s16(t.pri_str as i16);
+    let sec_str = vdupq_n_s16(t.sec_str as i16);
+    let pri_shift = vdupq_n_s16(-(t.pri_adj as i16));
+    let sec_shift = vdupq_n_s16(-(t.sec_adj as i16));
+    for i in 0..h {
+        let base = (pos + i * stride) as isize;
+        let x = load(base);
+        let mut sum = zero;
+        let mut mx = x;
+        let mut mn = x;
+        let mut tap = |off: isize, strv: int16x8_t, shift: int16x8_t, k: i32| {
+            let p = load(base + off);
+            let d = vsubq_s16(p, x);
+            let ad = vabsq_s16(d);
+            let shifted = vreinterpretq_s16_u16(vshlq_u16(vreinterpretq_u16_s16(ad), shift));
+            let lim = vmaxq_s16(vsubq_s16(strv, shifted), zero);
+            let mag = vminq_s16(ad, lim);
+            // Negate where the difference is negative.
+            let neg = vshrq_n_s16::<15>(d);
+            let c = vsubq_s16(veorq_s16(mag, neg), neg);
+            sum = vmlaq_n_s16(sum, c, k as i16);
+            mx = vmaxq_s16(mx, p);
+            mn = vminq_s16(mn, p);
+        };
+        if t.pri_str != 0 {
+            for k in 0..2 {
+                for sign in [-1isize, 1] {
+                    tap(sign * t.pri_off[k], pri_str, pri_shift, t.pri_taps[k]);
+                }
+            }
+        }
+        if t.sec_str != 0 {
+            for k in 0..2 {
+                for sign in [-1isize, 1] {
+                    for so in t.sec_off[k] {
+                        tap(sign * so, sec_str, sec_shift, t.sec_taps[k]);
+                    }
+                }
+            }
+        }
+        // x + ((8 + sum - (sum < 0)) >> 4): the sign is -1 where it is set.
+        let r = vshrq_n_s16::<4>(vaddq_s16(
+            vaddq_s16(sum, vdupq_n_s16(8)),
+            vshrq_n_s16::<15>(sum),
+        ));
+        let v = vreinterpretq_u16_s16(vmaxq_s16(vminq_s16(vaddq_s16(x, r), mx), mn));
+        // SAFETY: row i of the result, `w` samples, i < h <= 8.
+        unsafe {
+            let o = res.as_mut_ptr().add(i * w);
+            if wide {
+                vst1q_u16(o, v);
+            } else {
+                vst1_u16(o, vget_low_u16(v));
+            }
+        }
+    }
 }
 
 /// The reference version of [`filter_plane`].

@@ -50,6 +50,11 @@ Each row is the state after the step: fps, and its ratio to rav1d's.
 |  | mandelbrot 720p | 43.5 (0.65x) | 80.0 (0.53x) | 70.5 |
 |  | mandelbrot 720p 10-bit | 51.5 (0.67x) | 98.2 (1.21x) | 82.6 |
 |  | mandelbrot 1080p | 21.8 (0.68x) | 39.8 (0.54x) | 32.9 |
+| 4. the in-plane CDEF filter with NEON; AVX2 hosts keep the window filter | fixture 320x180 | 694 (0.59x) | 972 (0.56x) | 1196 |
+|  | testsrc2 720p | 102 (0.56x) | 148 (0.49x) | 176 |
+|  | mandelbrot 720p | 43.9 (0.65x) | 70.0 (0.46x) | 100 |
+|  | mandelbrot 720p 10-bit | 42.2 (0.61x) | 81.6 (1.17x) | 127 |
+|  | mandelbrot 1080p | 20.2 (0.78x) | 38.7 (0.60x) | 52.4 |
 
 ### 1. Inter prediction from an unscaled reference
 
@@ -72,3 +77,7 @@ The symbol decoder followed the specification bit for bit: every renormalisation
 ### 3. CDEF without the window: zero strengths skipped, interior blocks filtered in the plane, 16-bit SIMD128 lanes
 
 CDEF was 21 % of the simd decode and 40 % of the baseline one. Every 8x8 block was copied into a 12x12 window of 32-bit values with the unavailable samples marked, then filtered with all twelve taps, whatever its strengths. Now: a block whose primary and secondary strengths are both zero is not touched (the filter is the identity there), and its direction is not searched unless a primary strength needs it; a block whose border of 2 lies inside the frame, which is nearly all of them, is filtered from the plane itself; a strength of zero costs no taps (with one set of taps alone the clip to the taps' range is a no-op, so leaving the unused taps out of it changes nothing: tested against the window filter); and the SIMD128 version takes a row of eight samples in 16-bit lanes instead of four in 32-bit ones. After: 3.6 % of the simd decode, 21 % of the baseline one (where it is the scalar arithmetic itself).
+
+### 4. The in-plane CDEF filter with NEON; AVX2 hosts keep the window filter
+
+The step before sent interior blocks to the in-plane filter on every target, and on aarch64 that was the scalar version in place of the window filter's NEON one: native decoding got slower (mandelbrot 720p 83.5 to 70.5 fps). The in-plane filter now has a NEON version, 16-bit lanes like the SIMD128 one (tested against the window filter natively), and a host with AVX2 keeps the window filter, whose AVX2 version has no in-plane counterpart yet and could not be measured here. Native is now ahead of where it was before the CDEF work. The wasm numbers are unchanged, as they should be.
