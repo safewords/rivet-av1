@@ -32,6 +32,12 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
   them alike.
 - `bench-threads.mjs`, `thread-shim.mjs`: a threads build in Node, each
   wasm thread a `worker_threads` Worker.
+- `iter-threads.sh <label>`: the simd-threads variant of wasm-av1 on the
+  working tree (atomics, shared memory, std rebuilt), beside what
+  `iter.sh` builds.
+- `threads-table.sh <rounds> "<label>=<pkgdir> ..." "1 2 4 8" <ivf...>`:
+  the threads builds at each thread count, taking turns (a process for
+  every cell of every round): the tables of the "Threads" section.
 - `bench-native.py <runs> <threads> <decode_ivf>...`: the same natively,
   with wasm-av1's `decode_ivf` example.
 - `prof.sh <label> <variant> <clip>`: V8's CPU profile by function.
@@ -64,9 +70,11 @@ with `ffmpeg -c:v libdav1d ... -f rawvideo - | md5`.
   stderr, and take the patch off again; it is not for the branch).
 - `gate.sh <label>`: this crate's gates (fmt, clippy on the host, wasm32
   with and without simd128, and x86-64 with a locally built std under
-  Rosetta; doc; the tests), wasm-av1's tests on the tree, bit-exactness of
-  15 streams through the wasm builds against rav1d, and the clips natively
-  on 1 and 4 threads.
+  Rosetta; doc; the tests, with the AOM vectors on 1, 4 and 8 threads and
+  the threaded and fuzz tests in debug, the fuzz tests on 4 threads too),
+  wasm-av1's tests on the tree, bit-exactness of 15 streams through the
+  wasm builds against rav1d, and the clips natively and in the
+  simd-threads build on 1, 2, 4 and 8 threads.
 
 For the residual path (steps 8 on):
 

@@ -143,7 +143,17 @@ impl TileDecoder<'_, '_> {
         let mut left = [0i32; EDGE_LEN];
         {
             let cur = &self.f.cur.planes[plane];
-            let px = |xx: usize, yy: usize| cur.get(xx, yy) as i32;
+            // A row above the superblock row, when the plane holds that
+            // row alone, is the copy this walk was handed.
+            let top = self.band_top[plane];
+            let line = &self.above_line[plane];
+            let px = |xx: usize, yy: usize| {
+                if yy < top {
+                    line[xx] as i32
+                } else {
+                    cur.get(xx, yy) as i32
+                }
+            };
             for i in 0..w + h {
                 above[EDGE_OFF + i] = if !have_above && have_left {
                     px(x - 1, y)
@@ -2094,7 +2104,7 @@ mod tests {
             // The samples past the frame's last column and row are not the
             // frame's: over the largest value, so that reading one shows.
             let mut plane = PlaneBuf::new(96, 80, 0);
-            for (i, v) in plane.data.iter_mut().enumerate() {
+            for (i, v) in plane.data.as_mut_slice().iter_mut().enumerate() {
                 let inside = i % 96 <= last_x as usize && i / 96 <= last_y as usize;
                 *v = match (inside, rnd(8)) {
                     (false, _) => 0x7000,

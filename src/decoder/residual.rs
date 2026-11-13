@@ -34,6 +34,7 @@
 use crate::Result;
 use crate::consts::*;
 use crate::decoder::CoefficientReader;
+use crate::decoder::record::Pass;
 use crate::decoder::tile::{TileDecoder, find_tx_size};
 use crate::dsp::itx::inverse_transform_2d;
 use crate::tables::*;
@@ -131,7 +132,7 @@ impl TileDecoder<'_, '_> {
         if start_x >= max_x || start_y >= max_y {
             return Ok(());
         }
-        if !self.b.is_inter {
+        if !self.b.is_inter && self.pass != Pass::Parse {
             if (plane == 0 && self.b.palette_size_y > 0)
                 || (plane != 0 && self.b.palette_size_uv > 0)
             {
@@ -184,26 +185,52 @@ impl TileDecoder<'_, '_> {
             }
         }
         if !self.b.skip {
-            let (eob, dequantised) = self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
-            if eob > 0 {
-                if self.sd.encoding() {
-                    self.reconstruct(plane, start_x, start_y, tx_sz);
-                } else {
-                    self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob, dequantised);
+            match self.pass {
+                Pass::Both => {
+                    let (eob, dequantised) =
+                        self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
+                    if eob > 0 {
+                        if self.sd.encoding() {
+                            self.reconstruct(plane, start_x, start_y, tx_sz);
+                        } else {
+                            self.reconstruct_decode(
+                                plane,
+                                start_x,
+                                start_y,
+                                tx_sz,
+                                eob,
+                                dequantised,
+                            );
+                        }
+                    }
+                }
+                Pass::Parse => {
+                    let (eob, dequantised) =
+                        self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
+                    self.record_tx(tx_sz, eob, dequantised);
+                }
+                Pass::Recon => {
+                    let (eob, dequantised) = self.replay_tx(tx_sz);
+                    if eob > 0 {
+                        self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob, dequantised);
+                    }
                 }
             }
         }
+        // The transform sizes are mode info, the parsing walk's to write;
+        // `BlockDecoded` is asked by intra prediction alone.
         let cols = self.f.ms;
+        let (sizes, decoded) = (self.pass != Pass::Recon, self.pass != Pass::Parse);
         for i in 0..step_y {
             for j in 0..step_x {
                 let rr = (row >> sub_y) + i;
                 let cc = (col >> sub_x) + j;
-                if rr < self.f.mi_rows + 32 && cc < cols {
+                if sizes && rr < self.f.mi_rows + 32 && cc < cols {
                     self.f.lf_tx_sizes[plane][rr * cols + cc] = tx_sz as u8;
                 }
                 let by = (sub_block_mi_row >> sub_y) + i;
                 let bx = (sub_block_mi_col >> sub_x) + j;
-                if by < 33 && bx < 33 {
+                if decoded && by < 33 && bx < 33 {
                     self.block_decoded[plane][by + 1][bx + 1] = true;
                 }
             }

@@ -5,11 +5,16 @@
 use std::sync::Arc;
 
 use crate::cdf::CdfContext;
+use crate::decoder::shared::Shared;
 
 /// One plane of samples, 16 bits each whatever the bit depth.
+///
+/// `data` is the whole plane, or (while the rows of a frame are worked on
+/// by several threads) the rows of it lent to one of them: either way a
+/// sample's index is `y * stride + x`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PlaneBuf {
-    pub(crate) data: Vec<u16>,
+    pub(crate) data: Shared<u16>,
     pub(crate) stride: usize,
     /// Allocated width and height.
     pub(crate) w: usize,
@@ -19,7 +24,7 @@ pub(crate) struct PlaneBuf {
 impl PlaneBuf {
     pub(crate) fn new(w: usize, h: usize, fill: u16) -> Self {
         PlaneBuf {
-            data: vec![fill; w * h],
+            data: vec![fill; w * h].into(),
             stride: w,
             w,
             h,

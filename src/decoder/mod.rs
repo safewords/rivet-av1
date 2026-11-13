@@ -9,9 +9,12 @@
 
 pub(crate) mod grain;
 pub(crate) mod mvpred;
+pub(crate) mod pipeline;
 pub(crate) mod postfilter;
 pub(crate) mod predict;
+pub(crate) mod record;
 pub(crate) mod residual;
+pub(crate) mod shared;
 pub(crate) mod state;
 pub(crate) mod tile;
 
@@ -25,6 +28,7 @@ use crate::header::{FrameHeader, RefHeaderState, RefState, get_relative_dist};
 use crate::obu::{Metadata, SequenceHeader, split_obus};
 use crate::tables::*;
 use crate::{Error, Result};
+use shared::Shared;
 use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
 use tile::TileDecoder;
 
@@ -54,7 +58,7 @@ pub(crate) struct FrameCtx {
     /// which blocks overhanging the frame write into as the specification's
     /// unbounded arrays allow (and later reads may see).
     pub(crate) ms: usize,
-    pub(crate) mi: Vec<Mi>,
+    pub(crate) mi: Shared<Mi>,
     pub(crate) tx_types: Vec<u8>,
     pub(crate) lf_tx_sizes: [Vec<u8>; 3],
     pub(crate) palette_colors: [Vec<[u16; 8]>; 2],
@@ -96,7 +100,7 @@ impl FrameCtx {
             mi_rows: self.mi_rows,
             mi_cols: self.mi_cols,
             ms: self.ms,
-            mi: vec![Mi::default(); n],
+            mi: vec![Mi::default(); n].into(),
             tx_types: vec![0; n],
             lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
             palette_colors: [
@@ -300,7 +304,7 @@ pub struct Decoder {
     max_pixels: u64,
     /// The HDR metadata OBUs seen so far in this coded video sequence.
     hdr: HdrMetadata,
-    /// Worker threads for tiles and the post-filters (1: none).
+    /// Threads for rows, tiles and the post-filters (1: the caller's).
     threads: usize,
     /// Whether output frames get the film grain their stream asks for.
     apply_grain: bool,
@@ -346,9 +350,12 @@ impl Decoder {
         self.max_pixels = max;
     }
 
-    /// Decodes with up to `n` threads: the tiles of a frame in parallel
-    /// (when it has several) and the post-filters by rows. 1, the default,
-    /// decodes on the caller's thread alone; 0 means one per core.
+    /// Decodes with up to `n` threads: a frame of one tile has its
+    /// superblock rows reconstructed behind the parsing of the tile, a
+    /// frame of several its tiles in parallel, and the post-filters run by
+    /// rows (see `docs/threading.md`). The frames are the same whatever
+    /// `n`. 1, the default, decodes on the caller's thread alone; 0 means
+    /// one per core.
     pub fn set_threads(&mut self, n: usize) {
         self.threads = if n == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -636,7 +643,7 @@ impl Decoder {
             mi_rows,
             mi_cols,
             ms,
-            mi: vec![Mi::default(); n],
+            mi: vec![Mi::default(); n].into(),
             tx_types: vec![0; n],
             lf_tx_sizes: [vec![0; n], vec![0; n], vec![0; n]],
             // Palettes need screen content tools.
@@ -730,24 +737,34 @@ impl Decoder {
             };
             Ok((ok, saved))
         };
-        let results: Vec<(usize, TileResult)> = if threads > 1 {
-            let nums: Vec<usize> = tile_data.iter().map(|t| t.0).collect();
-            tiles_in_parallel(f, &nums, threads, |shard, i| {
-                let (tile_num, d) = tile_data[i];
-                (tile_num, decode_one(shard, tile_num, d))
-            })
-        } else {
-            let mut out = Vec::new();
-            for &(tile_num, d) in &tile_data {
-                let r = decode_one(f, tile_num, d);
-                let stop = r.is_err();
-                out.push((tile_num, r));
-                if stop {
-                    break;
+        let results: Vec<(usize, TileResult)> =
+            if self.threads > 1 && num_tiles == 1 && pipeline::applies(f) {
+                // One tile: its rows are reconstructed behind its parsing.
+                let (tile_num, d) = tile_data[0];
+                let r = pipeline::decode_tile(f, d, self.threads, coeff_reader).map(|(ok, cdf)| {
+                    let keep = !f.hdr.disable_frame_end_update_cdf
+                        && tile_num == ti.context_update_tile_id;
+                    (ok, keep.then_some(cdf))
+                });
+                vec![(tile_num, r)]
+            } else if threads > 1 {
+                let nums: Vec<usize> = tile_data.iter().map(|t| t.0).collect();
+                tiles_in_parallel(f, &nums, threads, |shard, i| {
+                    let (tile_num, d) = tile_data[i];
+                    (tile_num, decode_one(shard, tile_num, d))
+                })
+            } else {
+                let mut out = Vec::new();
+                for &(tile_num, d) in &tile_data {
+                    let r = decode_one(f, tile_num, d);
+                    let stop = r.is_err();
+                    out.push((tile_num, r));
+                    if stop {
+                        break;
+                    }
                 }
-            }
-            out
-        };
+                out
+            };
         for (tile_num, r) in results {
             let (ok, saved) = r?;
             if !ok {
