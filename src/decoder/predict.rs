@@ -911,20 +911,35 @@ impl TileDecoder<'_, '_> {
         if whole(&from[0]) && whole(&from[1]) {
             // Both predictions are their references' samples, scaled: the
             // block is the rounded mean of the two.
-            let mut padded = [[0u16; 128 + 8]; 2];
-            let [pad0, pad1] = &mut padded;
-            let rows = |&(ref_idx, last_x, last_y, sx, sy): &(usize, i32, i32, i64, i64)| {
-                let x0 = (sx >> 10) - 3;
-                let inside_x = x0 >= 0 && x0 + w as i64 + 7 <= last_x as i64 + 1;
-                (plane_of(ref_idx), sy >> 10, x0, inside_x, last_x, last_y)
-            };
-            let (a, b) = (rows(&from[0]), rows(&from[1]));
+            let mut edges = EDGES.take();
+            let [edge0, edge1] = &mut edges;
+            let (ref0, last_x0, last_y0, sx0, sy0) = from[0];
+            let (ref1, last_x1, last_y1, sx1, sy1) = from[1];
+            let (a, a_stride) = source_window(
+                plane_of(ref0),
+                sx0 >> 10,
+                sy0 >> 10,
+                w,
+                h,
+                last_x0,
+                last_y0,
+                edge0,
+            );
+            let (b, b_stride) = source_window(
+                plane_of(ref1),
+                sx1 >> 10,
+                sy1 >> 10,
+                w,
+                h,
+                last_x1,
+                last_y1,
+                edge1,
+            );
             for i in 0..h {
-                let ra = source_row(a.0, a.1 + i as i64, a.2, w, a.3, a.4, a.5, pad0);
-                let rb = source_row(b.0, b.1 + i as i64, b.2, w, b.3, b.4, b.5, pad1);
                 let dst = &mut cur.data[(y + i) * stride + x..][..w];
-                mc::avg_samples(&ra[3..3 + w], &rb[3..3 + w], dst);
+                mc::avg_samples(&a[i * a_stride..][..w], &b[i * b_stride..][..w], dst);
             }
+            EDGES.set(edges);
             return true;
         }
         let c = mc::Compound::new(f.bit_depth, rv.post_round as u32);
@@ -1484,33 +1499,6 @@ pub(crate) fn block_inter_prediction(
     })
 }
 
-/// `w + 7` samples of row `yy` of a reference from column `x0`, the row
-/// and the columns clamped to the reference (its edges repeated): the row
-/// itself when it holds them all, else gathered into `padded`.
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn source_row<'a>(
-    refp: &'a PlaneBuf,
-    yy: i64,
-    x0: i64,
-    w: usize,
-    inside_x: bool,
-    last_x: i32,
-    last_y: i32,
-    padded: &'a mut [u16; 128 + 8],
-) -> &'a [u16] {
-    let row = refp.row(clip3(0, last_y, yy as i32) as usize);
-    if inside_x {
-        &row[x0 as usize..x0 as usize + w + 7]
-    } else {
-        for (c, v) in padded[..w + 7].iter_mut().enumerate() {
-            *v = row[clip3(0, last_x, (x0 + c as i64) as i32) as usize];
-        }
-        &padded[..w + 7]
-    }
-}
-
 /// The samples of a reference at rows `y0..y0 + rows` and columns `x0..x0 +
 /// cols`, the rows and columns outside it clamped to it (its edges
 /// repeated), and the stride they have: the plane itself where it holds
@@ -1591,12 +1579,13 @@ fn block_inter_prediction_unscaled(
 
 // Per-thread buffers, reused from block to block (they only grow, and
 // every use writes what it reads): the intermediate array of an unscaled
-// prediction, the reference's samples for a block that reaches past its
-// edges, and a block's predictions in 16 bits.
+// prediction, the samples of a block's references where it reaches past
+// their edges, and a block's predictions in 16 bits.
 #[cfg(not(target_arch = "x86_64"))]
 thread_local! {
     static INTERMEDIATE: std::cell::RefCell<Vec<i16>> = const { std::cell::RefCell::new(Vec::new()) };
-    static EDGE: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    static EDGES: std::cell::RefCell<[Vec<u16>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
     static PREDS16: std::cell::RefCell<[Vec<i16>; 2]> =
         const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
@@ -1655,10 +1644,11 @@ fn block_inter_prediction16(
     let (bx, by) = (x >> 10, y >> 10);
     let (left, cols) = (bx - 3 + fx.first as i64, w + fx.len - 1);
     let (top, rows) = (by - 3 + fy.first as i64, h + fy.len - 1);
-    let mut edge = EDGE.take();
+    let mut edges = EDGES.take();
+    let edge = &mut edges[0];
     match (phase_x != 0, phase_y != 0) {
         (false, false) => {
-            let (src, stride) = source_window(refp, bx, by, w, h, last_x, last_y, &mut edge);
+            let (src, stride) = source_window(refp, bx, by, w, h, last_x, last_y, edge);
             let shift = 14 - round0 - round1;
             for (r, out) in pred.chunks_exact_mut(w).enumerate() {
                 for (o, &s) in out.iter_mut().zip(&src[r * stride..][..w]) {
@@ -1667,7 +1657,7 @@ fn block_inter_prediction16(
             }
         }
         (true, false) => {
-            let (src, stride) = source_window(refp, left, by, cols, h, last_x, last_y, &mut edge);
+            let (src, stride) = source_window(refp, left, by, cols, h, last_x, last_y, edge);
             mc::filter_rows16(src, stride, w, h, &fx, round0, bias, eight_bit, pred);
             let down = round1 - 7;
             if down != 0 {
@@ -1678,7 +1668,7 @@ fn block_inter_prediction16(
             }
         }
         (false, true) => {
-            let (src, stride) = source_window(refp, bx, top, w, rows, last_x, last_y, &mut edge);
+            let (src, stride) = source_window(refp, bx, top, w, rows, last_x, last_y, edge);
             let shift = round1 - (7 - round0);
             if eight_bit && bias == 0 {
                 mc::taps8(src, stride, stride, w, h, fy.taps(), shift, pred);
@@ -1688,8 +1678,7 @@ fn block_inter_prediction16(
             }
         }
         (true, true) => {
-            let (src, stride) =
-                source_window(refp, left, top, cols, rows, last_x, last_y, &mut edge);
+            let (src, stride) = source_window(refp, left, top, cols, rows, last_x, last_y, edge);
             let mut buf = INTERMEDIATE.take();
             if buf.len() < rows * w {
                 buf.resize(rows * w, 0);
@@ -1711,7 +1700,7 @@ fn block_inter_prediction16(
             INTERMEDIATE.set(buf);
         }
     }
-    EDGE.set(edge);
+    EDGES.set(edges);
 }
 
 #[allow(clippy::too_many_arguments)]

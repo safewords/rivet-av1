@@ -300,6 +300,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 50.4 (0.79x) | 101 (0.71x) | 122 (1.46x) |
 |  | mandelbrot 720p 10-bit | 63.8 (0.85x) | 138 (1.70x) | 161 (1.66x) |
 |  | mandelbrot 1080p | 25.3 (0.79x) | 54.9 (0.74x) | 65.9 (1.60x) |
+| 10. two whole-sample references averaged from windows of them | fixture 320x180 | 762 (0.64x) | 1104 (0.64x) | 1306 (0.86x) |
+|  | testsrc2 720p | 129 (0.72x) | 198 (0.64x) | 226 (0.96x) |
+|  | mandelbrot 720p | 51.2 (0.80x) | 102 (0.72x) | 131 (1.51x) |
+|  | mandelbrot 720p 10-bit | 64.7 (0.86x) | 145 (1.77x) | 176 (1.73x) |
+|  | mandelbrot 1080p | 25.9 (0.80x) | 56.6 (0.75x) | 68.9 (1.66x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -316,5 +321,9 @@ The vertical filter was also a call per row. For each row of the block the SIMD1
 Two things came with it. A block with a vertical phase and no horizontal one used to copy the reference's samples, shifted up, into the intermediate array and filter that. The intermediate is the sample shifted up by `7 - InterRound0`, so the vertical filter now runs on the reference's samples themselves with that much less of a shift (at 8 bits it is the horizontal filter's 16-bit sum, its taps a stride apart). And a single prediction comes out of the same function as a compound one, in 16 bits, which it fits (`Round2` by 11, or 9 at 12 bits, where a compound prediction is rounded by 7), and is widened for the general path's 32-bit blends.
 
 Inter prediction on mandelbrot 720p: simd 1.47 to 1.23 ms a frame, baseline 4.12 to 3.49, native 1.62 to 1.05.
+
+### 10. Two whole-sample references averaged from windows of them
+
+Two thirds of the samples that mandelbrot 720p predicts from two references have whole-sample motion vectors into both, and are the rounded mean of the two blocks (`090bf70`). Those blocks still fetched every row of both references through `source_row`, with its clamp and its test for the columns. They take their two windows once (`source_window`, as the filters do), and `source_row` is gone. Inter prediction on mandelbrot 720p: simd 1.23 to 1.18 ms a frame, native 1.05 to 0.95; baseline within noise (3.55 to 3.51).
 
 `tools/wasm-perf/` has the scripts every number here came from.
