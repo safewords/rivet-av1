@@ -301,6 +301,7 @@ runs with the builds taking turns.
 | 8. edge decisions | 1.45 | 2.22 | 1.09 |
 | 9. in the plane, eight 16-bit lanes (SIMD128, NEON) | 0.34 | 2.22 | 0.29 |
 | 10. the baseline build a sample at a time in the plane | 0.33 | 0.83 | (as step 9) |
+| 11. the walk scans the transform sizes | 0.27 | 0.77 | 0.22 |
 
 The state after each step, fps and the ratio to rav1d's (median of 7, load
 average about 10):
@@ -341,4 +342,8 @@ The kernels are written once, as a macro over two dozen lane operations, and exp
 ### 10. The wasm baseline build filters a sample at a time, in the plane
 
 A module without `simd128` has no vector lanes, so the lane filter was the worst of both there: every filter the edge's size allows, computed for all four lanes in scalar 32-bit arithmetic, inside the same gather and scatter. `filter_unit` is the one-sample process of 7.14.6 run on the plane. Each of a unit's four samples reads the samples across the edge as its mask asks for them, the nearest four first, which is enough to drop the quarter that fail; it computes the one filter it takes and writes the samples that filter changes, with a wide filter's sums carried from one output to the next as in step 9. Held to the same reference by the same two tests, natively and as a baseline `wasm32-wasip1` binary in Node; eight planted errors in its arithmetic fail them, and one in the walk's call of it fails the frame test in wasm. The baseline build's loop filter goes from 2.20 to 0.83 ms a frame, the frame 3 to 17 % faster. The other builds are untouched (their rows moved by under 2 %, both ways). Only wasm32 without `simd128` takes this path: on x86-64 the lane filter is compiled to SSE2 or AVX2 and which of the two is faster there could not be measured here, so x86-64 keeps it.
+
+### 11. The walk scans a row of transform sizes for the units on a transform edge
+
+With the kernels in, the walk was half of the loop filter natively (0.12 of 0.25 ms a frame, measured with the kernel call taken out) and the largest single function of it in the simd build's profile. Seven units in eight are not on a transform edge, and `edge_unit` said so only after indexing the transform sizes through their vector, looking the width up in a table of machine words, and being called twice a pair. `filter_band` now takes the row of sizes as a slice (two rows for the vertical edges, whose pairs are one unit above the other) and tests each byte against a 32-entry byte table of the frame's `LfLevels`, a transform's width or height in units less one: a unit is on a transform edge where its column or row has none of those bits. Only the units that pass go through `edge_unit`, which still makes the whole decision, so the scan can only save work, not change a result. Six planted errors in it (the other pass's table, a unit of the pair tested with its neighbour's size or row, ...) fail the frame test. Measured in a run of its own against step 10, median of 7 natively and of 5 in wasm, builds taking turns: the loop filter 0.255 -> 0.224 ms a frame natively, 0.35 -> 0.27 in the simd build, 0.76 -> 0.77 in the baseline build (no change: there the sample filtering is four fifths of it).
 

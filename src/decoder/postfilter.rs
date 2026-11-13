@@ -113,6 +113,11 @@ pub(crate) struct LfLevels {
     lvl: [[[[u8; 2]; 9]; 8]; 4],
     /// `[lvl]`: `limit`, `blimit`, `thresh`.
     limits: [[u8; 3]; 64],
+    /// `[pass][tx size]`: a transform's width (pass 0) or height (pass 1)
+    /// in 4x4 units, less one. A unit is on a transform edge where its
+    /// column or row has none of these bits. (Zero for the sizes there are
+    /// not: [`edge_unit`] is asked about those.)
+    tx_units: [[u8; 32]; 2],
 }
 
 impl LfLevels {
@@ -132,7 +137,16 @@ impl LfLevels {
             let (limit, blimit, thresh) = filter_limits(h.loop_filter_sharpness, l as i32);
             *lim = [limit as u8, blimit as u8, thresh as u8];
         }
-        LfLevels { lvl, limits }
+        let mut tx_units = [[0u8; 32]; 2];
+        for (tx_sz, (&w, &h)) in TX_WIDTH.iter().zip(&TX_HEIGHT).enumerate() {
+            tx_units[0][tx_sz] = (w / MI_SIZE - 1) as u8;
+            tx_units[1][tx_sz] = (h / MI_SIZE - 1) as u8;
+        }
+        LfLevels {
+            lvl,
+            limits,
+            tx_units,
+        }
     }
 
     /// `lvl` of 7.14.4 for the block of `m`.
@@ -317,18 +331,35 @@ fn filter_band(
         chroma: plane != 0,
         bit_depth: f.bit_depth,
     };
+    // Most units are not on a transform edge, which their transform size
+    // alone says: a row of sizes is scanned for the ones that are, and only
+    // those go through `edge_unit`.
+    let ms = f.ms;
+    let txs = &f.lf_tx_sizes[plane][..];
+    let tx_units = &levels.tx_units[pass];
+    let on_tx_edge = |at: usize, tx_sz: u8| at & tx_units[(tx_sz & 31) as usize] as usize == 0;
+    let unit = |on: bool, pr: usize, pc: usize| {
+        if on {
+            edge_unit(f, levels, plane, pass, pr, pc)
+        } else {
+            NO_EDGE
+        }
+    };
     if pass == 0 {
         let mut pr = pr0;
         while pr < pr1 {
             let second = pr + 1 < pr1;
+            let sizes_a = &txs[pr * ms..pr * ms + pc1];
+            let sizes_b = &txs[(pr + 1) * ms..(pr + 1) * ms + pc1];
             // No edge at the frame's left.
             for pc in pc0.max(1)..pc1 {
-                let a = edge_unit(f, levels, plane, 0, pr, pc);
-                let b = if second {
-                    edge_unit(f, levels, plane, 0, pr + 1, pc)
-                } else {
-                    NO_EDGE
-                };
+                let on_a = on_tx_edge(pc, sizes_a[pc]);
+                let on_b = second && on_tx_edge(pc, sizes_b[pc]);
+                if !(on_a || on_b) {
+                    continue;
+                }
+                let a = unit(on_a, pr, pc);
+                let b = unit(on_b, pr + 1, pc);
                 if a != NO_EDGE || b != NO_EDGE {
                     let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
                     ctx.filter_pair(pos, a, b);
@@ -339,17 +370,18 @@ fn filter_band(
     } else {
         // No edge at the frame's top.
         for pr in pr0.max(1)..pr1 {
+            let sizes = &txs[pr * ms..pr * ms + pc1];
             let mut pc = pc0;
             while pc < pc1 {
-                let a = edge_unit(f, levels, plane, 1, pr, pc);
-                let b = if pc + 1 < pc1 {
-                    edge_unit(f, levels, plane, 1, pr, pc + 1)
-                } else {
-                    NO_EDGE
-                };
-                if a != NO_EDGE || b != NO_EDGE {
-                    let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
-                    ctx.filter_pair(pos, a, b);
+                let on_a = on_tx_edge(pr, sizes[pc]);
+                let on_b = pc + 1 < pc1 && on_tx_edge(pr, sizes[pc + 1]);
+                if on_a || on_b {
+                    let a = unit(on_a, pr, pc);
+                    let b = unit(on_b, pr, pc + 1);
+                    if a != NO_EDGE || b != NO_EDGE {
+                        let pos = pr * MI_SIZE * stride + pc * MI_SIZE;
+                        ctx.filter_pair(pos, a, b);
+                    }
                 }
                 pc += 2;
             }

@@ -1,7 +1,7 @@
 #!/bin/bash
 # lfprof.sh <runs> <clip> <label/variant>...: the loop filter's ms per shown frame in each wasm build.
 # Each run: a V8 CPU profile of bench-node (1 warm-up + 3 timed decodes) gives the loop filter's share of the samples
-# (functions named loop_filter / ::lf:: / edge_ / filter_strength / filter_band / FilterCtx / LfLevels; md5, idle, GC and
+# (the functions of postfilter.rs's loop filter and of dsp::lf; md5, idle, GC and
 # "(program)" left out of the total, as prof.sh does); an unprofiled bench-node run (median of 5) gives the frame time.
 # Builds are interleaved; the median of the runs is printed.
 S="${WASM_PERF:?}"; runs="$1"; clip="$2"; shift 2
@@ -18,7 +18,7 @@ c=collections.Counter()
 for s,d in zip(p['samples'],p['timeDeltas']):
     c[nodes[s]['callFrame']['functionName'] or '(anon)']+=d
 for k in ('update','(idle)','(garbage collector)','(program)'): c.pop(k,None)
-lf=sum(t for n,t in c.items() if re.search(r'loop_filter|::lf::|edge_|filter_strength|filter_band|FilterCtx|filter_level|LfLevels',n))
+lf=sum(t for n,t in c.items() if re.search(r'loop_filter_threads|::lf::|postfilter::edge_|filter_strength|filter_band|FilterCtx|filter_level|LfLevels',n))
 print(lf/sum(c.values()))
 PY
 )
