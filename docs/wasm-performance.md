@@ -419,3 +419,97 @@ Two things were written for this step, verified, measured and left out (`tools/w
 After step 13 dequantisation was the scan walked once more: 124 000 positions a frame loaded, dequantised and stored for the 34 000 that hold something, 0.27 ms of the simd frame. The coefficient reader's sign pass already visits exactly those 34 000, each with its position and its value in hand as it completes it. It now dequantises each there (`Dequantiser::put`: the same arithmetic as step 13's, one function shared by both) and keeps count of the rows and columns they reach, and `coeffs_decode` hands that to `reconstruct_decode`, which then has only the transform and the sum left to do. A block read by the reference reader alone (`CoefficientReader::Reference`) is dequantised by the walk of step 13, as before. The test of the dequantiser now builds `Dequant` both ways and requires the same array and the same reach (the position split by the wrong dimension, planted, fails it; the DC coefficient dequantised as an AC one fails the committed vectors).
 
 This moves work from one column of the table of parts to the other, so the two are to be read together: from one run, 1.41 + 0.87 = 2.28 to 1.49 + 0.61 = 2.10 ms in wasm simd, 1.47 + 1.79 to 1.57 + 1.48 in baseline, 1.04 + 0.65 = 1.69 to 1.09 + 0.46 = 1.54 natively. Mandelbrot 720p 129.4 to 132.5 fps simd, 59.7 to 60.4 baseline, 153.3 to 157.0 natively; testsrc2 720p 239 to 244 simd, 276 to 282 natively.
+
+## Where the residual path stands after step 14 (`d3e6ac4`)
+
+All the steps in one run, each build beside the others clip by clip, median of 7 (load average 4 to 18 while it ran): fps and the ratio to rav1d's. Wasm simd:
+
+| after step | fixture 320x180 | testsrc2 720p | mandelbrot 720p | mandelbrot 720p 10-bit | mandelbrot 1080p |
+|---|---|---|---|---|---|
+| rav1d | 1829 | 328 | 155 | 86.5 | 79.3 |
+| before | 1144 (0.63x) | 195 (0.59x) | 103 (0.66x) | 140 (1.62x) | 55.5 (0.70x) |
+| 8 | 1150 (0.63x) | 205 (0.62x) | 108 (0.70x) | 146 (1.69x) | 57.9 (0.73x) |
+| 9 | 1163 (0.64x) | 212 (0.65x) | 111 (0.72x) | 150 (1.74x) | 58.5 (0.74x) |
+| 10 | 1175 (0.64x) | 221 (0.67x) | 119 (0.77x) | 157 (1.81x) | 62.1 (0.78x) |
+| 11 | 1176 (0.64x) | 224 (0.68x) | 119 (0.77x) | 160 (1.85x) | 63.3 (0.80x) |
+| 12 | 1180 (0.65x) | 229 (0.70x) | 123 (0.80x) | 165 (1.91x) | 64.6 (0.81x) |
+| 13 | 1191 (0.65x) | 236 (0.72x) | 129 (0.83x) | 168 (1.94x) | 66.6 (0.84x) |
+| 14 | 1195 (0.65x) | 241 (0.74x) | 132 (0.85x) | 171 (1.98x) | 68.2 (0.86x) |
+
+Wasm baseline:
+
+| after step | fixture 320x180 | testsrc2 720p | mandelbrot 720p | mandelbrot 720p 10-bit | mandelbrot 1080p |
+|---|---|---|---|---|---|
+| rav1d | 1253 | 192 | 68.9 | 79.9 | 33.5 |
+| before | 786 (0.63x) | 129 (0.67x) | 52.5 (0.76x) | 65.5 (0.82x) | 25.9 (0.77x) |
+| 8 | 795 (0.63x) | 132 (0.69x) | 53.6 (0.78x) | 66.4 (0.83x) | 26.5 (0.79x) |
+| 9 | 796 (0.64x) | 134 (0.70x) | 54.2 (0.79x) | 67.1 (0.84x) | 26.6 (0.79x) |
+| 10 | 802 (0.64x) | 140 (0.73x) | 56.1 (0.81x) | 68.9 (0.86x) | 27.3 (0.81x) |
+| 11 | 810 (0.65x) | 146 (0.76x) | 58.7 (0.85x) | 71.9 (0.90x) | 28.7 (0.86x) |
+| 12 | 810 (0.65x) | 146 (0.76x) | 58.3 (0.85x) | 71.6 (0.90x) | 28.6 (0.85x) |
+| 13 | 808 (0.64x) | 146 (0.76x) | 59.2 (0.86x) | 72.2 (0.90x) | 28.5 (0.85x) |
+| 14 | 810 (0.65x) | 150 (0.78x) | 60.3 (0.88x) | 72.1 (0.90x) | 28.7 (0.86x) |
+
+Native aarch64 (rav1d was not built natively in this round):
+
+| after step | fixture 320x180 | testsrc2 720p | mandelbrot 720p | mandelbrot 720p 10-bit | mandelbrot 1080p |
+|---|---|---|---|---|---|
+| before | 1333 | 228 | 122 | 164 | 65.1 |
+| 8 | 1357 | 240 | 130 | 171 | 68.1 |
+| 9 | 1358 | 246 | 134 | 178 | 70.3 |
+| 10 | 1375 | 267 | 147 | 189 | 75.3 |
+| 11 | 1388 | 270 | 149 | 192 | 76.7 |
+| 12 | 1390 | 270 | 149 | 191 | 76.8 |
+| 13 | 1395 | 276 | 154 | 197 | 78.8 |
+| 14 | 1401 | 282 | 157 | 200 | 79.9 |
+
+No native row got slower at any step. Step 12 changes nothing but the simd build: its other rows show what the noise of the run is.
+
+The fourteen streams, `before` (`829b1e1`) and now, in one run of their own (median of 7, load average about 4):
+
+| stream | native: before | now | wasm baseline: rav1d | before | now | wasm simd: rav1d | before | now |
+|---|---|---|---|---|---|---|---|---|
+| fixture 320x180, 8-bit | 1337 | 1403 (1.05x of before) | 1259 | 788 | 813 (0.65x) | 1838 | 1138 | 1188 (0.65x) |
+| fixture 160x90, 10-bit | 3383 | 3508 (1.04x of before) | 3037 | 2182 | 2258 (0.74x) | 3114 | 3050 | 3196 (1.03x) |
+| fixture 128x72, film grain | 2438 | 2536 (1.04x of before) | 2521 | 1682 | 1739 (0.69x) | 3582 | 2193 | 2283 (0.64x) |
+| fixture 177x99, 8-bit | 2740 | 2972 (1.08x of before) | 2026 | 1478 | 1563 (0.77x) | 3533 | 2433 | 2656 (0.75x) |
+| fixture 96x64, 4:4:4 | 4120 | 4343 (1.05x of before) | 3980 | 2652 | 2823 (0.71x) | 6106 | 4165 | 4385 (0.72x) |
+| fixture 96x64, mono | 9201 | 9366 (1.02x of before) | 12396 | 7969 | 8098 (0.65x) | 16865 | 10272 | 10795 (0.64x) |
+| AOM b8-05-mv 352x288 | 248 | 302 (1.22x of before) | 165 | 147 | 168 (1.02x) | 271 | 209 | 254 (0.94x) |
+| AOM b10-00-quantizer-10, 10-bit | 102 | 118 (1.15x of before) | 75.0 | 62.7 | 70.0 (0.93x) | 77.8 | 85.3 | 98.7 (1.27x) |
+| AOM b8-23-film_grain-50 | 421 | 461 (1.10x of before) | 364 | 230 | 249 (0.68x) | 544 | 360 | 398 (0.73x) |
+| AOM b8-00-quantizer-20 | 265 | 322 (1.22x of before) | 208 | 159 | 182 (0.88x) | 298 | 237 | 285 (0.96x) |
+| SVT testsrc2 720p | 228 | 283 (1.24x of before) | 192 | 129 | 152 (0.79x) | 330 | 196 | 246 (0.75x) |
+| SVT mandelbrot 720p | 122 | 157 (1.29x of before) | 68.9 | 52.4 | 59.6 (0.87x) | 155 | 102 | 130 (0.84x) |
+| SVT mandelbrot 720p, 10-bit | 166 | 202 (1.22x of before) | 78.9 | 64.8 | 72.3 (0.92x) | 86.2 | 138 | 172 (2.00x) |
+| SVT mandelbrot 1080p | 65.8 | 80.0 (1.22x of before) | 34.0 | 26.0 | 29.1 (0.86x) | 80.6 | 55.6 | 68.8 (0.85x) |
+
+Against rav1d on one thread the simd build is now at 0.64 to 0.96 on 8-bit streams (it was at 0.59 to 0.80 in this run's `before`) and at 1.03 to 2.00 on 10-bit ones; the baseline build at 0.65 to 1.02 (0.63 to 0.89); native decoding is 1.02 to 1.29 times what it was. The small fixtures move least: little of their time is coefficients.
+
+The two parts on mandelbrot 720p, milliseconds a frame, median of three profiles of each build (and of three timed runs natively):
+
+| | symbol decoder and coefficients | inverse transforms and reconstruction | the two | a frame |
+|---|---|---|---|---|
+| wasm simd, before | 2.81 | 1.59 | 4.40 | 10.25 |
+| wasm simd, now | 1.53 | 0.60 | 2.13 | 7.87 |
+| wasm baseline, before | 2.74 | 2.92 | 5.66 | 19.80 |
+| wasm baseline, now | 1.56 | 1.46 | 3.02 | 17.15 |
+| native, before | 2.36 | 0.93 | 3.29 | 9.14 |
+| native, now | 1.07 | 0.45 | 1.52 | 7.33 |
+
+(Dequantisation is in the first column now and was in the second before, step 14.) The first round measured rav1d's two parts at 1.6 and 1.1 ms in a simd frame of 6.6: this crate's are now 1.5 and 0.6, and its frame 7.9. What is left of the difference between the two decoders is in the other parts.
+
+**What every step was held to.** `tools/wasm-perf/gate.sh` as the first round ran it (formatting, clippy for the host, for wasm32 with and without `simd128` and for x86-64, the documentation, `cargo test --release`, which with the AOM vectors in place decodes all 244 of them with `CoefficientReader::Checked`, the committed vectors and the runner on 4 threads, the fuzz and encoder tests in debug, x86-64's tests under Rosetta, wasm-av1's tests on the tree, 15 streams through both wasm builds against rav1d's and libdav1d's MD5s, the clips natively on 1 and 4 threads), and from step 12 on the transform's comparison with the scalar reference inside both wasm modules. Every step passed all of it, with one exception that was not the code: step 14's run could not start the `itxbench` script, whose executable bit had just been cleared to match the other scripts; that line was run again by hand and passed, and `gate.sh` now starts it with `bash`. For each step a difference was planted and seen to fail the test that should catch it; they are named in the steps. At the end, on `d3e6ac4`: the 244 AOM vectors natively with the readers checked against each other and the symbol decoder against its reference, on 1 thread and on 4 (244 of 244, twice), and the 242 that are IVF through both wasm builds beside rav1d's two (the same MD5 from all four builds for all 242).
+
+AVX2 hosts were not measured: no machine here has AVX2. Steps 8 to 10 and 14 are the same code on every architecture. Steps 11 and 13 change what the AVX2 kernel is compiled from (the per-size dispatch, the bounded transform) in the same way as for aarch64; x86-64 was built, linted and tested without AVX2 only.
+
+### What is known from elsewhere
+
+The rule of this round was the specification and this crate as the only sources. These are the ideas in it that are common knowledge of how decoders are built, each derived here and held to this crate's reference code as its step describes: an arithmetic decoder's value kept in a wide window refilled in bulk (step 8; the complemented form is the specification's own `SymbolValue`); a symbol found by counting thresholds instead of searching, and a CDF adapted without branches (step 9); tables worked out once for each scan, and contexts from a padded map of clamped levels (step 10; the map is step 6's); the transforms as one function for each size (step 11, got by compiling the specification's process for each size, not by writing them); work bounded by the end-of-block position, in dequantisation and in the transform (steps 13 and 14); a coefficient dequantised as it is read (step 14). What rav1d does was not looked at for any of them; the README's sentence about techniques commonly known from other decoders names three, and should name these when this is merged.
+
+### What is left in these two parts
+
+- **The reads.** `coeffs_decode` is 1.35 ms of the simd frame and nearly all of it is 124 000 adaptive reads whose dependent chain (the thresholds from the CDF, the comparison, the adaptation stored for the next read of the same CDF) is about twenty cycles. Shorter needs the read itself restructured, for instance the thresholds and the adaptation of a CDF as one vector operation; the adaptation alone as a vector was slower (step 8), and the whole read as one was not written.
+- **Everything that is not a coefficient** (12 000 symbols a frame) still goes through the general `read_symbol`, a search loop and two adaptation loops: about 0.1 ms on its own and more inside `decode_block`.
+- **The transform arithmetic**, 0.5 ms of the simd frame, is 32-bit lanes, four to a vector. Sixteen-bit lanes would halve the vectors for 8-bit streams, if they can be proved exact for every value conformance allows; that proof was not attempted.
+- **The baseline build's transforms** are scalar and stay 1.4 ms: it has no lanes. Transforms that skip what is known to be zero pay there only on sparser streams than these (`tried/partial-transforms.diff`).
