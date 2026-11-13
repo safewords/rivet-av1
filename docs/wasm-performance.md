@@ -295,6 +295,11 @@ from one table to the next. The native column has its ratio to rav1d too.
 |  | mandelbrot 720p | 50.6 (0.78x) | 102 (0.70x) | 116 (1.38x) |
 |  | mandelbrot 720p 10-bit | 62.5 (0.83x) | 136 (1.66x) | 162 (1.60x) |
 |  | mandelbrot 1080p | 25.0 (0.77x) | 54.5 (0.72x) | 64.9 (1.53x) |
+| 9. the vertical filter a block at a time, in column strips | fixture 320x180 | 731 (0.64x) | 1061 (0.63x) | 1248 (0.83x) |
+|  | testsrc2 720p | 122 (0.71x) | 188 (0.65x) | 218 (0.94x) |
+|  | mandelbrot 720p | 50.4 (0.79x) | 101 (0.71x) | 122 (1.46x) |
+|  | mandelbrot 720p 10-bit | 63.8 (0.85x) | 138 (1.70x) | 161 (1.66x) |
+|  | mandelbrot 1080p | 25.3 (0.79x) | 54.9 (0.74x) | 65.9 (1.60x) |
 
 ### 8. The horizontal filter a block at a time, and 8-bit sums in 16-bit lanes
 
@@ -303,5 +308,13 @@ The horizontal filter was called a row at a time, each row fetched through `sour
 For a frame of 8 bits the sum itself fits 16 bits. A filter's taps sum to 128, at most 184 of it positive and 56 negative (tested over the table), so over samples of 0..255 the sum lies in -14280..46920, and with 16384 added it is an unsigned 16-bit value. The 8-bit kernel is then one 16-bit multiply and one add per tap for eight outputs (`i16x8_mul` in SIMD128, `vmlaq_n_u16` in NEON), a logical shift, and the 16384 taken off again. For 10 and 12 bits the SIMD128 kernel takes the taps two by two as dot products straight from the row (a 32-bit lane of the row is two neighbouring samples, so the row from column `c` gives the even outputs' sums and the row from `c + 1` the odd ones': no interleaving), and the NEON one is widening multiply-accumulates.
 
 The kernels were timed against each other in V8 on blocks of 8x8 to 64x64 before being wired in: the kernel that was there 0.63 to 0.82 ns a sample, dot products from the row 0.32 to 0.34, the 16-bit sums 0.12 to 0.18. Inter prediction on mandelbrot 720p: simd 1.99 to 1.47 ms a frame, baseline 4.39 to 4.12, native 1.73 to 1.62 (the vertical filter is the larger part there, and it is the next step). Two native rows of the table's run read flat and down (the fixture and 10-bit mandelbrot); measured again over 15 turns they are 1252 to 1265 and 154.5 to 157.1 fps.
+
+### 9. The vertical filter a block at a time, in column strips
+
+The vertical filter was also a call per row. For each row of the block the SIMD128 version loaded the eight rows of intermediates under the taps and interleaved them pair by pair for its dot products: eight loads and eight shuffles for work that the next row but one mostly repeats (row `r` takes the pairs of rows `r + 2k` and `r + 2k + 1`, and row `r + 2` takes all but one of the same pairs). Natively it was scalar. Now it takes a block, eight columns at a time down the block (four for a block under eight wide). The SIMD128 version keeps the interleaved pairs in two sets, for the even rows and the odd ones, so that a row of the block costs one load, one interleave and a dot product per pair of taps: three pairs for the regular and smooth filters, whose first and last taps are zero. The NEON version keeps the rows under the taps in registers and multiplies by widening multiply-accumulates. The horizontal pass before it computes only the rows under the taps that are not zero (`h + 5` rows for those filters, not `h + 7`). In V8 on the same blocks: 0.92 to 1.13 ns a sample before, 0.28 to 0.33 after (widening multiplies on rows kept in registers, with no interleaving, measured 0.30 to 0.36).
+
+Two things came with it. A block with a vertical phase and no horizontal one used to copy the reference's samples, shifted up, into the intermediate array and filter that. The intermediate is the sample shifted up by `7 - InterRound0`, so the vertical filter now runs on the reference's samples themselves with that much less of a shift (at 8 bits it is the horizontal filter's 16-bit sum, its taps a stride apart). And a single prediction comes out of the same function as a compound one, in 16 bits, which it fits (`Round2` by 11, or 9 at 12 bits, where a compound prediction is rounded by 7), and is widened for the general path's 32-bit blends.
+
+Inter prediction on mandelbrot 720p: simd 1.47 to 1.23 ms a frame, baseline 4.12 to 3.49, native 1.62 to 1.05.
 
 `tools/wasm-perf/` has the scripts every number here came from.
