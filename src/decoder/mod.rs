@@ -31,7 +31,7 @@ use crate::obu::{Metadata, SequenceHeader, split_obus};
 use crate::tables::*;
 use crate::{Error, Result};
 use shared::Shared;
-use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
+use state::{FrameBuf, Mi, Mv, Pool, RefData};
 use tile::TileDecoder;
 
 pub use lst::TileListLayout;
@@ -88,6 +88,8 @@ pub(crate) struct FrameCtx {
     /// `LrFrame`, when the post-filters ran with the tile's rows
     /// (`pipeline.rs`) and are not left to the decode frame wrapup.
     pub(crate) filtered: Option<FrameBuf>,
+    /// Where the frame's sample planes come from, and go back to.
+    pub(crate) pool: Arc<Pool>,
 }
 
 impl FrameCtx {
@@ -125,7 +127,7 @@ impl FrameCtx {
                     .cur
                     .planes
                     .iter()
-                    .map(|p| PlaneBuf::new(p.w, p.h, 0))
+                    .map(|p| self.pool.plane(p.w, p.h, 0))
                     .collect(),
             },
             refs: self.refs.clone(),
@@ -135,6 +137,7 @@ impl FrameCtx {
             tile_num: self.tile_num,
             tiles_ok: true,
             filtered: None,
+            pool: self.pool.clone(),
         }
     }
 
@@ -338,6 +341,8 @@ pub struct Decoder {
     ground_for: usize,
     /// The anchor frames of large scale tile decoding (`lst.rs`).
     anchors: lst::Anchors,
+    /// Sample planes no frame needs any more, for the frames to come.
+    pub(crate) planes: Arc<Pool>,
 }
 
 impl Default for Decoder {
@@ -373,6 +378,7 @@ impl Decoder {
             grounded: 0,
             ground_for: 0,
             anchors: Default::default(),
+            planes: Default::default(),
         }
     }
 
@@ -645,7 +651,7 @@ impl Decoder {
         hdr: FrameHeader,
     ) -> Result<FrameCtx> {
         self.check_frame(&seq, &hdr)?;
-        Ok(build_frame(&self.refs, seq, hdr))
+        Ok(build_frame(&self.refs, seq, hdr, &self.planes))
     }
 
     /// What can be wrong with a frame once its header is parsed: its size,
@@ -699,7 +705,7 @@ impl Decoder {
         hdr: FrameHeader,
         data: &[u8],
     ) -> Result<()> {
-        let out = Arc::new(ref_data(&seq, &hdr));
+        let out = Arc::new(ref_data(&seq, &hdr, Some(&self.planes)));
         let input = pipeline::Input {
             seq: seq.clone(),
             hdr: hdr.clone(),
@@ -707,6 +713,7 @@ impl Decoder {
             coeff_reader: self.coeff_reader,
             ref_order_hints: self.ref_state.order_hint,
             threads: self.threads,
+            pool: self.planes.clone(),
         };
         let job = pipeline::Job::new(&self.refs, out.clone(), input);
         if self.flying.is_some() {
@@ -743,7 +750,7 @@ impl Decoder {
             // not end as it should): decoded again as one thread decodes
             // it, for the same error and the same state after it.
             _ => {
-                self.frame = Some(build_frame(&self.refs, seq, hdr));
+                self.frame = Some(build_frame(&self.refs, seq, hdr, &self.planes));
                 self.tile_group(data)
             }
         }
@@ -872,7 +879,11 @@ impl Decoder {
     /// The decode frame wrapup process (7.4) for a decoded frame.
     fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
         let lr = filter_frame(&mut f, self.threads);
-        let data = ref_data(&f.seq, &f.hdr);
+        // `CurrFrame`, once the post-filters have made `LrFrame` of it.
+        if f.filtered.is_none() {
+            f.pool.give_back(std::mem::take(&mut f.cur));
+        }
+        let data = ref_data(&f.seq, &f.hdr, Some(&f.pool));
         let _ = data
             .syntax
             .set(frame_syntax(&mut f, &self.ref_state.order_hint));
@@ -1194,7 +1205,8 @@ pub(crate) fn filter_frame(f: &mut FrameCtx, threads: usize) -> FrameBuf {
 
 /// What a frame's header says of it as a reference (7.20): a slot's
 /// contents before anything of the frame is decoded.
-pub(crate) fn ref_data(seq: &SequenceHeader, h: &FrameHeader) -> RefData {
+/// `pool` takes the frame's planes back once no slot holds it.
+pub(crate) fn ref_data(seq: &SequenceHeader, h: &FrameHeader, pool: Option<&Arc<Pool>>) -> RefData {
     let c = &seq.color;
     RefData {
         frame_type: h.frame_type,
@@ -1211,6 +1223,7 @@ pub(crate) fn ref_data(seq: &SequenceHeader, h: &FrameHeader) -> RefData {
         saved_order_hints: h.order_hints,
         syntax: Default::default(),
         frame: Default::default(),
+        pool: pool.cloned(),
     }
 }
 
@@ -1242,6 +1255,7 @@ pub(crate) fn build_frame(
     refs: &[Option<Arc<RefData>>; 8],
     seq: Arc<SequenceHeader>,
     hdr: FrameHeader,
+    pool: &Arc<Pool>,
 ) -> FrameCtx {
     let c = &seq.color;
     let mi_rows = hdr.mi_rows;
@@ -1272,9 +1286,9 @@ pub(crate) fn build_frame(
     let num_planes = c.num_planes;
     let aw = (mi_cols * MI_SIZE + 127) & !127;
     let ah = (mi_rows * MI_SIZE + 127) & !127;
-    let mut planes = vec![PlaneBuf::new(aw + 32, ah + 32, 0)];
+    let mut planes = vec![pool.plane(aw + 32, ah + 32, 0)];
     for _ in 1..num_planes {
-        planes.push(PlaneBuf::new((aw >> ssx) + 32, (ah >> ssy) + 32, 0));
+        planes.push(pool.plane((aw >> ssx) + 32, (ah >> ssy) + 32, 0));
     }
     let cdef_stride = (mi_cols >> 4) + 2;
     let screen_content = hdr.allow_screen_content_tools;
@@ -1331,6 +1345,7 @@ pub(crate) fn build_frame(
         tile_num: 0,
         tiles_ok: true,
         filtered: None,
+        pool: pool.clone(),
     };
     if f.hdr.use_ref_frame_mvs {
         motion_field_estimation(&mut f);
@@ -1420,6 +1435,7 @@ pub(crate) fn tiles_in_parallel<T: Send>(
                 .merge_tile(&shard, t / cols, t % cols);
             *out[i].lock().expect("result slot") = Some(r);
         }
+        shard.pool.give_back(std::mem::take(&mut shard.cur));
     });
     out.into_iter()
         .map(|m| {

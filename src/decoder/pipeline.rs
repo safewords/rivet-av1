@@ -31,7 +31,7 @@ use crate::consts::*;
 use crate::decoder::postfilter::{self, LfLevels, SharedPlane};
 use crate::decoder::record::{Pass, RowRecord};
 use crate::decoder::shared::{Lender, Shared};
-use crate::decoder::state::{FrameBuf, Mi, PlaneBuf, RefData};
+use crate::decoder::state::{FrameBuf, Mi, PlaneBuf, Pool, RefData};
 use crate::decoder::tile::TileDecoder;
 use crate::decoder::{CoefficientReader, FrameCtx, LrPlane};
 use crate::header::FrameHeader;
@@ -478,6 +478,8 @@ pub(crate) struct Input {
     pub(crate) ref_order_hints: [u32; 8],
     /// Threads for the post-filters of a frame that is filtered whole.
     pub(crate) threads: usize,
+    /// Where the frame's sample planes come from.
+    pub(crate) pool: Arc<Pool>,
 }
 
 /// A frame's arrays once its parsing task has set them up, lent out by
@@ -1201,8 +1203,9 @@ impl Inner {
             coeff_reader,
             ref_order_hints,
             threads,
+            pool,
         } = input;
-        let mut f = crate::decoder::build_frame(&job.refs, seq, hdr);
+        let mut f = crate::decoder::build_frame(&job.refs, seq, hdr, &pool);
         let g = Geometry::of(&f);
         let template = f.view();
         // The frames the filters write: all of `CdefFrame` (CDEF copies
@@ -1213,7 +1216,7 @@ impl Inner {
                 .cur
                 .planes
                 .iter()
-                .map(|p| PlaneBuf::new(p.w, p.h, 0))
+                .map(|p| pool.plane(p.w, p.h, 0))
                 .collect(),
         });
         let lr = (g.stripes > 0).then(|| FrameBuf {
@@ -1224,7 +1227,7 @@ impl Inner {
                 .enumerate()
                 .map(|(i, p)| {
                     let h = if g.restored[i] { p.h } else { 0 };
-                    PlaneBuf::new(p.w, h, 0)
+                    pool.plane(p.w, h, 0)
                 })
                 .collect(),
         });
@@ -1622,6 +1625,7 @@ impl FrameCtx {
             tile_num: 0,
             tiles_ok: true,
             filtered: None,
+            pool: self.pool.clone(),
         }
     }
 }

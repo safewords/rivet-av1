@@ -262,6 +262,24 @@ impl<T> std::fmt::Debug for Shared<T> {
 }
 
 impl<T> Shared<T> {
+    /// The array, as the `Vec` it was made from, when this window is all
+    /// that is left of it (no other window, no lender); `None` otherwise,
+    /// and the array goes with what still holds it.
+    pub(crate) fn into_vec(mut self) -> Option<Vec<T>> {
+        let store = self.store.take()?;
+        {
+            let mut loans = store.loans.lock().unwrap_or_else(|e| e.into_inner());
+            loans.out.retain(|l| l.id != self.id);
+        }
+        let store = std::mem::ManuallyDrop::new(Arc::try_unwrap(store).ok()?);
+        // SAFETY: the store is no one else's (`try_unwrap`), so no window
+        // onto its elements is left; `ptr`, `len` and `cap` are those of
+        // the `Vec` it was made from (as in `Store::drop`, which is not
+        // run). The lock is moved out once, and dropped.
+        drop(unsafe { std::ptr::read(&store.loans) });
+        Some(unsafe { Vec::from_raw_parts(store.ptr.as_ptr(), store.len, store.cap) })
+    }
+
     /// The length of the whole array (not of the window).
     #[inline]
     pub(crate) fn len(&self) -> usize {
@@ -657,6 +675,22 @@ mod tests {
         drop(lender);
         assert_eq!(Arc::strong_count(&counter), 6, "a window keeps the array");
         drop(w);
+        assert_eq!(Arc::strong_count(&counter), 1);
+    }
+
+    #[test]
+    fn the_last_window_gives_the_array_back() {
+        let counter = Arc::new(());
+        let a: Shared<Arc<()>> = Shared::from(vec![counter.clone(); 5]);
+        let lender = a.lender();
+        assert!(a.into_vec().is_none(), "a lender still holds the array");
+        assert_eq!(Arc::strong_count(&counter), 6);
+        let w = lender.window(5, 0..5);
+        drop(lender);
+        let v = w.into_vec().expect("the last window");
+        assert_eq!(v.len(), 5);
+        assert_eq!(Arc::strong_count(&counter), 6);
+        drop(v);
         assert_eq!(Arc::strong_count(&counter), 1);
     }
 }

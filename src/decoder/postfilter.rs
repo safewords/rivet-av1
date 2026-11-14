@@ -769,7 +769,7 @@ fn filter_strength(
 /// `threads` threads (bands of 64 luma rows: each 8x8 block writes only its
 /// own samples).
 pub(crate) fn cdef(f: &FrameCtx, threads: usize) -> FrameBuf {
-    let mut out = f.cur.clone();
+    let mut out = f.pool.copy_frame(&f.cur);
     if !cdef_applies(f) {
         return out;
     }
@@ -1159,7 +1159,7 @@ pub(crate) fn loop_restoration(
     if !f.hdr.uses_lr {
         return cdef;
     }
-    let mut lr = cdef.clone();
+    let mut lr = f.pool.copy_frame(&cdef);
     let planes: Vec<SharedPlane> = lr.planes.iter_mut().map(SharedPlane::new).collect();
     let stripes = (f.hdr.frame_height as usize + 8).div_ceil(64);
     let mut jobs = Vec::new();
@@ -1177,6 +1177,8 @@ pub(crate) fn loop_restoration(
     } else {
         (0..jobs.len()).for_each(job);
     }
+    drop(planes);
+    f.pool.give_back(cdef);
     lr
 }
 
@@ -1784,6 +1786,7 @@ mod tests {
             tile_num: 0,
             tiles_ok: true,
             filtered: None,
+            pool: Default::default(),
         }
     }
 

@@ -149,6 +149,7 @@ impl Anchors {
             saved_order_hints: slot.map_or([0; 8], |s| s.saved_order_hints),
             syntax: OnceLock::new(),
             frame: OnceLock::from(FrameBuf { planes }),
+            pool: None,
         });
         a.as_ref = Some(((w, h), r.clone()));
         Ok(r)
@@ -198,7 +199,7 @@ impl Decoder {
         if let Some((seq, hdr)) = self.pending.take() {
             // A camera frame header that would have been decoded as tasks
             // had it brought a tile group.
-            self.frame = Some(super::build_frame(&self.refs, seq, hdr));
+            self.frame = Some(super::build_frame(&self.refs, seq, hdr, &self.planes));
         }
         let Some(mut f) = self.frame.take() else {
             return Err(Error::bitstream("tile list without a frame header"));

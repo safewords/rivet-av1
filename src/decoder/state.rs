@@ -2,7 +2,7 @@
 //! of the specification (`MiSizes`, `YModes`, `RefFrames`, `Mvs`, ...),
 //! and what a reference slot keeps (7.20).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cdf::CdfContext;
 use crate::decoder::shared::Shared;
@@ -51,6 +51,90 @@ impl PlaneBuf {
 
     pub(crate) fn row(&self, y: usize) -> &[u16] {
         &self.data[y * self.stride..y * self.stride + self.w]
+    }
+}
+
+/// Sample planes put aside for the frames after: what a frame's planes
+/// were once nothing reads them any more (a reference frame no slot holds,
+/// `CurrFrame` and `CdefFrame` once the post-filters are through them).
+/// The copies the post-filters start from (`CdefFrame` from `CurrFrame`,
+/// `LrFrame` from `CdefFrame`) are made into them rather than into new
+/// allocations. Planes of a size not seen lately make room for others.
+///
+/// A plane that starts as zeros (`CurrFrame`) is allocated afresh: zeroing
+/// a recycled plane cost more than the system's zeroed pages (4 % to 7 %
+/// of the decode, one thread or four), where recycling the copies'
+/// planes is neither faster nor slower.
+#[derive(Default)]
+pub(crate) struct Pool {
+    planes: Mutex<Vec<Vec<u16>>>,
+}
+
+/// How many planes a pool keeps: four frames' worth, at three planes a
+/// frame (each frame takes two copies and gives back two planes besides
+/// the reference it may push out of a slot).
+const POOL_PLANES: usize = 3 * 4;
+
+impl Pool {
+    /// A plane of `w` by `h` samples, each `fill`: a new allocation (see
+    /// above).
+    pub(crate) fn plane(&self, w: usize, h: usize, fill: u16) -> PlaneBuf {
+        let data = vec![fill; w * h];
+        PlaneBuf {
+            data: data.into(),
+            stride: w,
+            w,
+            h,
+        }
+    }
+
+    /// A copy of `src` (a whole plane).
+    pub(crate) fn copy(&self, src: &PlaneBuf) -> PlaneBuf {
+        let data = match self.take(src.data.len()) {
+            Some(mut v) => {
+                v.copy_from_slice(src.data.as_slice());
+                v
+            }
+            None => src.data.as_slice().to_vec(),
+        };
+        PlaneBuf {
+            data: data.into(),
+            stride: src.stride,
+            w: src.w,
+            h: src.h,
+        }
+    }
+
+    /// A copy of every plane of `src`.
+    pub(crate) fn copy_frame(&self, src: &FrameBuf) -> FrameBuf {
+        FrameBuf {
+            planes: src.planes.iter().map(|p| self.copy(p)).collect(),
+        }
+    }
+
+    fn take(&self, len: usize) -> Option<Vec<u16>> {
+        let mut planes = self.planes.lock().unwrap_or_else(|e| e.into_inner());
+        // The most recently given back first: the likeliest to be in cache.
+        let i = planes.iter().rposition(|v| v.len() == len)?;
+        Some(planes.swap_remove(i))
+    }
+
+    /// Takes back the planes of `frame` that nothing else holds.
+    pub(crate) fn give_back(&self, frame: FrameBuf) {
+        let vecs: Vec<Vec<u16>> = frame
+            .planes
+            .into_iter()
+            .filter_map(|p| p.data.into_vec())
+            .collect();
+        if vecs.is_empty() {
+            return;
+        }
+        let mut planes = self.planes.lock().unwrap_or_else(|e| e.into_inner());
+        planes.extend(vecs);
+        if planes.len() > POOL_PLANES {
+            let excess = planes.len() - POOL_PLANES;
+            planes.drain(..excess);
+        }
     }
 }
 
@@ -112,6 +196,16 @@ pub(crate) struct RefData {
     pub(crate) saved_order_hints: [u32; 8],
     pub(crate) syntax: OnceLock<RefSyntax>,
     pub(crate) frame: OnceLock<FrameBuf>,
+    /// Where the frame's planes go when no slot holds it any more.
+    pub(crate) pool: Option<Arc<Pool>>,
+}
+
+impl Drop for RefData {
+    fn drop(&mut self) {
+        if let (Some(pool), Some(frame)) = (&self.pool, self.frame.take()) {
+            pool.give_back(frame);
+        }
+    }
 }
 
 /// What parsing a frame leaves for the frames that refer to it.
