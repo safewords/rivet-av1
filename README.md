@@ -63,6 +63,11 @@ come out as decoded, for a player that cannot afford the grain.
 
 Not there yet:
 
+- **Speed 4 at rav1e's speed**: 4.4x its time on one thread (speed 6
+  1.09x, speed 8 0.71x; above). What is left there is the search itself —
+  four references searched exhaustively, every sub-sample candidate
+  predicted with the normative filters — which only a search that tries
+  less would change.
 - **Large-scale tile decoding** (tile list OBUs, 7.3). Optional for
   conformance; reported as `Error::Unsupported`.
 - **A frame-buffer pool.** Every frame allocates its buffers.
@@ -396,6 +401,94 @@ speed 6 0.79x to 1.02x the time of display order (fewer bits to search
 and code in the coarser frames, two more references to search), 1.2x to
 1.7x rav1e's; at speed 8 1.0x to 1.1x, 0.85x rav1e's; at speed 4 0.9x
 to 1.2x, 4.7x to 7.1x rav1e's.
+
+**The same streams, faster.** The encoder's kernels and the work its
+search repeated, with every decision left as it was — each of the 75
+streams below (three speeds, five clips, five quantisers, 30 frames) is
+byte for byte what it was. Seconds of CPU time per clip (the five
+quantisers together), one thread, each encode run alone beside the
+others' (rivet-av1 before and after interleaved; the best of two runs),
+rav1e 0.8.1 at the same speed:
+
+| speed | clip | before | after | after / before | rav1e | before / rav1e | after / rav1e |
+|---|---|---|---|---|---|---|---|
+| 4 | foreman | 59.2 | 44.6 | 0.75x | 13.4 | 4.41x | 3.32x |
+| 4 | mobile | 84.7 | 64.6 | 0.76x | 18.4 | 4.59x | 3.50x |
+| 4 | akiyo | 21.8 | 15.8 | 0.72x | 5.8 | 3.77x | 2.72x |
+| 4 | ducks_take_off | 830.6 | 622.0 | 0.75x | 130.8 | 6.35x | 4.76x |
+| 4 | park_joy | 816.9 | 598.8 | 0.73x | 136.0 | 6.01x | 4.40x |
+| **4** | **all** | **1813** | **1346** | **0.74x** | **305** | **5.96x** | **4.42x** |
+| 6 | foreman | 9.7 | 7.6 | 0.78x | 8.2 | 1.19x | 0.93x |
+| 6 | mobile | 13.9 | 10.7 | 0.77x | 11.6 | 1.20x | 0.93x |
+| 6 | akiyo | 4.5 | 3.4 | 0.77x | 3.4 | 1.33x | 1.02x |
+| 6 | ducks_take_off | 127.4 | 95.7 | 0.75x | 78.3 | 1.63x | 1.22x |
+| 6 | park_joy | 117.5 | 88.4 | 0.75x | 88.2 | 1.33x | 1.00x |
+| **6** | **all** | **273** | **206** | **0.75x** | **190** | **1.44x** | **1.09x** |
+| 8 | foreman | 5.3 | 4.2 | 0.80x | 7.0 | 0.77x | 0.61x |
+| 8 | mobile | 7.2 | 5.7 | 0.79x | 10.1 | 0.72x | 0.57x |
+| 8 | akiyo | 2.8 | 2.1 | 0.75x | 2.9 | 0.98x | 0.73x |
+| 8 | ducks_take_off | 68.2 | 53.1 | 0.78x | 67.4 | 1.01x | 0.79x |
+| 8 | park_joy | 65.3 | 50.6 | 0.77x | 75.4 | 0.87x | 0.67x |
+| **8** | **all** | **149** | **116** | **0.78x** | **163** | **0.92x** | **0.71x** |
+
+On all 16 threads of the same machine (an Apple M3 Max; wall-clock
+seconds, one encode at a time, both encoders given 16 threads; rav1e
+gains little from them here — one tile, 30 frames):
+
+| speed | before | after | after / before | rav1e | after / rav1e |
+|---|---|---|---|---|---|
+| 4 | 1648 | 1229 | 0.75x | 290 | 4.24x |
+| 6 | 77.9 | 62.5 | 0.80x | 179 | 0.35x |
+| 8 | 45.3 | 38.3 | 0.84x | 154 | 0.25x |
+
+Speeds 5 and up search in a wavefront of superblock rows and so use the
+threads; speed 4 searches a one-tile frame on one thread (only its filter
+searches use the others).
+
+Where the time went, and what was done about it (sampled profiles,
+park_joy and foreman, speeds 4, 6 and 8; shares of the encoder's time
+before):
+
+- **The coefficients' symbols in trial coding** (12 to 25 %: the reference
+  reader of `decoder::residual`, every context derived from `Quant` with
+  its edge tests, every symbol through `Coder`). The encoder now codes the
+  levels and signs with a writer of its own (`levels_encode`): the
+  decode-only reader's scan maps and padded level map for the contexts,
+  the costs from a table taken once per block; `levels_checked` holds it to
+  the reference on every transform block of a test's encodes.
+- **The forward transform** (11 to 15 %): its rows are now lanes, as its
+  columns were (the same sums in the same order, so the same values,
+  tested), each size compiled on its own, and the quantiser applied as the
+  coefficients come out, the end of block found from an inverse scan
+  (`forward_quantise`). Over half the transforms at speed 4 were of
+  residuals already transformed — the search codes a block for each
+  candidate that holds it, then again for real at every level above it —
+  and a transform block's levels are now kept for the next time the same
+  residual is quantised so.
+- **Memory cleared for nothing** (5 to 10 %): 8 KB for every intra
+  prediction, 4 KB for every quantised block, 2 KB for every inverse
+  transform.
+- **The motion search** (15 to 45 % at speed 4, with four references):
+  NEON SAD for 4-wide blocks, the limit checked every four rows (the result
+  does not depend on where), four candidates of the exhaustive search's
+  grid measured at once, and candidates past the reference's edge in three
+  runs per row instead of a sample at a time.
+- **Loop restoration's search** (10 to 25 % at speed 8): the Wiener fit's
+  cross-filtered samples worked out once instead of once for each of the
+  seven lines they lie on, and the self-guided box filter's neighbourhood
+  sums written out per row parity (the decoder's too).
+- The encoder reconstructs through the decoder's `reconstruct_decode`
+  (from the end of block), the directional intra predictor's tests of the
+  angle are out of its loops, and trial coding's symbol costs are inline.
+
+What is left is flat — at speed 6 no function above 9 % (the level
+writer's counting, the inverse transform, SATD and SAD, the motion
+search's sub-sample predictions). Speed 4 stays 4.4x rav1e's time
+because its decisions cost that much: an exhaustive full-sample search of
+four references, every sub-sample candidate predicted with the normative
+filters, the full transform type search at every depth and
+rate-distortion optimised quantisation in every trial; the gap there is in
+what the search tries, not in how fast it tries it.
 
 Each step at speed 6, as it went in (before rate-distortion optimised
 quantisation), BD-rate PSNR-Y against the step before (the five clips,
