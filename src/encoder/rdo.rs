@@ -57,6 +57,10 @@ pub(crate) struct Rdo {
     trials: Vec<Trial>,
     /// The trial (index in `trials`) given up: its cost passed its budget.
     abort: Option<usize>,
+    /// The references the blocks of a horizontal or vertical candidate
+    /// search (`Tools::rect_refs`): the block whole's, or (it intra) none
+    /// but the nearest.
+    pub(crate) ref_hint: Option<[i32; 2]>,
 }
 
 /// A partition candidate on trial: the costs of the blocks and partitions
@@ -354,7 +358,10 @@ impl TileDecoder<'_, '_> {
         let mut cands: Vec<usize> = Vec::with_capacity(4);
         if has_rows && has_cols {
             cands.push(PARTITION_NONE);
-            if tools.partition_rect {
+            let bw = block_width(b_size);
+            if tools.partition_rect
+                && (tools.rect_min as usize..=tools.rect_max as usize).contains(&bw)
+            {
                 cands.push(PARTITION_HORZ);
                 cands.push(PARTITION_VERT);
             }
@@ -396,6 +403,7 @@ impl TileDecoder<'_, '_> {
             cands.insert(0, PARTITION_SPLIT);
         }
         let mut children_whole = true;
+        let mut none_refs: Option<[i32; 2]> = None;
         let mut first = true;
         for &p in cands.iter() {
             if !first {
@@ -420,7 +428,12 @@ impl TileDecoder<'_, '_> {
                 f64::MAX
             };
             self.rdo().trials.push(Trial { spent: 0.0, budget });
-            if let Err(e) = self.decode_partition(r, c, b_size) {
+            if tools.rect_refs && (p == PARTITION_HORZ || p == PARTITION_VERT) {
+                self.rdo().ref_hint = none_refs;
+            }
+            let res = self.decode_partition(r, c, b_size);
+            self.rdo().ref_hint = None;
+            if let Err(e) = res {
                 let rdo = self.rdo();
                 if rdo.abort != Some(depth) {
                     return Err(e);
@@ -440,6 +453,11 @@ impl TileDecoder<'_, '_> {
             let sse = self.rect_sse(snap.r0, snap.r1, snap.c0, snap.c1);
             let cost = self.rd_cost(sse, bits);
             if p == PARTITION_NONE {
+                none_refs = self.rdo().log[log_start..].iter().find_map(|d| match d {
+                    Decision::Block(b) if b.is_inter => Some([b.ref_frame, b.ref_frame2]),
+                    Decision::Block(_) => Some([INTRA_FRAME, INTRA_FRAME]),
+                    _ => None,
+                });
                 none_flat = self.rdo().nonzero == 0;
                 // Or one whose cost per sample is low already.
                 let thr = if b_size >= BLOCK_32X32 {

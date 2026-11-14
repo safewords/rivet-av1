@@ -169,14 +169,17 @@ them:
   mode's rate from the CDFs), inter modes per reference — NEARESTMV, the
   NEARMV entries of the reference list, GLOBALMV, and NEWMV with a
   full-sample search then half- and quarter-sample refinement. From speed
-  5 the search is pruned: the motion search starts from the best of the
+  4 the search is pruned: the motion search starts from the best of the
   predicted, stacked and neighbouring vectors (a per-reference grid of the
   vectors found so far) and descends in square steps; a partition
   candidate is abandoned as soon as what it has coded costs more than the
   best before it (lossless, every speed); a block whose whole coding costs
-  little per sample (a threshold in units of lambda, higher for blocks of
-  16x16 and less) is not split; transform depths are tried with the DCT
-  and the types searched only at the best depth.
+  little per sample (a threshold in units of lambda) is not split;
+  transform depths are tried with the DCT and the types searched only at
+  the best depth, the types in their order of usefulness until one does
+  not beat the best before it; the halves of a block (horizontal and
+  vertical partitions, 16x16 blocks only at speeds 4 and 5) search only
+  the references the block whole chose.
 - **Intra**: all the directional and smooth modes, Paeth; **chroma from
   luma** (alphas fitted to the source); **palettes** (up to eight colours,
   their indices coded in the normative wavefront order) and **intra block
@@ -211,7 +214,7 @@ them:
   16 % more bits (below).
 - **Inter**: in a group, up to four references searched (the nearest
   frame on each side, the farthest after, the second nearest before; the
-  nearest on each side from speed 7), **compound prediction** of LAST with
+  nearest on each side from speed 4), **compound prediction** of LAST with
   a frame after it (and with LAST2, LAST3 or GOLDEN), **skip mode** (the
   nearest frames on each side with their predicted vectors, no residual),
   and the **motion field projected** from the references
@@ -219,7 +222,7 @@ them:
   groups (`Config::altref` = 0, and speeds 9 and 10), the last two frames
   and a golden frame (the key frame, then every 16th frame coded with a
   finer quantiser) as references, each searched, compound prediction of
-  LAST and another reference to speed 5, a key frame a step of 1 octave
+  LAST and another reference to speed 3, a key frame a step of 1 octave
   finer.
 - **Transforms**: 4x4 to 64x64, every size; the full transform sets at the
   slow speeds (DCT, ADST, flipped ADST, identity and their mixes, chosen per
@@ -230,7 +233,7 @@ them:
   less and zero, by squared error plus lambda times its rate under the
   CDFs in force and the contexts it will be coded in; then the end of
   block goes where the block costs least (all zero included). At speeds 0
-  to 4 in every block the search codes; at 5 to 8 only in the blocks it
+  to 3 in every block the search codes; at 4 to 8 only in the blocks it
   chose (its trials measure the dead-zone levels, with a wider dead zone
   standing in for the sparser levels the block will be coded with), which
   keeps most of the gain for a ninth of the time (below).
@@ -239,9 +242,10 @@ them:
   filter** levels (per plane), **CDEF** (each candidate strength applied
   with the decoder's own filter, eight (luma, chroma) pairs chosen greedily
   against the cost of signalling them, each 64x64 block taking its best)
-  and **loop restoration** (per unit: a Wiener filter fitted to the source
-  by least squares, or a self-guided filter with fitted projection weights,
-  or none; measured with the decoder's own restoration).
+  and **loop restoration** (speeds 0 to 3; per unit: a Wiener filter
+  fitted to the source by least squares, or a self-guided filter with
+  fitted projection weights, or none; measured with the decoder's own
+  restoration).
 - **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255 of
   plain inter frames, and in a group the middle of its pyramid, each frame
   offset from it by its role as above), or **average-bitrate rate
@@ -256,7 +260,7 @@ them:
   the rate (below).
 - **Tiles and threads**: `Config::tile_cols_log2` tile columns, coded in
   parallel on `Config::threads` threads (the stream is the same as coding
-  them in turn). From speed 5 the decision search of each tile also runs
+  them in turn). From speed 4 the decision search of each tile also runs
   in a **wavefront** of superblock rows on the threads (each row two
   superblocks behind the one above, with CDFs of its own; the frame is
   then coded sequentially with the decisions), and the filter searches run
@@ -536,6 +540,108 @@ filters, the full transform type search at every depth and
 rate-distortion optimised quantisation in every trial; the gap there is in
 what the search tries, not in how fast it tries it.
 
+**The tiers, at rav1e's time.** Then each speed's search was set to what
+rav1e spends at the same speed: speed 4 searches far less, speed 8 more,
+speed 6 a little less and differently (`Tools::for_speed`; each stream
+still decodes to the encoder's reconstruction). The same five clips,
+30 frames, quantisers 64 to 192, one thread; BD-rate of rivet-av1
+against rav1e 0.8.1 at the same speed, PSNR-Y (PSNR-YUV); seconds of
+CPU time per clip summed over the five clips, each encode run alone
+beside the others, rivet-av1 and rav1e interleaved, the best of three
+(speed 4's before: the best of two, scaled by rav1e's time of the same
+run):
+
+| speed | BD-rate before | BD-rate | time before / rav1e | time / rav1e | seconds (rav1e) | against before |
+|---|---|---|---|---|---|---|
+| 4 | −9.3 % (−3.7 %) | **−0.3 %** (+5.1 %) | 4.33x | **0.96x** | 296 (309) | +9.7 % (+9.0 %), 0.22x the time |
+| 6 | −0.1 % (+6.5 %) | **−0.5 %** (+5.0 %) | 1.10x | **0.89x** | 170 (191) | +0.2 % (−0.7 %), 0.81x |
+| 8 | +14.0 % (+17.9 %) | **−1.2 %** (+4.2 %) | 0.72x | **0.96x** | 157 (163) | −12.1 % (−10.5 %), 1.34x |
+
+Per clip, PSNR-Y (PSNR-YUV) and time against rav1e:
+
+| clip | speed 4 | speed 6 | speed 8 |
+|---|---|---|---|
+| foreman | +8.6 % (+12.4 %), 0.75x | +9.1 % (+13.6 %), 0.72x | +6.8 % (+11.4 %), 0.78x |
+| mobile | −3.4 % (+3.8 %), 0.87x | −3.0 % (+3.4 %), 0.79x | −0.9 % (+4.8 %), 0.85x |
+| akiyo | +5.4 % (+8.7 %), 0.55x | +5.1 % (+8.3 %), 0.68x | +2.9 % (+6.2 %), 0.75x |
+| ducks_take_off | −8.3 % (−0.4 %), 1.10x | −9.3 % (−1.1 %), 1.04x | −9.6 % (−1.3 %), 1.11x |
+| park_joy | −3.8 % (+1.3 %), 0.87x | −4.4 % (+0.7 %), 0.80x | −5.2 % (+0.0 %), 0.87x |
+
+So at rav1e's time rivet-av1 is at parity in PSNR-Y at every tier, and
+4 % to 5 % behind in PSNR-YUV: the chroma that rav1e's finer chroma
+quantisers buy (above) is the gap that is left, at every speed alike.
+
+What each tier now does (from speed 4 down to speed 8; speeds 0 to 3 are
+as they were):
+
+- **speed 4**: the pruned search of speed 6 (the stepped motion search,
+  the transform depths with the DCT, rate-distortion optimised
+  quantisation in the blocks coded, the wavefront) with the 16x16 blocks
+  also tried halved, the halves searching only the references the block
+  whole chose; the nearest frame on each side searched in a group; three
+  inter candidates trialled and one intra; the transform types searched;
+  no loop restoration.
+- **speed 6**: the same without the halves and without the transform
+  type search.
+- **speed 8**: the same with two inter candidates (the transform depths
+  are now searched at speed 8 too).
+- At speeds 4 to 8 a block is not split when coding it whole costs less
+  than 1.0 lambda per sample (0.15 for blocks of 32x32 and more).
+
+What each change was worth where it was measured (BD-rate PSNR-Y
+(PSNR-YUV) against the tier without it; times from runs contending with
+each other, to a few percent):
+
+| change | where | BD-rate | time |
+|---|---|---|---|
+| transform depths searched | speed 8 | −8.8 % (−6.7 %) | 1.21x |
+| two inter candidates trialled, not one | speed 8 | −3.6 % (−3.5 %) | 1.06x |
+| three, not two | speed 6 | −1.6 % (−1.7 %) | 1.06x |
+| … not two | speed 8 | −1.8 % (−1.8 %) | 1.08x |
+| the split threshold of blocks under 32x32 at 1.0 lambda, not 2.0 | speed 8; speed 6 | −1.8 % (−1.9 %); −1.6 % (−1.9 %) | 1.09x; 1.12x |
+| loop restoration | speed 8; speed 6; speed 4 | −1.2 % (−0.9 %); −1.2 % (−1.1 %); −1.2 % (−1.0 %) | 1.10x; 1.10x; 1.03x |
+| four references searched, not two | speed 8; speed 6 | −1.2 % (−1.1 %); −1.1 % (−0.9 %) | 1.19x; 1.15x |
+| transform types searched | speed 6 | −1.2 % (−0.8 %) | 1.12x |
+| the type search stopped at the first type that loses (`tx_type_early`) | speed 6 | −0.1 % (−0.2 %) | 0.98x |
+| one intra candidate trialled, not two | speed 6 | +0.2 % (+0.1 %) | 0.99x |
+| horizontal and vertical partitions | speed 8; speed 6 | −10.3 % (−9.5 %); −6.6 % (−7.1 %) | 2.10x; 2.49x |
+| … their halves searching only the whole block's references (`rect_refs`) | speed 6 | +0.9 % (+0.9 %) | 0.89x |
+| … of 8x8 blocks | speeds 4 and 6 | ±0 (the same streams) | 1.05x |
+| … of 32x32 blocks | speed 4 | −1.2 % (−1.2 %) | 1.12x |
+| … of 64x64 blocks | speed 4 | −0.6 % (−0.6 %) | 1.15x |
+| the stepped motion search, not the exhaustive one | the speed 4 before | −0.3 % (−0.3 %) | 0.88x |
+
+The trade at speed 4, against rav1e's speed 4 (times against rav1e's,
+from runs contending with each other, to about 5 %):
+
+| speed 4 | BD-rate | time |
+|---|---|---|
+| before (four references, the exhaustive motion search, every partition, the full transform search at every depth, rate-distortion optimised quantisation in every trial) | −9.3 % (−3.7 %) | 4.4x |
+| speed 5 before | −4.5 % (+1.4 %) | 2.0x |
+| speed 6's search, halves from 16x16 to 64x64, loop restoration | −3.7 % (+2.0 %) | 1.4x |
+| … halves of 16x16 and 32x32 | −2.9 % (+2.6 %) | 1.2x |
+| … no loop restoration | −1.8 % (+3.6 %) | 1.2x |
+| **… halves of 16x16 only (speed 4)** | **−0.3 % (+5.1 %)** | **0.96x** |
+
+PSNR-Y and the time at once were reached; PSNR-YUV at rav1e's time was
+not (above). At speed 8 the next steps up cost more than rav1e's time
+leaves: three inter candidates, −3.2 % (+2.2 %) for about 1.03x rav1e's
+time; the halves of every block, −7.6 % (−2.5 %) for 2.3x.
+
+**Groups at scene cuts**, measured and left out: a group ended at a scene
+cut (a frame whose quarter-size thumbnail, motion-searched against the
+one before, costs more than 1.2 times its own deviation from its block
+means and 2.5 times the group's other frames: 0.75 at most for the
+motion in the test clips, from 1.85 for a cut between any two of them),
+the next group starting at the cut. On two clips made of the test clips
+cut together (foreman, mobile and akiyo, 20 frames each; ducks_take_off
+and park_joy, 20 frames each), speed 6: +5.0 % (+5.1 %) and +1.5 %
+(+1.1 %); the cut frame also made a key frame, +3.6 % (−0.1 %) and +4.6 %
+(+3.6 %). A pyramid that spans a cut already codes the frames after it
+from the alt-ref frame beyond it (which is coded intra where it must be)
+and those before it from the anchor; ending the group early only adds a
+short group with its finely coded alt-ref frame.
+
 Each step at speed 6, as it went in (before rate-distortion optimised
 quantisation), BD-rate PSNR-Y against the step before (the five clips,
 or the three 352x288 ones where it says so):
@@ -610,8 +716,12 @@ Not there yet:
 - **Groups that follow the content**: a group is 16 frames whatever the
   frames are (cut only by a key frame); a scene cut inside a group, or a
   fast pan the alt-ref frame cannot be predicted across, is coded as if
-  it were not there. No temporal filtering of the alt-ref frames (built,
+  it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
+  clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
+- **PSNR-YUV at rav1e's time**: 4 % to 5 % behind at speeds 4, 6 and 8
+  (PSNR-Y at parity), the chroma that rav1e's finer chroma quantisers
+  buy; foreman and akiyo trail at every tier, in PSNR-Y too.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the

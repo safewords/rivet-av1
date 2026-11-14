@@ -248,6 +248,25 @@ pub struct Tools {
     /// `rdo::CHROMA_WEIGHT`) for 1.04x the time, 3 −3.7 % for 1.3x; at
     /// speed 4, 3 is −2.7 % for 1.2x and 1 only −0.8 %.
     pub rdoq: u8,
+    /// The transform type search stops at the first type (after the DCT)
+    /// that does not beat the best before it, and after the DCT when it
+    /// codes no coefficients (at speed 6: −0.1 % BD-rate, 0.98x the time;
+    /// the types are tried in their order of usefulness, so a type that
+    /// loses seldom has a better one behind it).
+    pub tx_type_early: bool,
+    /// The blocks of a horizontal or vertical partition candidate search
+    /// only the references the block whole chose (an intra block whole:
+    /// only the nearest). At speed 6 with `partition_rect`: 0.89x the time
+    /// of searching every reference in the halves, +0.9 % BD-rate.
+    pub rect_refs: bool,
+    /// The square blocks tried halved (with `partition_rect`): those
+    /// `rect_min` to `rect_max` samples wide. Halving 8x8 blocks changed
+    /// no stream of the test clips at speeds 4 and 6 (and cost 1.05x the
+    /// time); at speed 4 the 32x32 halves are worth −1.2 % BD-rate for
+    /// 1.12x the time, the 64x64 ones −0.6 % for 1.15x.
+    pub rect_min: u8,
+    /// See `rect_min`.
+    pub rect_max: u8,
 }
 
 impl Tools {
@@ -261,61 +280,62 @@ impl Tools {
             prune_split: s >= 3,
             prune_partition: false,
             rd_skip: s <= 8,
-            tx_size: s <= 7,
-            tx_type_rd: s <= 6,
+            tx_size: s <= 8,
+            tx_type_rd: s <= 5,
             tx_types: match s {
                 0..=1 => 16,
                 2..=3 => 7,
-                4..=6 => 5,
+                4..=5 => 5,
                 _ => 4,
             },
             full_tx_set: s <= 3,
             intra_candidates: match s {
                 0..=1 => 5,
-                2..=4 => 3,
-                5..=6 => 2,
+                2..=3 => 3,
                 _ => 1,
             },
             inter_candidates: match s {
                 0..=1 => 5,
-                2..=4 => 3,
-                5..=6 => 2,
-                _ => 1,
+                2..=6 => 3,
+                _ => 2,
             },
             cdef: s <= 9,
             cdef_thorough: s <= 3,
             lf_search: s <= 9,
-            multi_ref: s <= 6,
+            multi_ref: s <= 3,
             cfl: s <= 8,
-            restoration: s <= 8,
+            restoration: s <= 3,
             restoration_thorough: s <= 2,
             compound: s <= 5,
             palette: s <= 8,
             filter_intra: false,
             intrabc: s <= 8,
-            fast_me: s >= 5,
-            fast_tx_refine: s >= 5,
-            restoration_fast: s >= 5,
+            fast_me: s >= 4,
+            fast_tx_refine: s >= 4,
+            restoration_fast: s >= 4,
             abandon_trials: true,
             split_threshold: match s {
-                0..=4 => 0,
+                0..=3 => 0,
                 _ => 15,
             },
             split_threshold_small: match s {
-                0..=4 => 0,
-                5 => 100,
-                _ => 200,
+                0..=3 => 0,
+                _ => 100,
             },
-            rd_skip_best: s >= 5,
-            tx_depth_max: if s >= 6 { 1 } else { 2 },
-            prune_intra: s >= 5,
-            wavefront: s >= 5,
+            rd_skip_best: s >= 4,
+            tx_depth_max: if s >= 4 { 1 } else { 2 },
+            prune_intra: s >= 4,
+            wavefront: s >= 4,
             aq: false,
             rdoq: match s {
-                0..=4 => 3,
-                5..=8 => 1,
+                0..=3 => 3,
+                4..=8 => 1,
                 _ => 0,
             },
+            tx_type_early: s >= 4,
+            rect_refs: s >= 4,
+            rect_min: if s >= 4 { 16 } else { 8 },
+            rect_max: if s >= 4 { 16 } else { 128 },
         }
     }
 
@@ -359,6 +379,10 @@ impl Tools {
             "wavefront" => self.wavefront = b,
             "aq" => self.aq = b,
             "rdoq" => self.rdoq = value.min(3) as u8,
+            "tx_type_early" => self.tx_type_early = b,
+            "rect_refs" => self.rect_refs = b,
+            "rect_min" => self.rect_min = value.min(128) as u8,
+            "rect_max" => self.rect_max = value.min(128) as u8,
             _ => return false,
         }
         true

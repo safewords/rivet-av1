@@ -550,7 +550,18 @@ impl TileDecoder<'_, '_> {
         if self.f.hdr.allow_intrabc {
             out.extend(self.intrabc_candidates());
         }
-        let refs = self.enc().refs.clone();
+        let mut refs = self.enc().refs.clone();
+        if let Some(h) = self.rdo().ref_hint
+            && !refs.is_empty()
+        {
+            // A half of a block: the references the block whole chose.
+            let keep: Vec<i32> = refs.iter().copied().filter(|r| h.contains(r)).collect();
+            refs = if keep.is_empty() {
+                refs[..1].to_vec()
+            } else {
+                keep
+            };
+        }
         if refs.is_empty() || ms < BLOCK_8X8 {
             return out.into_iter().map(|x| x.0).collect();
         }
@@ -602,7 +613,7 @@ impl TileDecoder<'_, '_> {
             && NUM_4X4_BLOCKS_WIDE[ms].min(NUM_4X4_BLOCKS_HIGH[ms]) >= 2
         {
             for &(r2, mv2) in searched_mv.iter().skip(1) {
-                let Some(&(_, mv1)) = searched_mv.first() else {
+                let Some(&(LAST_FRAME, mv1)) = searched_mv.first() else {
                     break;
                 };
                 self.b.ref_frame = [LAST_FRAME, r2];
@@ -1898,6 +1909,7 @@ impl TileDecoder<'_, '_> {
         let nonzero = self.rdo().nonzero;
         let saved_ptt = self.plane_tx_type;
         let mut best = (cands[0], f64::MAX);
+        let early = self.enc().tools.tx_type_early;
         for &t in cands {
             self.rdo().forced_tx_type = Some(t);
             let bits0 = self.sd.trial_bits();
@@ -1908,10 +1920,16 @@ impl TileDecoder<'_, '_> {
             let bits = self.sd.trial_bits() - bits0;
             let sse = self.px_sse(0, x, y, w, h);
             let cost = self.rd_cost(sse, bits);
-            if cost < best.1 {
+            let better = cost < best.1;
+            if better {
                 best = (t, cost);
             }
             restore(self);
+            // Speed: the DCT coding nothing, or a type not beating the
+            // best before it, ends the search.
+            if early && ((t == DCT_DCT && eob == 0) || (t != DCT_DCT && !better)) {
+                break;
+            }
         }
         self.rdo().nonzero = nonzero;
         self.plane_tx_type = saved_ptt;
