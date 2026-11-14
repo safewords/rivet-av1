@@ -417,8 +417,11 @@ impl Tools {
                 2..=3 => 3,
                 _ => 1,
             },
+            // Four at speed 4, the time from the thresholds below: with
+            // them, −0.4 % BD-rate PSNR-Y and PSNR-YUV for 1.02x the time.
             inter_candidates: match s {
                 0..=1 => 5,
+                4 => 4,
                 2..=6 => 3,
                 _ => 2,
             },
@@ -453,9 +456,11 @@ impl Tools {
             // split more readily now in the frames others refer to, which
             // is most of what rav1e's finer partitions gain on foreman.
             // 0.5 at speed 6; 0.75 elsewhere, for the time: at speed 4,
-            // 0.5 is −0.2 % PSNR-YUV for 1.02x.)
+            // 0.5 is −0.2 % PSNR-YUV for 1.02x. Speed 4 goes to 1.25 for
+            // its fourth inter candidate's time.)
             split_threshold_small: match s {
                 0..=3 => 0,
+                4 => 125,
                 6 => 50,
                 _ => 75,
             },
@@ -468,7 +473,8 @@ impl Tools {
             },
             split_threshold_small_top: match s {
                 0..=3 => 0,
-                4 | 5 => 200,
+                4 => 250,
+                5 => 200,
                 6 => 100,
                 _ => 150,
             },
@@ -516,7 +522,13 @@ impl Tools {
             },
             angle_delta: if s <= 8 { 2 } else { 0 },
             angle_delta_uv: s <= 8,
-            intra_early: if (4..=8).contains(&s) { 120 } else { 0 },
+            // 1.1x at speed 4, which spends the time on its inter
+            // candidates instead (1.0x: +0.1 % PSNR-YUV; 0.8x: +0.8 %).
+            intra_early: match s {
+                4 => 110,
+                5..=8 => 120,
+                _ => 0,
+            },
             // One trial from speed 4: as much gain for less time.
             inter_tool_trials: if s >= 4 { 1 } else { 2 },
             force_inter_tool: 0,

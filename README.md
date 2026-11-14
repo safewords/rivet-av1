@@ -1027,6 +1027,32 @@ search, +1.4 % (+1.3 %). At speed 8 restoration outside the top layers
 would gain −0.6 % (−0.4 %) for about 1.02x, which its 0.973x does not
 quite leave room for at a margin worth having.
 
+Speed 4 then took a fourth inter candidate (`inter_candidates` 4:
+−0.75 % (−0.73 %) for 1.06x the time) and bought the time back from the
+split thresholds and the intra early-out: the small blocks split below
+1.25 lambda per sample instead of 0.75, 2.5 in the groups' top layers
+instead of 2.0, and intra ranked within 1.1x instead of 1.2x
+(`intra_early` 110; 100 is +0.1 % PSNR-YUV, 80 +0.8 %). Against the
+encoder before, −0.40 % (−0.42 %); against rav1e, **−4.65 % (−0.18 %)**
+at **0.997x** its one-thread CPU time (the five clips at all five
+quantisers, one encode at a time, interleaved with rav1e and the encoder
+before, which came to 0.975x in the same run). Per clip: foreman +4.3 %
+(+6.5 %), mobile −13.8 % (−7.2 %), akiyo +1.2 % (+3.4 %), ducks_take_off
+−9.9 % (−3.1 %), park_joy −5.0 % (−0.6 %). Measured on the way and left
+out: the inter candidate with the split thresholds alone at 1.0 or 1.5
+(1.015x, −0.15 % PSNR-YUV; 1.000x, +0.01 %), restoration off in the top
+layers, `rdoq_uv` 0, the 32x32 blocks' threshold at 0.2 in the top
+layers (each ±0 to +0.3 % for about 0.99x).
+
+So every tier is at parity with rav1e 0.8.1 on both measures, under its
+one-thread time:
+
+| speed | BD-rate PSNR-Y (PSNR-YUV) against rav1e | time / rav1e |
+|---|---|---|
+| 4 | −4.65 % (−0.18 %) | 0.997x |
+| 6 | −5.38 % (−0.86 %) | 0.982x |
+| 8 | −4.67 % (−0.37 %) | 0.973x |
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -1132,11 +1158,11 @@ Not there yet:
   it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
   clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
-- **PSNR-YUV at rav1e's time at speed 4**: 0.3 % behind (PSNR-Y 4.2 %
-  ahead; speeds 6 and 8 at parity on both, under rav1e's time: above).
-  The 32x32 blocks' halves would close it, for 1.19x rav1e's time.
-  foreman trails at every tier (+3.0 % to +5.4 % PSNR-Y, +5.9 % to
-  +7.6 % PSNR-YUV, mostly V), and akiyo in PSNR-YUV at speed 4. rav1e's
+- **foreman, and the margin at speed 4**: every tier is at parity with
+  rav1e on average (above), speed 4 with the least room (−0.18 %
+  PSNR-YUV at 0.997x its time). foreman trails at every tier (+3.0 % to
+  +4.3 % PSNR-Y, +5.9 % to +6.5 % PSNR-YUV, mostly V), and akiyo in
+  PSNR-YUV at speed 4. rav1e's
   inter frames code smaller blocks, each with one transform, but in this
   search splitting every block is worth under 1 % (above): what is left
   of foreman's gap is not in the split decision.
