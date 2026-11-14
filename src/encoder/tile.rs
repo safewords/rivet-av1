@@ -1187,11 +1187,61 @@ impl TileDecoder<'_, '_> {
             // A coarse square search (step 2), then a fine one around the best.
             let mut step_best = best;
             for dy in (-range..=range).step_by(2) {
-                for dx in (-range..=range).step_by(2) {
-                    let c = cost(cx + dx, cy + dy, step_best.2);
-                    if c < step_best.2 {
-                        step_best = (cx + dx, cy + dy, c);
+                let mut dx = -range;
+                while dx <= range {
+                    // Four candidates at once where they lie inside the
+                    // reference: their SADs against the limit the first of
+                    // them would have, then taken in order as `cost` takes
+                    // them (a SAD over a larger limit is over its own).
+                    let (nx, ny) = (cx + dx, cy + dy);
+                    if dx + 6 <= range
+                        && x0 + nx >= 0
+                        && x0 + nx + 6 + w as i32 - 1 <= last_x
+                        && y0 + ny >= 0
+                        && y0 + ny + h as i32 - 1 <= last_y
+                    {
+                        let rate = |k: i32| {
+                            lambda
+                                * (mv_bits(ny * 8 - pred_mv[0])
+                                    + mv_bits((nx + 2 * k) * 8 - pred_mv[1]))
+                        };
+                        let rates = [rate(0), rate(1), rate(2), rate(3)];
+                        let low = rates.iter().copied().fold(f64::MAX, f64::min);
+                        let sads = if low >= step_best.2 {
+                            [u64::MAX; 4]
+                        } else {
+                            let st = e.stride[0];
+                            let ro = (y0 + ny) as usize * rp.stride + (x0 + nx) as usize;
+                            crate::dsp::enc::sad4_step2(
+                                &e.src[0][y0 as usize * st + x0 as usize..],
+                                st,
+                                &rp.data[ro..],
+                                rp.stride,
+                                w,
+                                h,
+                                (step_best.2 - low).min(1e18) as u64,
+                            )
+                        };
+                        for (k, (&s, &rate)) in sads.iter().zip(&rates).enumerate() {
+                            if rate >= step_best.2 || s == u64::MAX {
+                                continue;
+                            }
+                            if s > (step_best.2 - rate).min(1e18) as u64 {
+                                continue;
+                            }
+                            let c = s as f64 + rate;
+                            if c < step_best.2 {
+                                step_best = (nx + 2 * k as i32, ny, c);
+                            }
+                        }
+                        dx += 8;
+                        continue;
                     }
+                    let c = cost(nx, ny, step_best.2);
+                    if c < step_best.2 {
+                        step_best = (nx, ny, c);
+                    }
+                    dx += 2;
                 }
             }
             best = step_best;

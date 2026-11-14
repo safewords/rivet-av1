@@ -179,6 +179,106 @@ unsafe fn sad_neon(
     s
 }
 
+/// The SADs of `a` against four blocks of `b` side by side, starting at
+/// `b` and at 2, 4 and 6 samples right of it (four candidates of a motion
+/// search on a grid of 2): each the exact sum, or `u64::MAX` if it
+/// exceeds `limit` — as [`sad`] gives them one by one with that limit.
+/// `b` holds `w + 6` samples in each of the `h` rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sad4_step2(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    limit: u64,
+) -> [u64; 4] {
+    #[cfg(target_arch = "aarch64")]
+    if w >= 4 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        return unsafe { sad4_step2_neon(a, a_stride, b, b_stride, w, h, limit) };
+    }
+    sad4_step2_scalar(a, a_stride, b, b_stride, w, h, limit)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sad4_step2_scalar(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    limit: u64,
+) -> [u64; 4] {
+    std::array::from_fn(|k| sad(a, a_stride, &b[2 * k..], b_stride, w, h, limit))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sad4_step2_neon(
+    a: &[u16],
+    a_stride: usize,
+    b: &[u16],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+    limit: u64,
+) -> [u64; 4] {
+    use std::arch::aarch64::*;
+    let mut s = [0u64; 4];
+    // As in `sad_neon`: four rows between checks, lanes of 32 bits.
+    let mut i = 0;
+    while i < h {
+        let rows = (h - i).min(4);
+        let mut acc = [vdupq_n_u32(0); 4];
+        let mut acc4 = [vdup_n_u32(0); 4];
+        let mut tail = [0u32; 4];
+        for r in i..i + rows {
+            let ra = &a[r * a_stride..r * a_stride + w];
+            let rb = &b[r * b_stride..r * b_stride + w + 6];
+            let mut j = 0;
+            while j + 8 <= w {
+                // SAFETY: j + 8 <= w, and the row of `b` holds w + 6.
+                unsafe {
+                    let x = vld1q_u16(ra.as_ptr().add(j));
+                    for (k, acc) in acc.iter_mut().enumerate() {
+                        let y = vld1q_u16(rb.as_ptr().add(j + 2 * k));
+                        *acc = vpadalq_u16(*acc, vabdq_u16(x, y));
+                    }
+                }
+                j += 8;
+            }
+            if j + 4 <= w {
+                // SAFETY: j + 4 <= w, and the row of `b` holds w + 6.
+                unsafe {
+                    let x = vld1_u16(ra.as_ptr().add(j));
+                    for (k, acc4) in acc4.iter_mut().enumerate() {
+                        let y = vld1_u16(rb.as_ptr().add(j + 2 * k));
+                        *acc4 = vpadal_u16(*acc4, vabd_u16(x, y));
+                    }
+                }
+                j += 4;
+            }
+            for (k, t) in tail.iter_mut().enumerate() {
+                for m in j..w {
+                    *t += (ra[m] as i32 - rb[m + 2 * k] as i32).unsigned_abs();
+                }
+            }
+        }
+        for k in 0..4 {
+            s[k] += (vaddvq_u32(acc[k]) + vaddv_u32(acc4[k]) + tail[k]) as u64;
+        }
+        if s.iter().all(|&v| v > limit) {
+            return [u64::MAX; 4];
+        }
+        i += rows;
+    }
+    s.map(|v| if v > limit { u64::MAX } else { v })
+}
+
 /// Sum of squared differences of two rows.
 pub(crate) fn sse_row(a: &[u16], b: &[u16]) -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -541,6 +641,24 @@ mod tests {
                     sse_row(&a[..w], &b[3..3 + w]),
                     sse_row_scalar(&a[..w], &b[3..3 + w])
                 );
+            }
+            // Four candidates side by side.
+            for (w, h) in [
+                (4, 4),
+                (8, 8),
+                (12, 4),
+                (16, 16),
+                (32, 8),
+                (64, 64),
+                (128, 128),
+            ] {
+                for limit in [u64::MAX, 0, 100, 1000, 20_000, 300_000] {
+                    assert_eq!(
+                        sad4_step2(&a, 160, &b, 136, w, h, limit),
+                        sad4_step2_scalar(&a, 160, &b, 136, w, h, limit),
+                        "sad4 {w}x{h} limit {limit}"
+                    );
+                }
             }
             // The SAD of any rectangle, against limits it passes at
             // different rows.
