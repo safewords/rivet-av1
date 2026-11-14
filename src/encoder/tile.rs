@@ -505,6 +505,20 @@ impl TileDecoder<'_, '_> {
         self.b.is_inter = false;
         self.b.ref_frame = [INTRA_FRAME, NONE];
         inter.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Skip mode, where the frame has it: the cheapest of blocks, always
+        // trialled.
+        let skip_mode = (self.f.hdr.skip_mode_present
+            && block_width(ms) >= 8
+            && block_height(ms) >= 8)
+            .then(|| Plan {
+                skip: true,
+                skip_mode: true,
+                is_inter: true,
+                y_mode: NEAREST_NEARESTMV,
+                ref_frame: self.f.hdr.skip_mode_frame[0],
+                ref_frame2: self.f.hdr.skip_mode_frame[1],
+                ..Default::default()
+            });
         // Intra is worth a trial only when its SATD is near the best inter's.
         let best_inter = inter.first().map_or(f64::MAX, |x| x.1);
         let intra_keep = out
@@ -516,6 +530,7 @@ impl TileDecoder<'_, '_> {
             .take(tools.inter_candidates.max(1) as usize)
             .map(|x| x.0)
             .collect();
+        all.extend(skip_mode);
         all.extend(intra_keep);
         all
     }

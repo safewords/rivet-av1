@@ -150,18 +150,29 @@ fn main() {
                 let mut dec = Decoder::new();
                 let mut bytes = 0usize;
                 let mut qs = Vec::new();
-                for i in 0..frames {
-                    let f = make(i);
-                    let tu = enc.encode(&f).unwrap();
+                let mut shown = 0;
+                let mut take = |tu: Vec<u8>, enc: &Encoder| {
                     bytes += tu.len();
-                    qs.push(enc.quantizer());
                     let d = dec.decode(&tu).unwrap().expect("a shown frame");
                     let r = enc.reconstruction().unwrap();
                     assert!(
                         d.data == r.data,
-                        "{name} frame {i}: decoder != reconstruction"
+                        "{name} frame {shown}: decoder != reconstruction"
                     );
+                    shown += 1;
+                };
+                for i in 0..frames {
+                    let f = make(i);
+                    let tu = enc.encode(&f).unwrap();
+                    qs.push(enc.quantizer());
+                    if !tu.is_empty() {
+                        take(tu, &enc);
+                    }
                 }
+                while let Some(tu) = enc.flush().unwrap() {
+                    take(tu, &enc);
+                }
+                assert_eq!(shown, frames, "{name}: a temporal unit per frame");
                 let secs = frames as f64 / 30.0;
                 let got = bytes as f64 * 8.0 / secs / 1000.0;
                 results.lock().unwrap().push((

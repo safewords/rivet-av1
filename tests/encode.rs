@@ -79,7 +79,8 @@ fn synthetic(w: u32, h: u32, t: u32, bit_depth: u32) -> Frame {
 
 /// Encodes `frames`; decodes every packet with a fresh decoder and checks
 /// it against the encoder's reconstruction. Returns the decoded frames and
-/// the packet sizes.
+/// the packet sizes, in display order (the packets of a group of frames
+/// come out late, `Encoder::flush` handing out the last).
 fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
     let mut enc = Encoder::new(cfg);
     let mut dec = Decoder::new();
@@ -88,8 +89,8 @@ fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
     dec.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
     let mut out = Vec::new();
     let mut sizes = Vec::new();
-    for (i, f) in frames.iter().enumerate() {
-        let pkt = enc.encode(f).unwrap();
+    let mut take = |pkt: Vec<u8>, enc: &Encoder| {
+        let i = out.len();
         sizes.push(pkt.len());
         let d = dec
             .decode(&pkt)
@@ -101,7 +102,17 @@ fn round_trip(cfg: Config, frames: &[Frame]) -> (Vec<Frame>, Vec<usize>) {
             "frame {i}: decoded frame differs from the encoder's reconstruction"
         );
         out.push(d);
+    };
+    for f in frames {
+        let pkt = enc.encode(f).unwrap();
+        if !pkt.is_empty() {
+            take(pkt, &enc);
+        }
     }
+    while let Some(pkt) = enc.flush().unwrap() {
+        take(pkt, &enc);
+    }
+    assert_eq!(out.len(), frames.len(), "a packet per frame");
     (out, sizes)
 }
 
@@ -211,6 +222,9 @@ fn forced_key_frames() {
     let frames: Vec<Frame> = (0..9).map(|t| synthetic(64, 48, t, 8)).collect();
     let mut cfg = cfg_for(64, 48);
     cfg.keyframe_interval = 4;
+    // (A unit a frame as it comes; alt_ref_groups_round_trip forces key
+    // frames in groups.)
+    cfg.altref = 0;
     let mut enc = Encoder::new(cfg);
     let mut keys = Vec::new();
     let mut packets = Vec::new();
@@ -263,17 +277,17 @@ fn tiles() {
 /// chroma from luma) on a small natural crop, and palettes on a frame of
 /// few colours: decoded to the reconstruction. Cheap enough for the
 /// overflow-checked run.
-/// Hidden alt-ref groups: the encoder holds frames, then hands out one
-/// temporal unit per frame in order (the first of each group carrying the
-/// hidden alt-ref frame, the last a `show_existing_frame`), each decoding
-/// to the reconstruction it reports; key frames forced or by the interval
-/// cut the groups.
+/// Alt-ref groups: the encoder holds frames, then hands out one temporal
+/// unit per frame in order (the first of each group carrying the hidden
+/// frames of the pyramid coded before it, the hidden ones shown with
+/// `show_existing_frame`), each decoding to the reconstruction it reports;
+/// key frames forced or by the interval cut the groups, and the stream
+/// ends in the middle of one.
 #[test]
 fn alt_ref_groups_round_trip() {
     let src = natural(13);
     let mut cfg = cfg_for(src[0].width, src[0].height);
-    cfg.altref = 4;
-    cfg.tools.multi_ref = true;
+    cfg.altref = 8;
     cfg.keyframe_interval = 9;
     cfg.quantizer = 100;
     let mut enc = Encoder::new(cfg);
@@ -283,6 +297,7 @@ fn alt_ref_groups_round_trip() {
     let mut check = |tu: Vec<u8>, enc: &Encoder| {
         let d = dec.decode(&tu).unwrap().expect("a shown frame per unit");
         assert_eq!(&d, enc.reconstruction().unwrap(), "frame {shown}");
+        assert_eq!(enc.last_was_keyframe(), [0, 9, 11].contains(&shown));
         assert!(
             psnr(&src[shown], &d, 0) > 28.0,
             "frame {shown} shown in order"
@@ -294,6 +309,7 @@ fn alt_ref_groups_round_trip() {
         if i == 11 {
             enc.force_keyframe();
         }
+        assert_eq!(enc.next_is_keyframe(), [0, 9, 11].contains(&i), "frame {i}");
         let tu = enc.encode(f).unwrap();
         if tu.is_empty() {
             held += 1;
@@ -436,20 +452,27 @@ fn natural_video_quality_tracks_the_quantiser() {
 }
 
 /// Average-bitrate mode spends its budget: over 24 frames of natural video
-/// (a key frame first), within 8 % of the target (`examples/av1_ratetest.rs`
+/// (a key frame first) coded as they come, and 64 in alt-ref groups,
+/// within 8 % of the target (`examples/av1_ratetest.rs`
 /// measures 10-second clips of several kinds).
 #[test]
 fn rate_control_tracks_the_target() {
-    let src = natural(24);
-    for target in [8_000u64, 30_000] {
+    let src = natural(64);
+    for (target, altref) in [(8_000u64, 0), (30_000, 0), (8_000, 16), (30_000, 16)] {
+        // (24 frames a frame at a time; groups of 16 are planned a group
+        // at a time, and take longer to settle.)
+        let src = if altref == 0 { &src[..24] } else { &src[..] };
         let mut cfg = cfg_for(src[0].width, src[0].height);
+        cfg.altref = altref;
         cfg.quantizer = 60;
         cfg.keyframe_interval = 100;
         cfg.target_bits_per_frame = Some(target);
-        let (_, sizes) = round_trip(cfg, &src);
+        let (_, sizes) = round_trip(cfg, src);
         let bits: u64 = sizes.iter().map(|&s| s as u64 * 8).sum();
         let ratio = bits as f64 / (target * sizes.len() as u64) as f64;
-        eprintln!("rate control: target {target} bits a frame, sizes {sizes:?}, {ratio:.3}x");
+        eprintln!(
+            "rate control: target {target} bits a frame, alt-ref groups {altref}, sizes {sizes:?}, {ratio:.3}x"
+        );
         assert!((0.92..1.08).contains(&ratio), "{ratio:.3}x the target");
     }
 }

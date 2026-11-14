@@ -6,8 +6,8 @@
 //!
 //! Settings are `name=value`: `speed`, `tiles` (tile columns, log2),
 //! `threads`, `frames` (at most this many), `key` (key frame interval),
-//! `bitrate` (bits per second at 30 frames/s), and the `Tools` switches
-//! by name (after `speed`).
+//! `bitrate` (bits per second at 30 frames/s), `altref` (the alt-ref
+//! group, 0 for none), and the `Tools` switches by name (after `speed`).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(("threads", v)) => cfg.threads = v.parse()?,
             Some(("frames", v)) => max_frames = v.parse()?,
             Some(("key", v)) => cfg.keyframe_interval = v.parse()?,
+            Some(("altref", v)) => cfg.altref = v.parse()?,
             Some(("bitrate", v)) => {
                 // Bits per second at 30 frames/s.
                 cfg.target_bits_per_frame = Some(v.parse::<u64>()? / 30);
@@ -88,12 +89,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = av1::ivf::IvfWriter::new(w as u16, h as u16, 30, 1);
     let start = std::time::Instant::now();
     let mut n = 0;
-    for (i, chunk) in frames.iter().take(max_frames).enumerate() {
+    // (With alt-ref groups the encoder holds frames: a temporal unit comes
+    // out for each frame, in order, but later.)
+    let mut shown = 0u64;
+    for chunk in frames.iter().take(max_frames) {
         let mut f = av1::Frame::new(w, h, bd, av1::ChromaFormat::Yuv420);
         f.data.copy_from_slice(chunk);
         let pkt = enc.encode(&f)?;
-        out.frame(i as u64, &pkt);
+        if !pkt.is_empty() {
+            out.frame(shown, &pkt);
+            shown += 1;
+        }
         n += 1;
+    }
+    while let Some(pkt) = enc.flush()? {
+        out.frame(shown, &pkt);
+        shown += 1;
     }
     let secs = start.elapsed().as_secs_f64();
     let bytes = out.finish();

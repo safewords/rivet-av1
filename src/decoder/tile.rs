@@ -94,6 +94,9 @@ pub(crate) struct Block {
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Plan {
     pub(crate) skip: bool,
+    /// Skip mode: the block predicted from the frame's two skip mode
+    /// references with their nearest vectors, and no residual.
+    pub(crate) skip_mode: bool,
     pub(crate) is_inter: bool,
     pub(crate) y_mode: usize,
     pub(crate) uv_mode: usize,
@@ -1042,7 +1045,10 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             if self.b.avail_l {
                 ctx += self.mi(self.b.mi_row, self.b.mi_col - 1).skip_mode as usize;
             }
-            self.b.skip_mode = self.sd.read_symbol(&mut self.cdf.skip_mode[ctx]) != 0;
+            self.b.skip_mode = self
+                .sd
+                .symbol(&mut self.cdf.skip_mode[ctx], self.plan.skip_mode as usize)
+                != 0;
         }
     }
 
@@ -2090,12 +2096,17 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let ctx_comp_bwdref_p1 = self.ref_ctx(&[BWDREF_FRAME], &[ALTREF2_FRAME]);
         if comp_mode == 1 {
             let ctx = self.comp_ref_type_ctx();
-            // The encoder plans unidirectional pairs: LAST with LAST2 or
-            // with GOLDEN.
-            let r2 = self.plan.ref_frame2;
+            // The encoder plans unidirectional pairs (LAST with LAST2,
+            // LAST3 or GOLDEN) and bidirectional ones (a forward reference
+            // with a backward one).
+            let (r1, r2) = (self.plan.ref_frame, self.plan.ref_frame2);
             let comp_ref_type = self.sd.symbol(
                 &mut self.cdf.comp_ref_type[ctx],
-                UNIDIR_COMP_REFERENCE as usize,
+                if r2 >= BWDREF_FRAME && r1 < BWDREF_FRAME {
+                    BIDIR_COMP_REFERENCE
+                } else {
+                    UNIDIR_COMP_REFERENCE
+                } as usize,
             ) as u32;
             if comp_ref_type == UNIDIR_COMP_REFERENCE {
                 let uni = self
@@ -2124,25 +2135,32 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                     }
                 }
             } else {
-                let comp_ref = self.sd.read_symbol(&mut self.cdf.comp_ref[ctx_comp_ref][0]);
+                let comp_ref = self.sd.symbol(
+                    &mut self.cdf.comp_ref[ctx_comp_ref][0],
+                    (r1 >= LAST3_FRAME) as usize,
+                );
                 if comp_ref == 0 {
-                    let p1 = self
-                        .sd
-                        .read_symbol(&mut self.cdf.comp_ref[ctx_comp_ref_p1][1]);
+                    let p1 = self.sd.symbol(
+                        &mut self.cdf.comp_ref[ctx_comp_ref_p1][1],
+                        (r1 == LAST2_FRAME) as usize,
+                    );
                     self.b.ref_frame[0] = if p1 != 0 { LAST2_FRAME } else { LAST_FRAME };
                 } else {
-                    let p2 = self
-                        .sd
-                        .read_symbol(&mut self.cdf.comp_ref[ctx_comp_ref_p2][2]);
+                    let p2 = self.sd.symbol(
+                        &mut self.cdf.comp_ref[ctx_comp_ref_p2][2],
+                        (r1 == GOLDEN_FRAME) as usize,
+                    );
                     self.b.ref_frame[0] = if p2 != 0 { GOLDEN_FRAME } else { LAST3_FRAME };
                 }
-                let bwd = self
-                    .sd
-                    .read_symbol(&mut self.cdf.comp_bwd_ref[ctx_comp_bwdref][0]);
+                let bwd = self.sd.symbol(
+                    &mut self.cdf.comp_bwd_ref[ctx_comp_bwdref][0],
+                    (r2 == ALTREF_FRAME) as usize,
+                );
                 if bwd == 0 {
-                    let p1 = self
-                        .sd
-                        .read_symbol(&mut self.cdf.comp_bwd_ref[ctx_comp_bwdref_p1][1]);
+                    let p1 = self.sd.symbol(
+                        &mut self.cdf.comp_bwd_ref[ctx_comp_bwdref_p1][1],
+                        (r2 == ALTREF2_FRAME) as usize,
+                    );
                     self.b.ref_frame[1] = if p1 != 0 { ALTREF2_FRAME } else { BWDREF_FRAME };
                 } else {
                     self.b.ref_frame[1] = ALTREF_FRAME;

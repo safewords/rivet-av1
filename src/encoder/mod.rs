@@ -17,6 +17,7 @@
 mod aq;
 pub(crate) mod cdef;
 pub(crate) mod fwd;
+mod gop;
 pub(crate) mod lr;
 mod rc;
 pub(crate) mod rdo;
@@ -38,6 +39,10 @@ use crate::{Error, Result};
 
 /// The default [`Config::speed`].
 pub const DEFAULT_SPEED: u32 = 4;
+
+/// The default [`Config::altref`]: groups of 16 frames (−1 % BD-rate
+/// against groups of 8, and against 32, on the test clips).
+pub const DEFAULT_ALTREF: u32 = 16;
 
 /// Encoder settings.
 #[derive(Debug, Clone)]
@@ -82,15 +87,21 @@ pub struct Config {
     /// Threads coding tiles in parallel (with several tile columns); 1
     /// codes on the caller's thread.
     pub threads: usize,
-    /// Hidden alt-ref frames: frames are coded in groups of this many (3 or
-    /// more; 0 off), the last frame of each group first, as a frame not
-    /// shown (finer, a backward reference for the others), then the others
-    /// in order, then a `show_existing_frame` showing it. The encoder holds
-    /// up to this many frames: [`Encoder::encode`] returns an empty vector
-    /// while it does, and [`Encoder::flush`] returns the rest. Needs
-    /// `Tools::multi_ref`. Off by default: without temporal filtering of
-    /// the alt-ref frame it has not paid on the encoder's test clips (+2 %
-    /// BD-rate in groups of 8 at speed 4, ±0 at speed 6).
+    /// Alt-ref groups: frames are coded in groups of this many (3 or more,
+    /// up to 32; 0 or less than 3: every frame in display order, as it
+    /// comes), in a pyramid: the last frame of each group first, not shown
+    /// and coded finest, then the frame half way to it, not shown either,
+    /// and so on down, each frame predicted from the nearest coded frames
+    /// on both sides and coded coarser the fewer frames refer to it; each
+    /// hidden frame is shown with a `show_existing_frame` in its turn (see
+    /// `encoder::gop`). [`DEFAULT_ALTREF`] by default; used where the
+    /// rate-distortion search runs (`Tools::rdo`: speeds 0 to 8).
+    ///
+    /// The encoder holds a group's frames until the last of them comes:
+    /// [`Encoder::encode`] returns an empty vector for the first frames
+    /// (the delay is up to this many frames), then a temporal unit a call
+    /// in order, and [`Encoder::flush`] the rest. A stream may end anywhere
+    /// in a group.
     pub altref: u32,
     /// Luma only (`mono_chrome` = 1): the encoder takes
     /// [`ChromaFormat::Mono`] frames and codes one plane. An AVIF alpha
@@ -333,7 +344,7 @@ impl Config {
             tile_cols_log2: 0,
             tools: Tools::for_speed(DEFAULT_SPEED),
             threads: 1,
-            altref: 0,
+            altref: DEFAULT_ALTREF,
             monochrome: false,
         }
     }
@@ -350,14 +361,23 @@ pub struct Encoder {
     frame_num: u64,
     /// Frames shown so far: the display index (order hint) of the next.
     shown: u64,
-    /// Frames waiting for their group (alt-ref mode), and whether a key
-    /// frame was forced at each.
+    /// Frames waiting for their group (alt-ref groups), and whether each
+    /// is to be a key frame.
     queue: std::collections::VecDeque<(Frame, bool)>,
+    /// Frames taken, and since the last key frame among them.
+    received: u64,
+    received_since_key: u64,
     /// Temporal units ready to hand out (alt-ref mode), each with its shown
     /// frame's reconstruction and whether it is a key frame.
     ready: std::collections::VecDeque<(Vec<u8>, Option<Frame>, bool)>,
-    /// The slot of the hidden alt-ref frame not yet shown.
-    arf_slot: Option<usize>,
+    /// The display indices of the hidden frames not yet shown (alt-ref
+    /// groups).
+    pending: Vec<u64>,
+    /// The display index of the group's anchor: the last key frame or
+    /// alt-ref frame shown (alt-ref groups), kept as a reference.
+    anchor: u64,
+    /// Rate control's plan for the group being coded.
+    group_plan: Option<GroupPlan>,
     /// Frames since the last key frame.
     since_key: u64,
     /// The next frame is to be a key frame whatever the interval says.
@@ -372,6 +392,9 @@ pub struct Encoder {
     recon: Option<Frame>,
     /// The frame number each reference slot holds.
     slot_frame: [u64; NUM_REF_FRAMES],
+    /// The pyramid layer of the frame each slot holds (0: a key or alt-ref
+    /// frame).
+    slot_layer: [u8; NUM_REF_FRAMES],
     /// The slots of `LAST_FRAME` and `LAST2_FRAME`.
     last_slot: usize,
     last2_slot: usize,
@@ -382,6 +405,23 @@ pub struct Encoder {
 /// The slot the golden frame (the key frame, or a periodic boosted frame)
 /// lives in when several references are used.
 const GOLDEN_SLOT: usize = 2;
+
+/// Rate control's plan for a group of frames.
+struct GroupPlan {
+    /// The plan's quantiser.
+    q: u32,
+    /// The display index of the group's first frame.
+    first: u64,
+    /// Each frame's layer and complexity, in display order.
+    frames: Vec<(u8, rc::Complexity)>,
+}
+
+impl GroupPlan {
+    /// The layer and complexity of the frame of display index `hint`.
+    fn frame(&self, hint: u64) -> (u8, rc::Complexity) {
+        self.frames[(hint - self.first) as usize]
+    }
+}
 
 /// What one frame's header says, as the encoder chooses it.
 #[derive(Clone, Debug)]
@@ -418,10 +458,17 @@ struct FrameParams {
 enum Role {
     Key,
     Inter,
-    /// A hidden alt-ref frame: the frame `ahead` frames after the next
-    /// shown one.
-    AltRef {
-        ahead: u64,
+    /// A frame of an alt-ref group: its display index, its layer of the
+    /// pyramid (0 the alt-ref frame), whether it is of the group's top
+    /// layer (a reference for few frames, if any), and whether it is shown
+    /// now or hidden until a `show_existing_frame`.
+    Group {
+        hint: u64,
+        layer: u8,
+        top: bool,
+        /// The group's top layer.
+        depth: u8,
+        show: bool,
     },
 }
 
@@ -479,7 +526,10 @@ impl Encoder {
             enable_dual_filter: false,
             enable_order_hint: true,
             enable_jnt_comp: false,
-            enable_ref_frame_mvs: false,
+            // The motion field projected from the references (7.9): their
+            // vectors as candidates (-1.8 % BD-rate without alt-ref groups,
+            // -1.1 % with them).
+            enable_ref_frame_mvs: true,
             // Screen content tools chosen per frame when palettes may be
             // used.
             seq_force_screen_content_tools: if cfg.tools.palette {
@@ -519,6 +569,7 @@ impl Encoder {
                 cfg.bit_depth,
                 cfg.keyframe_interval,
                 cfg.quantizer,
+                cfg.altref >= 3 && cfg.tools.rdo,
             )
         });
         let mut dec = Decoder::new();
@@ -530,8 +581,12 @@ impl Encoder {
             frame_num: 0,
             shown: 0,
             queue: Default::default(),
+            received: 0,
+            received_since_key: 0,
             ready: Default::default(),
-            arf_slot: None,
+            pending: Vec::new(),
+            anchor: 0,
+            group_plan: None,
             since_key: 0,
             force_key: false,
             last_key: false,
@@ -540,6 +595,7 @@ impl Encoder {
             prev_src: None,
             recon: None,
             slot_frame: [0; NUM_REF_FRAMES],
+            slot_layer: [0; NUM_REF_FRAMES],
             last_slot: 0,
             last2_slot: 1,
             next_screen_content: false,
@@ -560,11 +616,12 @@ impl Encoder {
         self.force_key = true;
     }
 
-    /// Whether the next frame will be a key frame.
+    /// Whether the next frame given to [`Encoder::encode`] will be a key
+    /// frame.
     pub fn next_is_keyframe(&self) -> bool {
         self.force_key
-            || self.shown == 0
-            || self.since_key >= self.cfg.keyframe_interval.max(1) as u64
+            || self.received == 0
+            || self.received_since_key >= self.cfg.keyframe_interval.max(1) as u64
     }
 
     /// Whether the last frame encoded was a key frame.
@@ -582,8 +639,12 @@ impl Encoder {
         self.q.round().clamp(1.0, 255.0) as u32
     }
 
-    /// Encodes one frame and returns its temporal unit (temporal delimiter,
-    /// sequence header and metadata on key frames, frame OBU).
+    /// Takes one frame and returns the next temporal unit (temporal
+    /// delimiter, sequence header and metadata on key frames, the frame
+    /// OBUs): this frame's, or with alt-ref groups ([`Config::altref`]) an
+    /// earlier frame's in order, or an empty vector while the encoder
+    /// holds the frames of a group. [`Encoder::reconstruction`] and
+    /// [`Encoder::last_was_keyframe`] are of the frame the unit shows.
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         let cfg = &self.cfg;
         if frame.width != cfg.width || frame.height != cfg.height {
@@ -605,31 +666,41 @@ impl Encoder {
             return Err(Error::invalid("bit depth must be 8 or 10"));
         }
         check_color(&cfg.color)?;
+        let key = self.next_is_keyframe();
+        self.force_key = false;
+        self.received += 1;
+        self.received_since_key = if key { 1 } else { self.received_since_key + 1 };
         if !self.altref_groups() {
-            let key = self.next_is_keyframe();
-            self.force_key = false;
             let (obus, recon) = self.code_one(frame, if key { Role::Key } else { Role::Inter })?;
             let tu = self.temporal_unit(key, &[], &obus);
             self.recon = recon;
             self.last_key = key;
             return Ok(tu);
         }
-        let forced = std::mem::take(&mut self.force_key);
-        self.queue.push_back((frame.clone(), forced));
+        self.queue.push_back((frame.clone(), key));
         self.pump(false)?;
         Ok(self.pop_ready().unwrap_or_default())
     }
 
     /// The temporal units of the frames the encoder still holds (alt-ref
-    /// mode), one a call, in order; `None` once there are none. The
+    /// groups), one a call, in order; `None` once there are none. The
     /// encoder can take more frames afterwards.
     pub fn flush(&mut self) -> Result<Option<Vec<u8>>> {
         self.pump(true)?;
         Ok(self.pop_ready())
     }
 
+    /// Whether frames are coded in alt-ref groups: asked for, and with the
+    /// rate-distortion search, which searches the references after a
+    /// frame (without it, speeds 9 and 10, groups cost 3 % to 7 %).
     fn altref_groups(&self) -> bool {
-        self.cfg.altref >= 3 && self.cfg.tools.multi_ref
+        self.cfg.altref >= 3 && self.cfg.tools.rdo
+    }
+
+    /// The frames of a group (up to 32: the order hints of a group's
+    /// frames stay within half their range of each other).
+    fn group_len(&self) -> u64 {
+        self.cfg.altref.min(32) as u64
     }
 
     /// The next ready temporal unit, its reconstruction and key flag made
@@ -644,9 +715,8 @@ impl Encoder {
     /// Codes the frames held whose group is complete (all of them when
     /// `all`).
     fn pump(&mut self, all: bool) -> Result<()> {
-        while let Some(&(_, forced)) = self.queue.front() {
-            let interval = self.cfg.keyframe_interval.max(1) as u64;
-            if forced || self.shown == 0 || self.since_key >= interval {
+        while let Some(&(_, key)) = self.queue.front() {
+            if key {
                 let (frame, _) = self.queue.pop_front().expect("a frame");
                 let (obus, recon) = self.code_one(&frame, Role::Key)?;
                 let tu = self.temporal_unit(true, &[], &obus);
@@ -654,44 +724,118 @@ impl Encoder {
                 continue;
             }
             // The group: up to the alt-ref interval, not past the next key
-            // frame (by the interval, or forced).
-            let mut g = (self.cfg.altref as u64).min(interval - self.since_key) as usize;
+            // frame (held, or not yet taken).
+            let interval = self.cfg.keyframe_interval.max(1) as u64;
+            let mut g =
+                self.group_len()
+                    .min(interval.saturating_sub(self.since_key).max(1)) as usize;
             if let Some(k) = self.queue.iter().skip(1).position(|q| q.1) {
                 g = g.min(k + 1);
             }
-            if self.queue.len() < g {
-                if !all {
-                    break;
-                }
-                g = self.queue.len();
+            if self.queue.len() < g && !all {
+                break;
             }
-            if g < 3 {
-                let (frame, _) = self.queue.pop_front().expect("a frame");
-                let (obus, recon) = self.code_one(&frame, Role::Inter)?;
-                let tu = self.temporal_unit(false, &[], &obus);
-                self.ready.push_back((tu, recon, false));
-                continue;
-            }
-            // The alt-ref first, hidden; it goes out with the first frame.
-            let arf = self.queue[g - 1].0.clone();
-            let (mut hidden, _) = self.code_one(
-                &arf,
-                Role::AltRef {
-                    ahead: g as u64 - 1,
-                },
-            )?;
-            for _ in 0..g - 1 {
-                let (frame, _) = self.queue.pop_front().expect("a frame");
-                let (obus, recon) = self.code_one(&frame, Role::Inter)?;
-                let tu = self.temporal_unit(false, &hidden, &obus);
-                hidden.clear();
-                self.ready.push_back((tu, recon, false));
-            }
-            self.queue.pop_front();
-            let (tu, recon) = self.show_alt_ref()?;
-            self.ready.push_back((tu, recon, false));
+            g = g.min(self.queue.len());
+            self.code_group(g)?;
         }
         Ok(())
+    }
+
+    /// Codes the next `g` frames held as a group (see `gop`): its temporal
+    /// units, one a frame, made ready.
+    fn code_group(&mut self, g: usize) -> Result<()> {
+        let steps = gop::plan(g as u32);
+        let top = steps
+            .iter()
+            .map(|s| match *s {
+                gop::Step::Code { layer, .. } => layer,
+                gop::Step::Show { .. } => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        let base = self.shown;
+        if self.rc.is_some() {
+            self.plan_group(&steps, top, g);
+        }
+        // Frames not shown go out in the temporal unit of the next one shown.
+        let mut hidden = Vec::new();
+        for step in steps {
+            match step {
+                gop::Step::Code { idx, layer, show } => {
+                    let at = idx as usize - 1;
+                    let frame = self.queue[at].0.clone();
+                    let role = Role::Group {
+                        hint: base + at as u64,
+                        layer,
+                        top: layer == top,
+                        depth: top,
+                        show,
+                    };
+                    let (obus, recon) = self.code_one(&frame, role)?;
+                    if show {
+                        let tu = self.temporal_unit(false, &hidden, &obus);
+                        hidden.clear();
+                        self.ready.push_back((tu, recon, false));
+                    } else {
+                        hidden.extend_from_slice(&obus);
+                    }
+                }
+                gop::Step::Show { idx } => {
+                    let (obu, recon) = self.show_existing(base + idx as u64 - 1)?;
+                    let tu = self.temporal_unit(false, &hidden, &obu);
+                    hidden.clear();
+                    self.ready.push_back((tu, recon, false));
+                }
+            }
+        }
+        self.queue.drain(..g);
+        self.group_plan = None;
+        Ok(())
+    }
+
+    /// Rate control's plan for the group of the next `g` frames held,
+    /// coded in `steps` with `top` its top layer: their complexities
+    /// measured in display order, then the quantiser.
+    fn plan_group(&mut self, steps: &[gop::Step], top: u8, g: usize) {
+        let mut layers = vec![top; g];
+        for s in steps {
+            if let gop::Step::Code { idx, layer, .. } = *s {
+                layers[idx as usize - 1] = layer;
+            }
+        }
+        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        let mut group = Vec::with_capacity(g);
+        for (i, &layer) in layers.iter().enumerate() {
+            let (src, stride) = self.source_planes(&self.queue[i].0);
+            let rc = self.rc.as_mut().expect("rate control");
+            group.push((layer, rc.measure(&src[0], stride[0], w, h, true)));
+        }
+        self.group_plan = Some(GroupPlan {
+            q: 0,
+            first: self.shown,
+            frames: group,
+        });
+        self.replan_group();
+    }
+
+    /// The group's quantiser planned (again) from rate control's models.
+    fn replan_group(&mut self) {
+        let bit_depth = self.cfg.bit_depth;
+        let (Some(rc), Some(plan)) = (self.rc.as_ref(), self.group_plan.as_mut()) else {
+            return;
+        };
+        let top = plan.frames.iter().map(|g| g.0).max().unwrap_or(0);
+        let frame_q = |q: u32, layer: u8| {
+            let role = Role::Group {
+                hint: 0,
+                layer,
+                top: layer == top,
+                depth: top,
+                show: true,
+            };
+            frame_qidx(q, role, false, true, true, bit_depth)
+        };
+        plan.q = rc.plan_group(&plan.frames, frame_q);
     }
 
     /// A temporal unit: the delimiter, on key frames the sequence header and
@@ -713,30 +857,36 @@ impl Encoder {
         out
     }
 
-    /// The temporal unit that shows the pending alt-ref frame
-    /// (`show_existing_frame`), and its reconstruction.
-    fn show_alt_ref(&mut self) -> Result<(Vec<u8>, Option<Frame>)> {
-        let slot = self.arf_slot.take().expect("an alt-ref frame to show");
+    /// The frame header OBU that shows the hidden frame of display index
+    /// `hint` (`show_existing_frame`), and the frame shown.
+    fn show_existing(&mut self, hint: u64) -> Result<(Vec<u8>, Option<Frame>)> {
+        let slot = (0..NUM_REF_FRAMES)
+            .find(|&s| self.slot_frame[s] == hint)
+            .expect("the hidden frame to show is held");
+        self.pending.retain(|&h| h != hint);
         let mut w = BitWriter::new();
         w.flag(true); // show_existing_frame
         w.f(3, slot as u32); // frame_to_show_map_idx
         w.byte_align();
+        let mut obu = Vec::new();
+        write_obu(&mut obu, OBU_FRAME_HEADER, &w.finish());
+        // The encoder's decoder shows it as any decoder will.
         let mut tu = Vec::new();
         write_obu(&mut tu, OBU_TEMPORAL_DELIMITER, &[]);
-        write_obu(&mut tu, OBU_FRAME_HEADER, &w.finish());
-        // The encoder's decoder shows it as any decoder will.
+        tu.extend_from_slice(&obu);
         let mut recon = self.dec.decode(&tu)?;
         if let Some(r) = recon.as_mut() {
             r.hdr = self.cfg.hdr;
         }
-        self.last2_slot = self.last_slot;
-        self.last_slot = slot;
+        if self.slot_layer[slot] == 0 {
+            self.anchor = hint;
+        }
         self.shown += 1;
         self.since_key += 1;
         if let Some(rc) = self.rc.as_mut() {
             rc.account_shown(tu.len() as u64 * 8);
         }
-        Ok((tu, recon))
+        Ok((obu, recon))
     }
 
     /// Codes one frame and commits it to the reference state: its frame
@@ -756,26 +906,45 @@ impl Encoder {
         let golden = role == Role::Inter
             && tools.multi_ref
             && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
-        let boost = role != Role::Inter || golden;
-        let shown = !matches!(role, Role::AltRef { .. });
+        let bit_depth = self.cfg.bit_depth;
+        let groups = self.altref_groups();
+        let frame_q = move |q: u32| frame_qidx(q, role, golden, groups, true, bit_depth);
+        let shown = !matches!(role, Role::Group { show: false, .. });
         // Rate control: the quantiser planned for this frame.
         let mut planned = None;
         if let Some(rc) = self.rc.as_mut() {
-            let class = if key {
-                rc::Class::Key
+            if let (Role::Group { hint, layer, .. }, Some(plan)) = (role, &self.group_plan) {
+                // The group's plan.
+                let c = plan.frame(hint).1;
+                planned = Some(rc.planned(layer, c, plan.q, frame_q(plan.q)));
             } else {
-                rc::Class::Inter
-            };
-            let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
-            let c = rc.measure(&src[0], stride[0], w, h, shown);
-            planned = Some(rc.plan(class, c, |q| if boost { golden_boost(q) } else { 0 }));
+                let class = if key {
+                    rc::Class::Key
+                } else {
+                    rc::Class::Inter
+                };
+                let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+                let c = rc.measure(&src[0], stride[0], w, h, shown);
+                planned = Some(rc.plan(class, c, frame_q));
+            }
         }
         let (mut p, mut f, mut obus) =
             self.code_tu(role, &src, &stride, planned.map(|x| x.qidx))?;
         if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
-            && let Some(again) = rc.redo(pl, obus.len() as u64 * 8, |q| {
-                if boost { golden_boost(q) } else { 0 }
-            })
+            && let Role::Group { hint, layer: 0, .. } = role
+            && rc.rescale_layers(pl, obus.len() as u64 * 8)
+        {
+            // The group's first frame (its alt-ref frame) far from the first
+            // guess of the layers' models: the group planned again and the
+            // frame coded again.
+            self.replan_group();
+            let plan = self.group_plan.as_ref().expect("a group plan");
+            let rc = self.rc.as_ref().expect("rate control");
+            *pl = rc.planned(0, plan.frame(hint).1, plan.q, frame_q(plan.q));
+            (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
+        }
+        if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
+            && let Some(again) = rc.redo(pl, obus.len() as u64 * 8, frame_q)
         {
             // Far from the plan: planned again and coded again.
             *pl = again;
@@ -789,17 +958,26 @@ impl Encoder {
             r.hdr = self.cfg.hdr;
         }
         // The reference slots now hold this frame.
+        let layer = match role {
+            Role::Group { layer, .. } => layer,
+            Role::Key => 0,
+            Role::Inter => 1,
+        };
         for i in 0..NUM_REF_FRAMES {
             if (p.refresh >> i) & 1 != 0 {
                 self.slot_frame[i] = p.order_hint;
+                self.slot_layer[i] = layer;
             }
         }
         if key {
             self.last_slot = 0;
             self.last2_slot = 1;
-            self.arf_slot = None;
-        } else if let Role::AltRef { .. } = role {
-            self.arf_slot = Some(p.refresh.trailing_zeros() as usize);
+            self.pending.clear();
+            self.anchor = p.order_hint;
+        } else if let Role::Group { show, .. } = role {
+            if !show {
+                self.pending.push(p.order_hint);
+            }
         } else if tools.multi_ref {
             self.last2_slot = self.last_slot;
             self.last_slot = (p.refresh & !(1 << GOLDEN_SLOT)).trailing_zeros() as usize;
@@ -814,7 +992,11 @@ impl Encoder {
             rc.update(
                 pl,
                 obus.len() as u64 * 8,
-                role == Role::Inter && !golden,
+                match role {
+                    Role::Inter => !golden,
+                    Role::Group { top, .. } => top,
+                    Role::Key => false,
+                },
                 shown,
             );
             self.q = rc.base_q as f64;
@@ -955,54 +1137,51 @@ impl Encoder {
         let tools = self.cfg.tools;
         let key = role == Role::Key;
         let order_hint = match role {
-            Role::AltRef { ahead } => self.shown + ahead,
+            Role::Group { hint, .. } => hint,
             _ => self.shown,
         };
-        let mut qidx = planned_q.unwrap_or_else(|| self.quantizer());
+        // (Rate control plans the frame's offset in.)
+        let golden = role == Role::Inter
+            && tools.multi_ref
+            && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
+        let qidx = planned_q.unwrap_or_else(|| {
+            frame_qidx(
+                self.quantizer(),
+                role,
+                golden,
+                self.altref_groups(),
+                false,
+                self.cfg.bit_depth,
+            )
+        });
         let mut refresh = 0xFFu8;
         let mut ref_slots = [0usize; REFS_PER_FRAME];
         let mut search_refs = Vec::new();
-        if !key {
+        if let Role::Group { .. } = role {
+            (refresh, ref_slots, search_refs) = self.group_refs(order_hint);
+        } else if !key {
             if tools.multi_ref {
-                // This frame replaces the oldest frame of the last ones
-                // (not LAST, nor the alt-ref frame waiting to be shown; an
-                // alt-ref frame not LAST2 either); every GOLDEN_INTERVAL
-                // frames a shown one is also the golden frame, coded finer.
+                // This frame replaces the older of the last two (not LAST);
+                // every GOLDEN_INTERVAL frames it is also the golden frame,
+                // coded finer.
                 let golden = role == Role::Inter && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
-                let pool: &[usize] = if self.altref_groups() {
-                    &[0, 1, 3, 4]
-                } else {
-                    &[0, 1]
-                };
-                let target = pool
-                    .iter()
-                    .copied()
-                    .filter(|&s| {
-                        s != self.last_slot
-                            && Some(s) != self.arf_slot
-                            && (role == Role::Inter || s != self.last2_slot)
-                    })
+                let target = [0, 1]
+                    .into_iter()
+                    .filter(|&s| s != self.last_slot)
                     .min_by_key(|&s| self.slot_frame[s])
                     .expect("a slot to refresh");
                 refresh = 1 << target;
-                if golden || matches!(role, Role::AltRef { .. }) {
-                    if golden {
-                        refresh |= 1 << GOLDEN_SLOT;
-                    }
-                    // (Rate control plans the boost in.)
-                    if planned_q.is_none() {
-                        qidx = qidx.saturating_sub(golden_boost(qidx)).max(1);
-                    }
+                if golden {
+                    refresh |= 1 << GOLDEN_SLOT;
                 }
-                let back = self.arf_slot.unwrap_or(GOLDEN_SLOT);
                 ref_slots = [
                     self.last_slot,
                     self.last2_slot,
                     self.last2_slot,
                     GOLDEN_SLOT,
-                    back,
-                    back,
-                    back,
+                    GOLDEN_SLOT,
+                    GOLDEN_SLOT,
+                    GOLDEN_SLOT,
                 ];
                 search_refs.push(LAST_FRAME);
                 let lf = self.slot_frame[self.last_slot];
@@ -1014,12 +1193,6 @@ impl Encoder {
                 if g != lf && g != l2 {
                     search_refs.push(GOLDEN_FRAME);
                 }
-                if let Some(a) = self.arf_slot {
-                    let a = self.slot_frame[a];
-                    if a != lf && a != l2 && a != g {
-                        search_refs.push(ALTREF_FRAME);
-                    }
-                }
             } else {
                 refresh = 1;
                 search_refs.push(LAST_FRAME);
@@ -1030,7 +1203,14 @@ impl Encoder {
             .loop_filter
             .unwrap_or_else(|| ((qidx as f64) * 0.18 + 2.0).min(40.0) as u32);
         let chroma_lf = if lf != 0 { lf / 2 + 1 } else { 0 };
-        let reference_select = !key && tools.compound && tools.multi_ref && search_refs.len() > 1;
+        // Compound prediction where the speed has it, and in a group
+        // wherever a frame has a reference on each side.
+        let bidir = matches!(role, Role::Group { .. })
+            && search_refs
+                .iter()
+                .any(|&r| self.slot_frame[ref_slots[(r - LAST_FRAME) as usize]] > order_hint);
+        let reference_select =
+            !key && search_refs.len() > 1 && ((tools.compound && tools.multi_ref) || bidir);
         let screen_content = tools.palette && self.next_screen_content;
         FrameParams {
             key,
@@ -1057,7 +1237,7 @@ impl Encoder {
             reduced_tx_set: !(tools.full_tx_set && tools.rdo),
             tile_cols_log2: self.cfg.tile_cols_log2,
             aq: None,
-            show: !matches!(role, Role::AltRef { .. }),
+            show: !matches!(role, Role::Group { show: false, .. }),
             order_hint,
         }
     }
@@ -1218,7 +1398,10 @@ impl Encoder {
             rd_lambda: rd_lambda(&self.cfg, p.qidx),
             refs: p.search_refs.clone(),
             search_range: self.cfg.search_range,
-            tools: self.cfg.tools,
+            tools: Tools {
+                compound: self.cfg.tools.compound || p.reference_select,
+                ..self.cfg.tools
+            },
             rdo: Default::default(),
             res: Vec::new(),
             fc: Vec::new(),
@@ -1270,6 +1453,9 @@ impl Encoder {
             w.flag(false); // is_filter_switchable
             w.f(2, EIGHTTAP);
             w.flag(false); // is_motion_mode_switchable
+            if seq.enable_ref_frame_mvs {
+                w.flag(true); // use_ref_frame_mvs
+            }
         } else {
             w.flag(false); // render_and_frame_size_different
             if p.screen_content {
@@ -1380,7 +1566,7 @@ impl Encoder {
         if !key {
             w.flag(p.reference_select); // reference_select
             if p.reference_select && self.skip_mode_allowed(p) {
-                w.flag(false); // skip_mode_present
+                w.flag(true); // skip_mode_present
             }
         }
         w.flag(p.reduced_tx_set); // reduced_tx_set
@@ -1391,6 +1577,72 @@ impl Encoder {
         }
         w.byte_align();
         w.finish()
+    }
+}
+
+impl Encoder {
+    /// The references of the group frame of display index `hint`, and the
+    /// slot it replaces: `refresh_frame_flags`, `ref_frame_idx` and the
+    /// references searched.
+    ///
+    /// The frames held before it are LAST, LAST2 and LAST3, nearest first,
+    /// and GOLDEN the anchor (the last key or alt-ref frame shown) unless
+    /// it is one of those; the frames held after it (the hidden frames of
+    /// the layers below) BWDREF, nearest, ALTREF2, and ALTREF, the
+    /// farthest. The search takes the nearest on each side first.
+    fn group_refs(&self, hint: u64) -> (u8, [usize; REFS_PER_FRAME], Vec<i32>) {
+        // One slot for each frame held.
+        let mut frames: Vec<(u64, usize)> = Vec::new();
+        for s in 0..NUM_REF_FRAMES {
+            if !frames.iter().any(|f| f.0 == self.slot_frame[s]) {
+                frames.push((self.slot_frame[s], s));
+            }
+        }
+        let mut past: Vec<(u64, usize)> = frames.iter().copied().filter(|f| f.0 < hint).collect();
+        past.sort_by_key(|f| std::cmp::Reverse(f.0));
+        let mut future: Vec<(u64, usize)> = frames.iter().copied().filter(|f| f.0 > hint).collect();
+        future.sort_by_key(|f| f.0);
+        let last = past.first().expect("a frame shown before").1;
+        let last2 = past.get(1).map_or(last, |f| f.1);
+        let last3 = past.get(2).map_or(last2, |f| f.1);
+        let golden = match past.iter().find(|f| f.0 == self.anchor) {
+            Some(a) if ![last, last2, last3].contains(&a.1) => a.1,
+            _ => past.get(3).map_or(last3, |f| f.1),
+        };
+        let bwd = future.first().map_or(golden, |f| f.1);
+        let alt2 = future.get(1).map_or(bwd, |f| f.1);
+        let alt = future.last().map_or(bwd, |f| f.1);
+        let ref_slots = [last, last2, last3, golden, bwd, alt2, alt];
+        let max_refs = group_max_refs(&self.cfg.tools);
+        let mut search_refs = Vec::new();
+        let mut used = Vec::new();
+        for rf in [
+            LAST_FRAME,
+            BWDREF_FRAME,
+            ALTREF_FRAME,
+            LAST2_FRAME,
+            GOLDEN_FRAME,
+            ALTREF2_FRAME,
+            LAST3_FRAME,
+        ] {
+            let s = ref_slots[(rf - LAST_FRAME) as usize];
+            if search_refs.len() < max_refs && !used.contains(&s) {
+                used.push(s);
+                search_refs.push(rf);
+            }
+        }
+        // The slot replaced: a second copy of a frame, else the oldest
+        // frame that is neither waiting to be shown nor the anchor.
+        let spare = (0..NUM_REF_FRAMES).find(|&s| !frames.iter().any(|f| f.1 == s));
+        let target = spare.or_else(|| {
+            frames
+                .iter()
+                .filter(|f| !self.pending.contains(&f.0) && f.0 != self.anchor)
+                .min_by_key(|f| f.0)
+                .map(|f| f.1)
+        });
+        let refresh = 1 << target.expect("a slot to refresh");
+        (refresh, ref_slots, search_refs)
     }
 }
 
@@ -1452,6 +1704,74 @@ fn looks_like_screen_content(frame: &Frame) -> bool {
         }
     }
     blocks > 0 && screen * 10 >= blocks
+}
+
+/// A frame's quantiser index when the plan's (or the configured one) is
+/// `q`: its step scaled by a power of two for its role. Key frames and
+/// the alt-ref frames, references for every frame after them, are coded
+/// finer; the frames of the top layer of a group, references for none or
+/// few, coarser; the layers between, between.
+fn frame_qidx(
+    q: u32,
+    role: Role,
+    golden: bool,
+    groups: bool,
+    planned: bool,
+    bit_depth: u32,
+) -> u32 {
+    let log2 = match role {
+        Role::Key if groups => KEY_Q,
+        // (Rate control plans key frames finer by its own offset.)
+        Role::Key if planned => return q.saturating_sub(golden_boost(q)).max(1),
+        Role::Key => KEY_Q_LOW_DELAY,
+        Role::Inter if golden => return q.saturating_sub(golden_boost(q)).max(1),
+        Role::Inter => return q,
+        Role::Group { layer, depth, .. } => {
+            ALTREF_Q + (TOP_Q - ALTREF_Q) * layer as f64 / depth.max(1) as f64
+        }
+    };
+    scaled_qidx(q, log2, bit_depth)
+}
+
+/// The quantiser index (1 to 255) whose step is nearest `2^log2` times the
+/// step of `q`.
+fn scaled_qidx(q: u32, log2: f64, bit_depth: u32) -> u32 {
+    // (A plan past 255: see `rc::MAX_GROUP_Q`.)
+    let log2 = log2 + q.saturating_sub(255) as f64 / 32.0;
+    let q = q.min(255);
+    if log2 == 0.0 {
+        return q;
+    }
+    let t = &AC_QLOOKUP[((bit_depth - 8) >> 1) as usize];
+    let goal = (t[q.clamp(1, 255) as usize] as f64 * log2.exp2()).ln();
+    (1..=255u32)
+        .min_by(|&a, &b| {
+            let da = ((t[a as usize] as f64).ln() - goal).abs();
+            let db = ((t[b as usize] as f64).ln() - goal).abs();
+            da.total_cmp(&db)
+        })
+        .unwrap_or(q)
+}
+
+/// The quantiser step of a key frame against the configured one, as a
+/// power of two, with alt-ref groups (with rav1e's figure, -1.2 measured
+/// best of -0.9, -1.2 and -1.5 on the test clips) and without (-1.0 of
+/// -0.6 and -1.0: there it is the reference of every frame up to the
+/// next golden one).
+const KEY_Q: f64 = -1.2;
+const KEY_Q_LOW_DELAY: f64 = -1.0;
+/// The same for a group's alt-ref frame (layer 0) and its top layer; the
+/// layers between are spaced evenly. (-0.6 of -0.4, -0.6 and -0.8; 0.5 of
+/// 0.5, 0.7 and 0.9.)
+const ALTREF_Q: f64 = -0.6;
+const TOP_Q: f64 = 0.5;
+
+/// How many references a group frame searches: four with several
+/// references (the nearest on each side, the farthest after, the second
+/// nearest before; three cost +0.6 % BD-rate, five gained 0.3 % for the
+/// time), else the nearest on each side.
+fn group_max_refs(tools: &Tools) -> usize {
+    if tools.multi_ref { 4 } else { 2 }
 }
 
 /// How often a boosted golden frame is coded with several references.
