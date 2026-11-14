@@ -225,6 +225,11 @@ pub struct Tools {
     pub split_threshold: u16,
     /// The same for the smaller blocks.
     pub split_threshold_small: u16,
+    /// `split_threshold` in the frames of a group's top layer, which few
+    /// frames (if any) refer to (setting `split_threshold` leaves it).
+    pub split_threshold_top: u16,
+    /// `split_threshold_small` in the frames of a group's top layer.
+    pub split_threshold_small_top: u16,
     /// The residual of inter blocks is tried skipped only for the best
     /// inter candidate (with `rd_skip`).
     pub rd_skip_best: bool,
@@ -327,6 +332,19 @@ pub struct Tools {
     /// coded): their levels then follow the chroma weights, as the coded
     /// ones do. 0: never; 1: in intra frames; 2: in every frame.
     pub rdoq_uv: u8,
+    /// Angle deltas (`angle_delta_y`): each directional luma mode a block
+    /// keeps for its trials is predicted at its six other angles too, the
+    /// best by SATD plus rate taken. 0: never; 1: in intra frames; 2: in
+    /// every frame.
+    pub angle_delta: u8,
+    /// Angle deltas of chroma (`angle_delta_uv`): the directional chroma
+    /// modes the chroma trials (`uv_trials`) rank are ranked at each angle.
+    pub angle_delta_uv: bool,
+    /// In inter frames, a block's intra modes are ranked only when the
+    /// best of the five plainest (DC, V, H, smooth, Paeth) scores less than
+    /// this many hundredths of what an intra candidate must score to be
+    /// trialled (0: always ranked).
+    pub intra_early: u16,
     /// How many of the inter tools' variants of a block's best inter
     /// candidate (those whose prediction measures cheaper) are trialled.
     pub inter_tool_trials: u8,
@@ -401,19 +419,37 @@ impl Tools {
             fast_tx_refine: s >= 4,
             restoration_fast: s >= 4,
             abandon_trials: true,
+            // Every block of 32x32 and more is tried split at speeds 6 to
+            // 8 (−0.3 % / −0.2 % BD-rate PSNR-Y / PSNR-YUV at speed 6 for
+            // 1.02x the time); speeds 4 and 5 keep 0.15 for the time.
             split_threshold: match s {
+                0..=3 | 6..=8 => 0,
+                _ => 15,
+            },
+            // (Speeds 4 and 8 traded 100 for the inter tools' time, speed 4
+            // 200 for the chroma trials'. The intra early-out
+            // (`intra_early`) bought it back, and more: the smaller blocks
+            // split more readily now in the frames others refer to, which
+            // is most of what rav1e's finer partitions gain on foreman.
+            // 0.5 at speed 6; 0.75 elsewhere, for the time: at speed 4,
+            // 0.5 is −0.2 % PSNR-YUV for 1.02x.)
+            split_threshold_small: match s {
+                0..=3 => 0,
+                6 => 50,
+                _ => 75,
+            },
+            // The frames of a group's top layer keep the old thresholds:
+            // splitting there too was worth −0.4 % PSNR-YUV at speed 6, for
+            // 1.05x the time.
+            split_threshold_top: match s {
                 0..=3 => 0,
                 _ => 15,
             },
-            // (Speeds 4 and 8 trade 100 for the inter tools' time: with
-            // them, 150 is −2.0 % and −1.1 % BD-rate for 1.04x and 1.01x
-            // the time. Speed 4 goes to 200 for the chroma trials' time:
-            // +0.15 % / +0.18 % BD-rate, 1.028x rav1e's time to 0.994x.)
-            split_threshold_small: match s {
+            split_threshold_small_top: match s {
                 0..=3 => 0,
-                4 => 200,
-                8 => 150,
-                _ => 100,
+                4 | 5 => 200,
+                6 => 100,
+                _ => 150,
             },
             rd_skip_best: s >= 4,
             tx_depth_max: if s >= 4 { 1 } else { 2 },
@@ -448,7 +484,16 @@ impl Tools {
                 _ => 0,
             },
             uv_trials_inter: false,
-            rdoq_uv: if s <= 8 { 1 } else { 0 },
+            // In inter frames too at speeds 5 to 7: −0.2 % PSNR-YUV at speed
+            // 6; ±0 at speed 8, for 1.02x the time.
+            rdoq_uv: match s {
+                5..=7 => 2,
+                0..=8 => 1,
+                _ => 0,
+            },
+            angle_delta: if s <= 8 { 2 } else { 0 },
+            angle_delta_uv: s <= 8,
+            intra_early: if (4..=8).contains(&s) { 120 } else { 0 },
             // One trial from speed 4: as much gain for less time.
             inter_tool_trials: if s >= 4 { 1 } else { 2 },
             force_inter_tool: 0,
@@ -523,6 +568,11 @@ impl Tools {
             "uv_trials" => self.uv_trials = value.min(12) as u8,
             "uv_trials_inter" => self.uv_trials_inter = b,
             "rdoq_uv" => self.rdoq_uv = value.min(2) as u8,
+            "angle_delta" => self.angle_delta = value.min(2) as u8,
+            "angle_delta_uv" => self.angle_delta_uv = b,
+            "split_threshold_top" => self.split_threshold_top = value as u16,
+            "split_threshold_small_top" => self.split_threshold_small_top = value as u16,
+            "intra_early" => self.intra_early = value.min(1000) as u16,
             "inter_tool_trials" => self.inter_tool_trials = value.min(255) as u8,
             "force_inter_tool" => self.force_inter_tool = value.min(255) as u8,
             _ => return false,
@@ -715,6 +765,8 @@ struct FrameParams {
     aq: Option<Arc<tile::AqMap>>,
     /// `show_frame` (a hidden alt-ref frame is not shown).
     show: bool,
+    /// Of a group's top layer: a reference for few frames, if any.
+    top: bool,
     /// The frame's display index.
     order_hint: u64,
     /// `film_grain_params()`.
@@ -1756,6 +1808,7 @@ impl Encoder {
             tile_cols_log2: self.cfg.tile_cols_log2,
             aq: None,
             show: !matches!(role, Role::Group { show: false, .. }),
+            top: matches!(role, Role::Group { top: true, .. }),
             order_hint,
             intrabc,
             ibc: None,
@@ -1938,6 +1991,18 @@ impl Encoder {
             search_range: self.cfg.search_range,
             tools: Tools {
                 compound: self.cfg.tools.compound || p.reference_select,
+                // A frame of the top layer, which few frames refer to, splits
+                // its blocks less readily.
+                split_threshold: if p.top {
+                    self.cfg.tools.split_threshold_top
+                } else {
+                    self.cfg.tools.split_threshold
+                },
+                split_threshold_small: if p.top {
+                    self.cfg.tools.split_threshold_small_top
+                } else {
+                    self.cfg.tools.split_threshold_small
+                },
                 ..self.cfg.tools
             },
             rdo: Default::default(),

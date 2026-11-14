@@ -14,7 +14,7 @@ use crate::Result;
 use crate::consts::*;
 use crate::decoder::predict::block_inter_prediction;
 use crate::decoder::state::Mv;
-use crate::decoder::tile::{Plan, TileDecoder};
+use crate::decoder::tile::{Plan, TileDecoder, is_directional_mode};
 use crate::dsp::enc::{sad, satd};
 use crate::encoder::Tools;
 use crate::encoder::fwd::{Quantiser, coef_bound, forward_quantise, forward_wht};
@@ -437,6 +437,49 @@ impl TileDecoder<'_, '_> {
         cost as f64 / 256.0
     }
 
+    /// The cost in bits of coding angle delta `d` with directional mode
+    /// `m` (either plane's), from the CDFs in force.
+    fn angle_delta_bits(&self, m: usize, d: i32) -> f64 {
+        Coder::cost(
+            &self.cdf.angle_delta[m - V_PRED],
+            (d + MAX_ANGLE_DELTA) as usize,
+        ) as f64
+            / 256.0
+    }
+
+    /// Whether this block's luma modes are searched at their angle deltas
+    /// (`Tools::angle_delta`).
+    fn angle_deltas_here(&self) -> bool {
+        self.b.mi_size >= BLOCK_8X8
+            && !self.b.lossless
+            && match self.enc().tools.angle_delta {
+                0 => false,
+                1 => self.f.hdr.frame_is_intra,
+                _ => true,
+            }
+    }
+
+    /// The best angle delta of directional luma mode `m` for this block by
+    /// SATD plus rate, and that cost (the delta's rate included), given the
+    /// cost `cost0` of delta 0 without the delta's rate. Leaves
+    /// `angle_delta_y` at 0.
+    fn best_angle_delta_y(&mut self, m: usize, cost0: f64) -> (i32, f64) {
+        let lambda = self.enc().lambda;
+        let mut best = (0, cost0 + lambda * self.angle_delta_bits(m, 0));
+        let mode_bits = self.y_mode_bits(m);
+        self.b.y_mode = m;
+        for d in [-3, -2, -1, 1, 2, 3] {
+            self.b.angle_delta_y = d;
+            let cost =
+                self.try_intra(0, m) as f64 + lambda * (mode_bits + self.angle_delta_bits(m, d));
+            if cost < best.1 {
+                best = (d, cost);
+            }
+        }
+        self.b.angle_delta_y = 0;
+        best
+    }
+
     /// Whether this frame's trials quantise chroma by rate and distortion
     /// (`Tools::rdoq_uv`).
     fn rdoq_uv_trials(&self) -> bool {
@@ -451,35 +494,97 @@ impl TileDecoder<'_, '_> {
     /// whose luma mode is `y_mode`: by the SATD of each plane's prediction,
     /// weighted by the square root of the plane's `rdo::CHROMA_WEIGHT` (a
     /// weight on squared error is its square root on the error), plus the
-    /// mode's rate under the CDFs in force. Leaves `uv_mode` changed.
-    pub(crate) fn ranked_uv_modes(&mut self, y_mode: usize) -> Vec<usize> {
+    /// mode's rate under the CDFs in force. With `Tools::angle_delta_uv`,
+    /// the best two directional modes are ranked at their other angles too.
+    /// Each is `(uv_mode, angle_delta_uv)`. Leaves `uv_mode` changed.
+    pub(crate) fn ranked_uv_modes(&mut self, y_mode: usize) -> Vec<(usize, i32)> {
         let lambda = self.enc().lambda;
         let ms = self.b.mi_size;
         let cfl_allowed = !self.b.lossless && block_width(ms).max(block_height(ms)) <= 32;
         let w = crate::encoder::rdo::CHROMA_WEIGHT.map(|q| (q as f64 / 4.0).sqrt());
-        let mut ranked: Vec<(f64, usize)> = (DC_PRED..UV_CFL_PRED)
-            .map(|m| {
-                self.b.uv_mode = m;
-                let cdf = if cfl_allowed {
-                    &self.cdf.uv_mode_cfl_allowed[y_mode][..]
-                } else {
-                    &self.cdf.uv_mode_cfl_not_allowed[y_mode][..]
-                };
-                let bits = Coder::cost(cdf, m) as f64 / 256.0;
-                let cost = w[1] * self.try_intra(1, m) as f64
-                    + w[2] * self.try_intra(2, m) as f64
-                    + lambda * bits;
-                (cost, m)
-            })
+        let deltas = self.enc().tools.angle_delta_uv && ms >= BLOCK_8X8 && !self.b.lossless;
+        let cost_of = |t: &mut Self, m: usize, d: i32| -> f64 {
+            t.b.uv_mode = m;
+            t.b.angle_delta_uv = d;
+            let cdf = if cfl_allowed {
+                &t.cdf.uv_mode_cfl_allowed[y_mode][..]
+            } else {
+                &t.cdf.uv_mode_cfl_not_allowed[y_mode][..]
+            };
+            let mut bits = Coder::cost(cdf, m) as f64 / 256.0;
+            if deltas && is_directional_mode(m) {
+                bits += t.angle_delta_bits(m, d);
+            }
+            w[1] * t.try_intra(1, m) as f64 + w[2] * t.try_intra(2, m) as f64 + lambda * bits
+        };
+        let mut ranked: Vec<(f64, usize, i32)> = (DC_PRED..UV_CFL_PRED)
+            .map(|m| (cost_of(self, m, 0), m, 0))
             .collect();
         ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-        ranked.into_iter().map(|r| r.1).collect()
+        if deltas {
+            let dirs: Vec<usize> = ranked
+                .iter()
+                .map(|r| r.1)
+                .filter(|&m| is_directional_mode(m))
+                .take(2)
+                .collect();
+            for m in dirs {
+                for d in [-3, -2, -1, 1, 2, 3] {
+                    ranked.push((cost_of(self, m, d), m, d));
+                }
+            }
+            ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        self.b.angle_delta_uv = 0;
+        ranked.into_iter().map(|r| (r.1, r.2)).collect()
     }
 
     /// The candidates the rate-distortion search trials for this block:
     /// the best intra modes by SATD (plus their rate), then the best inter
     /// modes and vectors per reference.
     pub(crate) fn block_candidates(&mut self) -> Vec<Plan> {
+        let tools = self.enc().tools;
+        let refs = self.block_refs();
+        if refs.is_empty() || self.b.mi_size < BLOCK_8X8 {
+            let mut out = self.intra_candidates(f64::MAX);
+            if self.angle_deltas_here() {
+                self.refine_angles(&mut out, f64::MAX);
+            }
+            return out.into_iter().map(|x| x.0).collect();
+        }
+        let (inter, skip_mode) = self.inter_candidates(&refs);
+        // Intra is worth a trial only when its SATD is near the best inter's.
+        let best_inter = inter.first().map_or(f64::MAX, |x| x.1);
+        let keep_factor = if tools.prune_intra { 1.0 } else { 1.5 };
+        let bound = if tools.intra_early > 0 {
+            best_inter * keep_factor
+        } else {
+            f64::MAX
+        };
+        let mut out = self.intra_candidates(bound);
+        if self.angle_deltas_here() {
+            self.refine_angles(&mut out, best_inter * keep_factor);
+        }
+        let intra_keep = out
+            .into_iter()
+            .filter(|(_, score)| *score < best_inter * keep_factor)
+            .map(|(p, _)| p);
+        let mut all: Vec<Plan> = inter
+            .iter()
+            .take(tools.inter_candidates.max(1) as usize)
+            .map(|x| x.0)
+            .collect();
+        all.extend(skip_mode);
+        all.extend(intra_keep);
+        all
+    }
+
+    /// The intra candidates of this block, each with its preselection
+    /// score (SATD plus the multiplier times its rate). With a finite
+    /// `bound` (the score an intra candidate must beat to be trialled,
+    /// `Tools::intra_early`), none when the five plainest luma modes all
+    /// score well above it: the rest are seldom better by that much.
+    fn intra_candidates(&mut self, bound: f64) -> Vec<(Plan, f64)> {
         let lambda = self.enc().lambda;
         let tools = self.enc().tools;
         let ms = self.b.mi_size;
@@ -491,7 +596,15 @@ impl TileDecoder<'_, '_> {
         // Each luma mode (and filter intra mode: `FILTER_INTRA_MODES` past
         // the plain ones), by SATD and rate.
         let mut ys: Vec<(usize, Option<u8>, f64)> = Vec::with_capacity(Y_MODES.len() + 5);
-        for &(m, _) in Y_MODES.iter() {
+        for (k, &(m, _)) in Y_MODES.iter().enumerate() {
+            if k == 5
+                && bound < f64::MAX
+                && ys
+                    .iter()
+                    .all(|y| y.2 > bound * tools.intra_early as f64 / 100.0)
+            {
+                return Vec::new();
+            }
             self.b.y_mode = m;
             let cost = self.try_intra(0, m) as f64 + lambda * self.y_mode_bits(m);
             ys.push((m, None, cost));
@@ -523,7 +636,7 @@ impl TileDecoder<'_, '_> {
         let mut best_uv = DC_PRED;
         if self.b.has_chroma && tools.uv_modes {
             self.b.y_mode = ys[0].0;
-            best_uv = self.ranked_uv_modes(ys[0].0)[0];
+            best_uv = self.ranked_uv_modes(ys[0].0)[0].0;
         } else if self.b.has_chroma {
             self.b.y_mode = ys[0].0;
             let mut best = f64::MAX;
@@ -595,6 +708,12 @@ impl TileDecoder<'_, '_> {
         if self.f.hdr.allow_intrabc {
             out.extend(self.intrabc_candidates());
         }
+        out
+    }
+
+    /// The references this block searches: the frame's, or (a half of a
+    /// block, `Tools::rect_refs`) those the block whole chose.
+    fn block_refs(&mut self) -> Vec<i32> {
         let mut refs = self.enc().refs.clone();
         if let Some(h) = self.rdo().ref_hint
             && !refs.is_empty()
@@ -607,13 +726,19 @@ impl TileDecoder<'_, '_> {
                 keep
             };
         }
-        if refs.is_empty() || ms < BLOCK_8X8 {
-            return out.into_iter().map(|x| x.0).collect();
-        }
+        refs
+    }
+
+    /// The inter candidates of this block for references `refs`, best
+    /// first by their preselection score, and its skip mode candidate.
+    fn inter_candidates(&mut self, refs: &[i32]) -> (Vec<(Plan, f64)>, Option<Plan>) {
+        let lambda = self.enc().lambda;
+        let tools = self.enc().tools;
+        let ms = self.b.mi_size;
         let mut inter: Vec<(Plan, f64)> = Vec::new();
         // The searched vector of each reference, for compound candidates.
         let mut searched_mv: Vec<(i32, Mv)> = Vec::new();
-        for &rf in &refs {
+        for &rf in refs {
             self.b.ref_frame = [rf, NONE];
             self.b.is_inter = true;
             self.b.use_intrabc = false;
@@ -712,20 +837,35 @@ impl TileDecoder<'_, '_> {
                 ref_frame2: self.f.hdr.skip_mode_frame[1],
                 ..Default::default()
             });
-        // Intra is worth a trial only when its SATD is near the best inter's.
-        let best_inter = inter.first().map_or(f64::MAX, |x| x.1);
-        let intra_keep = out
-            .into_iter()
-            .filter(|(_, score)| *score < best_inter * if tools.prune_intra { 1.0 } else { 1.5 })
-            .map(|(p, _)| p);
-        let mut all: Vec<Plan> = inter
-            .iter()
-            .take(tools.inter_candidates.max(1) as usize)
-            .map(|x| x.0)
-            .collect();
-        all.extend(skip_mode);
-        all.extend(intra_keep);
-        all
+        (inter, skip_mode)
+    }
+
+    /// The plain directional intra candidates whose score is below
+    /// `limit` (those that will be trialled), each at its best angle delta
+    /// (`best_angle_delta_y`); chroma from luma candidates take the delta
+    /// found for their luma mode.
+    fn refine_angles(&mut self, out: &mut [(Plan, f64)], limit: f64) {
+        let mut found: Vec<(usize, i32, f64)> = Vec::new();
+        for (p, score) in out.iter_mut() {
+            if p.use_intrabc
+                || p.palette_n > 0
+                || p.use_filter_intra
+                || !is_directional_mode(p.y_mode)
+                || *score >= limit
+            {
+                continue;
+            }
+            let (d, cost) = match found.iter().find(|f| f.0 == p.y_mode) {
+                Some(&(_, d, c)) => (d, c),
+                None => {
+                    let (d, c) = self.best_angle_delta_y(p.y_mode, *score);
+                    found.push((p.y_mode, d, c));
+                    (d, c)
+                }
+            };
+            p.angle_delta_y = d;
+            *score = cost;
+        }
     }
 
     /// Whether an intra block copy of this block by `dv` (in eighths, whole

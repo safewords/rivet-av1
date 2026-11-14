@@ -216,8 +216,10 @@ them:
   not beat the best before it; the halves of a block (horizontal and
   vertical partitions, 16x16 blocks only at speeds 4 and 5) search only
   the references the block whole chose.
-- **Intra**: all the directional and smooth modes, Paeth; **chroma from
-  luma** (alphas fitted to the source); **palettes** (up to eight colours,
+- **Intra**: all the directional and smooth modes, Paeth, the directional
+  ones at their **angle deltas** (luma and chroma, `Tools::angle_delta`,
+  `Tools::angle_delta_uv`); **chroma from luma** (alphas fitted to the
+  source); **palettes** (up to eight colours,
   their indices coded in the normative wavefront order) and **intra block
   copy** (`Tools::intrabc`, speeds 0 to 8) on frames that look like screen
   content; **filter intra** (`Tools::filter_intra`, off: below). Intra
@@ -894,6 +896,76 @@ threshold goes from 150 to 200 to pay for it: 0.994x (ducks_take_off
 (+2.83 %) against rav1e; turning the chroma trials off at speed 4
 instead would cost +0.35 % / +0.57 %.
 
+**Angle deltas, and smaller blocks where others refer to them.** Read
+with rivet-av1's own parser, rav1e's streams of foreman, akiyo and
+mobile at speed 6 differ from rivet-av1's in two ways that matter.
+rav1e codes an angle delta on half or more of its directional intra
+blocks (in the key frame 52 % to 63 % of luma's, 39 % to 49 % of
+chroma's); rivet-av1 coded none. And in the frames that others refer to
+it codes smaller blocks: on foreman at the same quality, 31 % of the
+alt-ref frames' area in 8x8 blocks against rivet-av1's 9 %, each inter
+block with a single transform (rivet-av1 splits its larger blocks'
+transforms instead, 2.1 per block), twice rivet-av1's mode-information
+bits, and chroma coded in more of its transform blocks (V in 21 % of
+them against 15 %) — a larger inter block has larger chroma transforms
+and a coarser chroma prediction, and nothing below the block can split
+them. The key frame is not where chroma is lost: coded alone (one
+frame, the same quantisers), rivet-av1's key frames were already
+−7.7 % (−4.7 %) against rav1e's, −9.7 % (−6.8 %) with the angle deltas;
+and shorter groups (8 or 4 frames, as rav1e's) cost foreman and akiyo
++2 % to +3 %.
+
+So, each against the step before at speed 6 (BD-rate PSNR-Y (PSNR-YUV),
+the five clips; times one encode at a time, interleaved):
+
+| step | BD-rate | time |
+|---|---|---|
+| luma angle deltas: each directional mode a block keeps for its trials predicted at its six other angles, the best by SATD and rate (`angle_delta` 2; in intra frames only, −0.55 % (−0.52 %)) | −0.61 % (−0.65 %) | about 1.01x |
+| chroma angle deltas: the best two directional chroma modes ranked at each angle for the chroma trials (`angle_delta_uv`) | −0.25 % (−0.32 %) | about 1.01x |
+| in inter frames, the intra modes ranked only when the best of DC, V, H, smooth and Paeth scores under 1.2 times what an intra candidate must beat (`intra_early`; 1.0: +0.14 % (+0.19 %)) | +0.02 % (−0.03 %) | 0.92x |
+| the blocks of 16x16 split unless they cost under 0.5 lambda per sample (`split_threshold_small` 50, not 100) | −0.97 % (−0.80 %) | 1.07x |
+| the blocks of 32x32 and more always tried split (`split_threshold` 0, not 15) | −0.32 % (−0.23 %) | 1.02x |
+| … but the frames of the groups' top layers, which few frames refer to, split as they did (`split_threshold_top`, `split_threshold_small_top`) | +0.43 % (+0.41 %) | 0.95x |
+| the chroma levels of inter frames' trials by rate and distortion (`rdoq_uv` 2; ±0 at speed 8, for 1.02x) | −0.17 % (−0.06 %) | about 1.01x |
+
+The early-out pays for the rest. Per tier (`Tools::for_speed`: angle
+deltas and the early-out at speeds 4 to 8; the small blocks' threshold
+0.5 lambda at speed 6 and 0.75 at 4, 5, 7 and 8, the top layers' as it
+was; 32x32 and more always tried split at speeds 6 to 8; `rdoq_uv` 2 at
+5 to 7), against develop at 64dd6c3 (which codes the same streams as
+a328e71 at a constant quantiser) and against rav1e, BD-rate PSNR-Y
+(PSNR-YUV), and CPU time of the five clips at all five quantisers, one
+encode at a time beside rav1e, interleaved (two rounds at speeds 6 and
+8, one at 4; develop measured in the same runs at 0.979x, 0.974x and
+0.995x rav1e's):
+
+| speed | against develop | time against develop | against rav1e | time against rav1e |
+|---|---|---|---|---|
+| 4 | −1.27 % (−1.20 %) | 1.006x | −3.88 % (**+1.46 %**) | 0.98x |
+| 6 | −1.88 % (−1.75 %) | 1.04x | −5.22 % (**+0.09 %**) | 1.015x |
+| 8 | −2.15 % (−2.19 %) | 1.02x | −5.12 % (**−0.02 %**) | 1.016x |
+
+Per clip against rav1e, PSNR-Y (PSNR-YUV) at speeds 4 / 6 / 8: foreman
++6.0 % (+9.6 %) / +3.4 % (+7.6 %) / +2.6 % (+6.7 %), mobile −11.7 %
+(−4.6 %) / −11.5 % (−5.3 %) / −8.8 % (−3.5 %), akiyo +0.6 % (+3.7 %) /
+−1.0 % (+1.8 %) / −2.5 % (+0.1 %), ducks_take_off −9.1 % (−1.2 %) /
+−10.8 % (−2.6 %) / −10.6 % (−2.3 %), park_joy −5.2 % (−0.1 %) / −6.2 %
+(−1.1 %) / −6.3 % (−1.2 %).
+
+At rav1e's time to within 1.6 %, PSNR-YUV is at parity at speeds 6 and
+8 and 1.5 % behind at speed 4. The trades at the edge, measured: at
+speed 4 the small blocks' threshold at 0.5 lambda (+1.2 % against rav1e)
+for 1.00x rav1e's time; at
+speed 8 the small blocks' threshold at 1.0 lambda (+0.3 % PSNR-YUV
+against rav1e) for 0.995x rav1e's time; at speed 6 `rdoq_uv` 1 (+0.15 %)
+for 0.99x; splitting in the top layers too, −0.4 % at speed 6 for
+1.05x. Speed 4 has the least to spend: its 32x32 blocks halved as well
+would take it to −5.3 % (−0.1 %) against rav1e, but for 1.26x the
+time; the chroma
+trials in inter frames (`uv_trials_inter`), −0.05 % PSNR-YUV; the
+quarters of a split 16x16 block searching only the block whole's
+references (as the halves do), +0.3 % for no time saved.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -970,12 +1042,14 @@ Not there yet:
   it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
   clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
-- **PSNR-YUV at rav1e's time**: 2.1 % to 2.8 % behind at speeds 4, 6
-  and 8 (PSNR-Y 2.5 % to 3.2 % ahead); foreman and akiyo trail at every
-  tier, in PSNR-Y too. What is left is not in the quantisers or the
-  weights, which only move along one trade (above), but in what the
-  search makes of chroma: rav1e's key frames have 0.6 to 0.9 dB more U for
-  the same U bits.
+- **PSNR-YUV at rav1e's time**: at parity at speeds 6 and 8 (+0.1 % and
+  −0.0 %, at 1.015x its time), 1.5 % behind at speed 4 (PSNR-Y 4 % to
+  5 % ahead). foreman trails at every tier (+2.6 % to +6.0 % PSNR-Y,
+  +6.7 % to +9.6 % PSNR-YUV, mostly V), and akiyo in PSNR-YUV: rav1e's
+  inter frames code smaller blocks, each with one transform, where
+  rivet-av1 splits transforms (above); its split thresholds are what
+  hold the time, and a cheaper way to decide when to split would be
+  worth more than they are.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the

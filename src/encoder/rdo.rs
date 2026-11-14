@@ -199,12 +199,10 @@ impl TileDecoder<'_, '_> {
         s.left_seg.clear();
         s.left_seg
             .extend_from_slice(&self.left_seg_pred_ctx[r0..r1.min(self.left_seg_pred_ctx.len())]);
+        // (The flags are one array: one copy, not one per row.)
         s.block_decoded.clear();
-        for p in 0..3 {
-            for row in &self.block_decoded[p] {
-                s.block_decoded.extend_from_slice(row);
-            }
-        }
+        s.block_decoded
+            .extend_from_slice(self.block_decoded.as_flattened().as_flattened());
         s.cdef.clear();
         s.cdef.extend_from_slice(&f.cdef_idx);
         s.q = self.current_q_index;
@@ -266,14 +264,10 @@ impl TileDecoder<'_, '_> {
         self.above_seg_pred_ctx[c0..c0 + n].copy_from_slice(&s.above_seg);
         let n = s.left_seg.len();
         self.left_seg_pred_ctx[r0..r0 + n].copy_from_slice(&s.left_seg);
-        let mut k = 0;
-        for p in 0..3 {
-            for row in self.block_decoded[p].iter_mut() {
-                let n = row.len();
-                row.copy_from_slice(&s.block_decoded[k..k + n]);
-                k += n;
-            }
-        }
+        self.block_decoded
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .copy_from_slice(&s.block_decoded);
         f.cdef_idx.copy_from_slice(&s.cdef);
         self.current_q_index = s.q;
         self.delta_lf = s.delta_lf;
@@ -697,14 +691,14 @@ impl TileDecoder<'_, '_> {
             self.b = saved_b.clone();
             self.b.y_mode = base.y_mode;
             let ranked = self.ranked_uv_modes(base.y_mode);
-            for &m in ranked
+            for &(m, d) in ranked
                 .iter()
-                .filter(|&&m| m != base.uv_mode)
+                .filter(|&&(m, d)| (m, d) != (base.uv_mode, base.angle_delta_uv))
                 .take(tools.uv_trials as usize)
             {
                 let q = Plan {
                     uv_mode: m,
-                    angle_delta_uv: 0,
+                    angle_delta_uv: d,
                     ..base
                 };
                 let (cost, _, seg) = trial(self, q, false)?;
