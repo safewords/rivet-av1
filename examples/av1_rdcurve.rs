@@ -9,12 +9,17 @@
 //! ```text
 //! cargo run --release --example av1_rdcurve -- \
 //!     --out new.csv [--compare base.csv] [--frames 10] [--qs 64,96,128,160,192] \
-//!     [--set name=value ...] clip1.y4m clip2.y4m ...
+//!     [--jobs n] [--set name=value ...] clip1.y4m clip2.y4m ...
 //! ```
 //!
 //! `--set` changes an encoder setting by name (see `apply` below: the
 //! `Config` fields and the `Tools` switches), so one tool's gain is a run
-//! with it and a run without it. Clips run in parallel, one per core.
+//! with it and a run without it. The encodes (each clip at each quantiser)
+//! run in parallel, one per core; `--jobs 1` runs them one at a time, so
+//! that the times of one-thread encodes are not those of encodes
+//! contending for the memory and the caches. The time of a point is its
+//! encoder's alone: the calls of `encode` and `flush`, not the decoding
+//! and the measuring that check them.
 //! `examples/av1toy4m.rs` makes Y4M clips from AV1 streams.
 
 use std::io::Write;
@@ -114,7 +119,7 @@ fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point
     let mut bytes = 0u64;
     let mut se = [0f64; 3];
     let mut n = [0u64; 3];
-    let start = Instant::now();
+    let mut seconds = 0f64;
     // (With alt-ref groups the encoder holds frames: a temporal unit comes
     // out for each frame, in order, but later.)
     let mut shown = 0;
@@ -133,16 +138,21 @@ fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point
         shown += 1;
     };
     for f in frames {
+        let start = Instant::now();
         let tu = enc.encode(f).unwrap();
+        seconds += start.elapsed().as_secs_f64();
         if !tu.is_empty() {
             take(tu, &enc);
         }
     }
-    while let Some(tu) = enc.flush().unwrap() {
+    loop {
+        let start = Instant::now();
+        let tu = enc.flush().unwrap();
+        seconds += start.elapsed().as_secs_f64();
+        let Some(tu) = tu else { break };
         take(tu, &enc);
     }
     assert_eq!(shown, frames.len(), "{path}: a temporal unit per frame");
-    let seconds = start.elapsed().as_secs_f64();
     let p: Vec<f64> = (0..3).map(|i| psnr(se[i], n[i], bd)).collect();
     let yuv = (6.0 * p[0] + p[1] + p[2]) / 8.0;
     Point {
@@ -251,6 +261,7 @@ fn main() {
     let mut compare = None;
     let mut test_csv: Option<String> = None;
     let mut frames_n = 10usize;
+    let mut jobs_n = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut qs = vec![64u32, 96, 128, 160, 192];
     let mut sets = Vec::new();
     let mut clips = Vec::new();
@@ -266,6 +277,7 @@ fn main() {
             "--compare" => compare = Some(next()),
             "--test" => test_csv = Some(next()),
             "--frames" => frames_n = next().parse().unwrap(),
+            "--jobs" => jobs_n = next().parse::<usize>().unwrap().max(1),
             "--qs" => qs = next().split(',').map(|s| s.parse().unwrap()).collect(),
             "--set" => {
                 let s = next();
@@ -290,10 +302,9 @@ fn main() {
         .collect();
     let results = Mutex::new(Vec::new());
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let wall = Instant::now();
     std::thread::scope(|s| {
-        for _ in 0..threads.min(jobs.len()) {
+        for _ in 0..jobs_n.min(jobs.len()) {
             s.spawn(|| {
                 loop {
                     let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
