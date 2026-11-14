@@ -149,8 +149,9 @@ columns they need):
   mode (each symbol's cost read from the CDFs in force, nothing written,
   nothing adapted), measuring the reconstruction's squared error against
   the source, and keeping the least `SSE + lambda * bits` (lambda a fixed
-  multiple of the squared quantiser step). Region snapshots put the state
-  back between candidates; a decision log replays the chosen sub-decisions
+  multiple of the squared quantiser step; the chroma planes' squared error
+  weighted 1.5 (U) and 3 (V) against luma's, see below). Region snapshots
+  put the state back between candidates; a decision log replays the chosen sub-decisions
   when the caller codes the winner, so nothing is searched twice. The
   candidates come from a cheap preselection: intra modes by SATD (with the
   mode's rate from the CDFs), inter modes per reference — NEARESTMV, the
@@ -175,7 +176,16 @@ columns they need):
 - **Transforms**: 4x4 to 64x64, every size; the full transform sets at the
   slow speeds (DCT, ADST, flipped ADST, identity and their mixes, chosen per
   transform block by trial coding), the reduced ones otherwise. A dead-zone
-  quantiser.
+  quantiser, then **rate-distortion optimised quantisation**
+  (`encoder::rdoq`): a transform block's levels are chosen again in the
+  order they are coded, each among its level rounded to the nearest, one
+  less and zero, by squared error plus lambda times its rate under the
+  CDFs in force and the contexts it will be coded in; then the end of
+  block goes where the block costs least (all zero included). At speeds 0
+  to 4 in every block the search codes; at 5 to 8 only in the blocks it
+  chose (its trials measure the dead-zone levels, with a wider dead zone
+  standing in for the sparser levels the block will be coded with), which
+  keeps most of the gain for a ninth of the time (below).
 - **In-loop filters**, searched on a first pass's reconstruction (the frame
   is then coded again, replaying the first pass's decisions): the **loop
   filter** levels (per plane), **CDEF** (each candidate strength applied
@@ -281,6 +291,46 @@ quantisers) 0.17x the time at −1.6 %. At 1080x720 it codes 1.6
 megapixels/s on one thread (2.0 frames/s), 2.9 on two, 4.7 on four and
 5.6 on eight — the same stream on each.
 
+Against rav1e 0.8.1 (run as a black box, its defaults otherwise) on five
+standard clips — foreman, mobile and akiyo (352x288), ducks_take_off and
+park_joy (1280x720) — the first 30 frames, quantisers 64 to 192, a key
+frame every 240, one thread, the same speed in both (BD-rate of
+rivet-av1 against rav1e, PSNR-Y and the 6:1:1 PSNR-YUV; before: develop at
+03054ad), at speed 6:
+
+| clip | PSNR-Y before | PSNR-Y | PSNR-YUV before | PSNR-YUV |
+|---|---|---|---|---|
+| foreman | +36.7 % | +29.6 % | +53.8 % | +45.5 % |
+| mobile | +40.2 % | +33.7 % | +71.0 % | +61.3 % |
+| akiyo | +43.6 % | +43.9 % | +61.1 % | +58.3 % |
+| ducks_take_off | +10.1 % | +5.4 % | +31.2 % | +24.2 % |
+| park_joy | +7.6 % | +3.9 % | +18.8 % | +14.8 % |
+| **average** | **+27.6 %** | **+23.3 %** | **+47.2 %** | **+40.8 %** |
+
+At speed 8 the average went from +46.7 % / +65.5 % to +37.1 % / +54.4 %.
+Against the encoder before, on the same clips: speed 6 −3.1 % PSNR-Y and
+−4.0 % PSNR-YUV for 1.04x the time; speed 8 −5.7 % and −6.1 % for 1.05x;
+speed 4 −2.7 % and −4.2 % for 1.2x (times interleaved, one encode at a
+time). Of speed 6's, weighting chroma alone is +0.1 % and −1.1 %;
+rate-distortion optimised quantisation in every trial as well (speeds 0
+to 4) would be −3.7 % and −4.7 %, but for 1.3x the time. akiyo, a still
+talking head, is the one clip that loses PSNR-Y (+1.4 % at speed 6), to
+the chroma weights.
+
+Why PSNR-YUV trails PSNR-Y by so much against rav1e: rav1e codes chroma
+with a much finer quantiser than luma — its frame headers carry an AC
+delta-q of +5 to −39 for U and −8 to −57 for V, the finer the coarser the
+frame (read back from its streams of foreman with rivet-av1's own header
+parser) — so at the same luma quality it spends more on chroma and has
+1.5 to 2.5 dB more of it in its inter frames. rivet-av1 codes chroma at
+the luma quantiser. Finer chroma quantisers move rivet-av1 along the same
+trade, not past it (all U and V offsets −8: +1.8 % PSNR-Y, −0.8 %
+PSNR-YUV; offsets like rav1e's: +6.9 % and −2.2 %), and so do the
+chroma weights in the search (against counting chroma as luma: U and V
+3, +4.0 % and −3.6 %; U and V 2, +2.3 % and −3.1 %); U 1.5 and V 3
+(+2.0 % and −3.2 %) are where the two measures together gained the
+most.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -310,6 +360,10 @@ Not there yet:
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the
   test clips; off by default. No segmentation.
+- **Chroma quantiser offsets**: the frame header's delta-q for U and V is
+  zero. Finer chroma alone trades PSNR-Y for PSNR-YUV (above); it may pay
+  together with a quantiser hierarchy, which changes what each frame's
+  chroma is worth to the frames after it.
 - Filter intra, intra block copy, OBMC and warped motion, wedge /
   difference-weighted compound, inter-intra, switchable interpolation
   filters, film grain parameters.
