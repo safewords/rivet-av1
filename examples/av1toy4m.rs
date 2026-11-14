@@ -36,25 +36,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n = 0;
     'outer: for p in packets {
         for f in dec.decode_all(p)? {
-            if f.chroma != av1::ChromaFormat::Yuv420 {
-                return Err("only 4:2:0".into());
-            }
             let (w, h) = crop.unwrap_or((f.width, f.height));
             let (x0, y0) = (((f.width - w) / 2) & !1, ((f.height - h) / 2) & !1);
             if n == 0 {
-                let c = if f.bit_depth > 8 {
-                    "C420p10"
-                } else {
-                    "C420jpeg"
+                let info = av1::y4m::Y4mInfo {
+                    width: w,
+                    height: h,
+                    bit_depth: f.bit_depth,
+                    chroma: f.chroma,
                 };
-                writeln!(out, "YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 {c}")?;
+                out.write_all(info.header().as_bytes())?;
             }
             out.write_all(b"FRAME\n")?;
-            for p in 0..3 {
-                let s = if p == 0 { 0 } else { 1 };
-                for y in 0..(h + s) >> s {
-                    for x in 0..(w + s) >> s {
-                        let v = f.sample(p, (x0 >> s) + x, (y0 >> s) + y);
+            let (sx, sy) = f.chroma.shifts();
+            for p in 0..f.chroma.num_planes() {
+                let (sx, sy) = if p == 0 { (0, 0) } else { (sx, sy) };
+                for y in 0..(h + sy) >> sy {
+                    for x in 0..(w + sx) >> sx {
+                        let v = f.sample(p, (x0 >> sx) + x, (y0 >> sy) + y);
                         if f.bit_depth > 8 {
                             out.write_all(&v.to_le_bytes())?;
                         } else {

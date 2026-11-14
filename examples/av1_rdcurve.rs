@@ -26,35 +26,14 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use av1::{ChromaFormat, Config, Decoder, Encoder, Frame};
+use av1::{Config, Decoder, Encoder, Frame};
 
-/// A Y4M file's frames (4:2:0, 8 or 10 bits).
+/// A Y4M file's frames (any format the encoder takes).
 fn read_y4m(path: &str, max: usize) -> Vec<Frame> {
     let data = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let nl = data.iter().position(|&b| b == b'\n').expect("Y4M header");
-    let header = std::str::from_utf8(&data[..nl]).unwrap();
-    let (mut w, mut h, mut bd) = (0u32, 0u32, 8u32);
-    for tok in header.split_whitespace() {
-        match tok.as_bytes()[0] {
-            b'W' => w = tok[1..].parse().unwrap(),
-            b'H' => h = tok[1..].parse().unwrap(),
-            b'C' if tok.contains("p10") => bd = 10,
-            _ => {}
-        }
-    }
-    let bps = if bd > 8 { 2 } else { 1 };
-    let size = (w * h + 2 * w.div_ceil(2) * h.div_ceil(2)) as usize * bps;
-    let mut pos = nl + 1;
-    let mut out = Vec::new();
-    while pos < data.len() && out.len() < max {
-        let fl = data[pos..].iter().position(|&b| b == b'\n').unwrap();
-        pos += fl + 1;
-        let mut f = Frame::new(w, h, bd, ChromaFormat::Yuv420);
-        f.data.copy_from_slice(&data[pos..pos + size]);
-        pos += size;
-        out.push(f);
-    }
-    out
+    av1::y4m::read(&data, max)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .1
 }
 
 fn sse(a: &Frame, b: &Frame, plane: usize) -> (f64, u64) {
@@ -108,6 +87,7 @@ struct Point {
 fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point {
     let mut cfg = Config::new(frames[0].width, frames[0].height);
     cfg.bit_depth = frames[0].bit_depth;
+    cfg.chroma = frames[0].chroma;
     cfg.quantizer = q;
     for (k, v) in sets {
         apply(&mut cfg, k, v);
@@ -130,7 +110,7 @@ fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point
             Some(&d) == enc.reconstruction(),
             "{path} q {q} frame {shown}: the decoder disagrees with the reconstruction"
         );
-        for p in 0..3 {
+        for p in 0..d.chroma.num_planes() {
             let (s, c) = sse(&frames[shown], &d, p);
             se[p] += s;
             n[p] += c;
@@ -153,7 +133,13 @@ fn run(path: &str, frames: &[Frame], q: u32, sets: &[(String, String)]) -> Point
         take(tu, &enc);
     }
     assert_eq!(shown, frames.len(), "{path}: a temporal unit per frame");
-    let p: Vec<f64> = (0..3).map(|i| psnr(se[i], n[i], bd)).collect();
+    // (Monochrome: the chroma PSNRs are luma's.)
+    let p: Vec<f64> = (0..3)
+        .map(|i| {
+            let i = if n[i] == 0 { 0 } else { i };
+            psnr(se[i], n[i], bd)
+        })
+        .collect();
     let yuv = (6.0 * p[0] + p[1] + p[2]) / 8.0;
     Point {
         clip: std::path::Path::new(path)

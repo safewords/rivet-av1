@@ -368,6 +368,81 @@ fn monochrome() {
     assert!(e.is_err());
 }
 
+/// `src` cropped to `w` x `h` (from 40, 30) in another format: luma
+/// copied, chroma taken from the 4:2:0 source's nearest sample (finer
+/// chroma repeats it), and the samples scaled to `bit_depth`.
+fn reformat(src: &Frame, w: u32, h: u32, bit_depth: u32, chroma: ChromaFormat) -> Frame {
+    let mut f = Frame::new(w, h, bit_depth, chroma);
+    let (sx, sy) = chroma.shifts();
+    for p in 0..chroma.num_planes() {
+        let pl = f.planes[p];
+        let (sx, sy) = if p == 0 { (0, 0) } else { (sx, sy) };
+        for y in 0..pl.height {
+            for x in 0..pl.width {
+                // Luma coordinates, then the source plane's.
+                let (lx, ly) = ((x << sx) + 40, (y << sy) + 30);
+                let (px, py) = if p == 0 { (lx, ly) } else { (lx >> 1, ly >> 1) };
+                let v = src.sample(p, px, py) as u32;
+                f.set_sample(
+                    p,
+                    x,
+                    y,
+                    (v << (bit_depth - 8) | v >> (16 - bit_depth)) as u16,
+                );
+            }
+        }
+    }
+    f
+}
+
+#[test]
+fn profiles_one_and_two() {
+    // 4:4:4 (profile 1), 4:2:2 and 12 bits (profile 2), at a speed with
+    // the full search and at a fast one: key and inter frames in alt-ref
+    // groups, every one decoding to the reconstruction, in its format.
+    let src = natural(4);
+    for (chroma, bit_depth, speed) in [
+        (ChromaFormat::Yuv444, 8, 4),
+        (ChromaFormat::Yuv444, 10, 8),
+        (ChromaFormat::Yuv422, 8, 6),
+        (ChromaFormat::Yuv422, 10, 4),
+        (ChromaFormat::Yuv420, 12, 6),
+        (ChromaFormat::Yuv422, 12, 8),
+        (ChromaFormat::Yuv444, 12, 6),
+        (ChromaFormat::Mono, 12, 6),
+    ] {
+        let (w, h) = (90, 66);
+        let frames: Vec<Frame> = src
+            .iter()
+            .map(|f| reformat(f, w, h, bit_depth, chroma))
+            .collect();
+        let mut cfg = Config::new(w, h);
+        cfg.chroma = chroma;
+        cfg.bit_depth = bit_depth;
+        cfg.quantizer = 80;
+        cfg.speed = if cfg!(debug_assertions) { 8 } else { speed };
+        cfg.tools = av1::Tools::for_speed(cfg.speed);
+        cfg.altref = 3;
+        let (dec, _) = round_trip(cfg, &frames);
+        for (a, b) in frames.iter().zip(&dec) {
+            assert_eq!((b.chroma, b.bit_depth), (chroma, bit_depth));
+            for p in 0..chroma.num_planes() {
+                let q = psnr(a, b, p);
+                assert!(q > 34.0, "{chroma:?} {bit_depth}-bit plane {p}: {q:.1} dB");
+            }
+        }
+    }
+    // RGB (the identity matrix) needs 4:4:4.
+    let mut cfg = Config::new(16, 16);
+    cfg.color.matrix_coefficients = 0;
+    let frame = Frame::new(16, 16, 8, ChromaFormat::Yuv420);
+    assert!(Encoder::new(cfg.clone()).encode(&frame).is_err());
+    cfg.chroma = ChromaFormat::Yuv444;
+    let frame = Frame::new(16, 16, 8, ChromaFormat::Yuv444);
+    let (dec, _) = round_trip(cfg, &[frame]);
+    assert_eq!(dec[0].color.matrix_coefficients, 0);
+}
+
 #[test]
 fn every_tool_round_trips() {
     let src = natural(4);

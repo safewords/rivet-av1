@@ -51,7 +51,7 @@ pub struct Config {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Bits per sample: 8 or 10 (profile 0, 4:2:0).
+    /// Bits per sample: 8, 10 or 12 (12 is profile 2's).
     pub bit_depth: u32,
     /// The quantiser index, 1 (finest) to 255 (coarsest); the starting
     /// point under rate control.
@@ -106,8 +106,14 @@ pub struct Config {
     /// Luma only (`mono_chrome` = 1): the encoder takes
     /// [`ChromaFormat::Mono`] frames and codes one plane. An AVIF alpha
     /// plane is coded this way (AV1 Image File Format 4: an alpha item's
-    /// sequence header has `mono_chrome` = 1).
+    /// sequence header has `mono_chrome` = 1). The same as `chroma` =
+    /// [`ChromaFormat::Mono`], which it overrides.
     pub monochrome: bool,
+    /// The chroma sampling of the frames taken: 4:2:0 (the default) and
+    /// monochrome are profile 0's at 8 and 10 bits, 4:4:4 profile 1's, 4:2:2
+    /// profile 2's; at 12 bits every format is profile 2's. The sequence
+    /// header's `seq_profile` follows from this and `bit_depth`.
+    pub chroma: ChromaFormat,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -346,6 +352,28 @@ impl Config {
             threads: 1,
             altref: DEFAULT_ALTREF,
             monochrome: false,
+            chroma: ChromaFormat::Yuv420,
+        }
+    }
+
+    /// The chroma format coded: [`Config::chroma`], or monochrome.
+    pub fn chroma_format(&self) -> ChromaFormat {
+        if self.monochrome {
+            ChromaFormat::Mono
+        } else {
+            self.chroma
+        }
+    }
+
+    /// The `seq_profile` this format and bit depth need (6.4.1): 0 for
+    /// 4:2:0 and monochrome at 8 and 10 bits, 1 for 4:4:4 at 8 and 10, 2 for
+    /// 4:2:2 and for everything at 12 bits.
+    pub fn profile(&self) -> u32 {
+        match (self.chroma_format(), self.bit_depth) {
+            (_, 12) => 2,
+            (ChromaFormat::Yuv444, _) => 1,
+            (ChromaFormat::Yuv422, _) => 2,
+            _ => 0,
         }
     }
 }
@@ -496,8 +524,10 @@ impl Encoder {
         let bits = |v: u32| 32 - (v.max(1) - 1).leading_zeros().min(31);
         let w_bits = bits(cfg.width).max(1);
         let h_bits = bits(cfg.height).max(1);
+        let chroma = cfg.chroma_format();
+        let (ss_x, ss_y) = chroma.shifts();
         let seq = SequenceHeader {
-            seq_profile: 0,
+            seq_profile: cfg.profile(),
             still_picture: false,
             reduced_still_picture_header: false,
             timing_info_present: false,
@@ -544,14 +574,14 @@ impl Encoder {
             enable_restoration: cfg.tools.restoration,
             color: ColorConfig {
                 bit_depth: cfg.bit_depth,
-                mono_chrome: cfg.monochrome,
-                num_planes: if cfg.monochrome { 1 } else { 3 },
+                mono_chrome: chroma == ChromaFormat::Mono,
+                num_planes: chroma.num_planes(),
                 color_primaries: cfg.color.color_primaries,
                 transfer_characteristics: cfg.color.transfer_characteristics,
                 matrix_coefficients: cfg.color.matrix_coefficients,
                 color_range: cfg.color.full_range,
-                subsampling_x: 1,
-                subsampling_y: 1,
+                subsampling_x: ss_x,
+                subsampling_y: ss_y,
                 chroma_sample_position: cfg.color.chroma_sample_position,
                 separate_uv_delta_q: false,
                 color_description_present: cfg.color.color_primaries != CP_UNSPECIFIED
@@ -650,22 +680,17 @@ impl Encoder {
         if frame.width != cfg.width || frame.height != cfg.height {
             return Err(Error::invalid("frame size differs from the configuration"));
         }
-        let chroma = if cfg.monochrome {
-            ChromaFormat::Mono
-        } else {
-            ChromaFormat::Yuv420
-        };
-        if frame.bit_depth != cfg.bit_depth || frame.chroma != chroma {
-            return Err(Error::invalid(if cfg.monochrome {
-                "the encoder is configured monochrome: it takes luma-only frames of the configured bit depth"
-            } else {
-                "the encoder takes 4:2:0 frames of the configured bit depth"
-            }));
+        if frame.bit_depth != cfg.bit_depth || frame.chroma != cfg.chroma_format() {
+            return Err(Error::invalid(format!(
+                "the encoder is configured for {:?} frames of {} bits",
+                cfg.chroma_format(),
+                cfg.bit_depth
+            )));
         }
-        if cfg.bit_depth != 8 && cfg.bit_depth != 10 {
-            return Err(Error::invalid("bit depth must be 8 or 10"));
+        if ![8, 10, 12].contains(&cfg.bit_depth) {
+            return Err(Error::invalid("bit depth must be 8, 10 or 12"));
         }
-        check_color(&cfg.color)?;
+        check_color(&cfg.color, cfg.chroma_format())?;
         let key = self.next_is_keyframe();
         self.force_key = false;
         self.received += 1;
@@ -867,7 +892,9 @@ impl Encoder {
         let mut w = BitWriter::new();
         w.flag(true); // show_existing_frame
         w.f(3, slot as u32); // frame_to_show_map_idx
-        w.byte_align();
+        // A frame header OBU ends in trailing_bits() (5.3.1), like every
+        // OBU but a frame or tile group.
+        w.trailing_bits();
         let mut obu = Vec::new();
         write_obu(&mut obu, OBU_FRAME_HEADER, &w.finish());
         // The encoder's decoder shows it as any decoder will.
@@ -1251,11 +1278,12 @@ impl Encoder {
         let ah = (mi_rows * MI_SIZE + 127) & !127;
         let mut src = Vec::new();
         let mut stride = Vec::new();
+        let (ssx, ssy) = frame.chroma.shifts();
         for p in 0..3 {
             let (sw, sh) = if p == 0 {
                 (aw + 32, ah + 32)
             } else {
-                ((aw >> 1) + 32, (ah >> 1) + 32)
+                ((aw >> ssx) + 32, (ah >> ssy) + 32)
             };
             if p >= frame.chroma.num_planes() {
                 // A monochrome frame: no chroma to code (the planes are
@@ -1556,7 +1584,8 @@ impl Encoder {
                 if big {
                     w.flag(false); // lr_unit_extra_shift
                 }
-                if uses_chroma_lr {
+                let c = &self.seq.color;
+                if uses_chroma_lr && c.subsampling_x != 0 && c.subsampling_y != 0 {
                     w.flag(false); // lr_uv_shift
                 }
             }
@@ -1842,19 +1871,27 @@ fn plane_sse(f: &crate::decoder::FrameCtx, src: &[Vec<u16>], stride: &[usize], p
     s
 }
 
-/// Whether the encoder can write this colour description: code points in
-/// range, and none that profile 0's 4:2:0 cannot carry (the identity
-/// matrix, and the sRGB triple that implies 4:4:4).
-fn check_color(c: &ColorInfo) -> Result<()> {
+/// Whether the encoder can write this colour description for frames of
+/// `chroma`: code points in range, and the identity matrix (RGB, and the
+/// sRGB triple that implies it) only with 4:4:4, as 6.4.2 requires.
+fn check_color(c: &ColorInfo, chroma: ChromaFormat) -> Result<()> {
     if c.color_primaries > 255 || c.transfer_characteristics > 255 || c.matrix_coefficients > 255 {
         return Err(Error::invalid("colour code points are 8-bit values"));
     }
     if c.chroma_sample_position > 3 {
         return Err(Error::invalid("chroma_sample_position is 0 to 3"));
     }
-    if c.matrix_coefficients == MC_IDENTITY {
+    if c.matrix_coefficients == MC_IDENTITY && chroma != ChromaFormat::Yuv444 {
+        return Err(Error::invalid("the identity matrix (RGB) needs 4:4:4"));
+    }
+    if c.color_primaries == CP_BT_709
+        && c.transfer_characteristics == TC_SRGB
+        && c.matrix_coefficients == MC_IDENTITY
+        && !c.full_range
+    {
+        // The sRGB triple implies full range (`color_range` is not coded).
         return Err(Error::invalid(
-            "the identity matrix (RGB) needs 4:4:4; the encoder writes 4:2:0",
+            "sRGB (BT.709, sRGB, identity) is full range",
         ));
     }
     Ok(())

@@ -1,5 +1,5 @@
-//! Encodes raw 8-bit 4:2:0 planar video (I420), or a Y4M file (8- or
-//! 10-bit 4:2:0), to an AV1 IVF file.
+//! Encodes raw 8-bit 4:2:0 planar video (I420), or a Y4M file (4:2:0,
+//! 4:2:2, 4:4:4 or monochrome; 8, 10 or 12 bits), to an AV1 IVF file.
 //!
 //! cargo run --release --example av1_ivfenc -- input.yuv WIDTH HEIGHT output.ivf [QUANTIZER] [settings]
 //! cargo run --release --example av1_ivfenc -- input.y4m output.ivf [QUANTIZER] [settings]
@@ -18,22 +18,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let data = std::fs::read(&args[1])?;
     let y4m = data.starts_with(b"YUV4MPEG2");
-    let (w, h, bd, mut rest, frames): (u32, u32, u32, usize, Vec<&[u8]>) = if y4m {
-        let nl = data.iter().position(|&b| b == b'\n').ok_or("Y4M header")?;
-        let header = std::str::from_utf8(&data[..nl])?;
-        let (mut w, mut h, mut bd) = (0u32, 0u32, 8u32);
-        for tok in header.split_whitespace() {
-            match tok.as_bytes()[0] {
-                b'W' => w = tok[1..].parse()?,
-                b'H' => h = tok[1..].parse()?,
-                b'C' if tok.contains("p10") => bd = 10,
-                _ => {}
-            }
-        }
-        let size = av1::Frame::new(w, h, bd, av1::ChromaFormat::Yuv420)
+    let (w, h, bd, chroma, mut rest, frames): (
+        u32,
+        u32,
+        u32,
+        av1::ChromaFormat,
+        usize,
+        Vec<&[u8]>,
+    ) = if y4m {
+        // Any format the encoder takes: 4:2:0, 4:2:2, 4:4:4 or
+        // monochrome, 8, 10 or 12 bits.
+        let (info, mut pos) = av1::y4m::parse_header(&data)?;
+        let size = av1::Frame::new(info.width, info.height, info.bit_depth, info.chroma)
             .data
             .len();
-        let mut pos = nl + 1;
         let mut frames = Vec::new();
         while pos < data.len() {
             let fl = data[pos..]
@@ -44,7 +42,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frames.push(&data[pos..pos + size]);
             pos += size;
         }
-        (w, h, bd, 2, frames)
+        (
+            info.width,
+            info.height,
+            info.bit_depth,
+            info.chroma,
+            2,
+            frames,
+        )
     } else {
         if args.len() < 5 {
             eprintln!("{usage}");
@@ -55,12 +60,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let size = av1::Frame::new(w, h, 8, av1::ChromaFormat::Yuv420)
             .data
             .len();
-        (w, h, 8, 4, data.chunks_exact(size).collect())
+        (
+            w,
+            h,
+            8,
+            av1::ChromaFormat::Yuv420,
+            4,
+            data.chunks_exact(size).collect(),
+        )
     };
     let output = args[rest].clone();
     rest += 1;
     let mut cfg = av1::Config::new(w, h);
     cfg.bit_depth = bd;
+    cfg.chroma = chroma;
     let mut max_frames = usize::MAX;
     for a in &args[rest..] {
         match a.split_once('=') {
@@ -93,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // out for each frame, in order, but later.)
     let mut shown = 0u64;
     for chunk in frames.iter().take(max_frames) {
-        let mut f = av1::Frame::new(w, h, bd, av1::ChromaFormat::Yuv420);
+        let mut f = av1::Frame::new(w, h, bd, chroma);
         f.data.copy_from_slice(chunk);
         let pkt = enc.encode(&f)?;
         if !pkt.is_empty() {

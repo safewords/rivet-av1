@@ -368,6 +368,14 @@ impl TileDecoder<'_, '_> {
             cands.push(PARTITION_VERT);
             cands.push(PARTITION_SPLIT);
         }
+        // Blocks whose chroma would have no size at this subsampling (a
+        // vertical half at 4:2:2: twice as tall as wide, chroma four times)
+        // are not allowed (6.10.4).
+        if self.f.num_planes > 1 {
+            cands.retain(|&p| {
+                self.f.plane_residual_size(PARTITION_SUBSIZE[p][b_size], 1) != BLOCK_INVALID
+            });
+        }
         if cands.len() == 1 {
             self.rdo().log.push(Decision::Partition(cands[0] as u8));
             return Ok(cands[0]);
