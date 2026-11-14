@@ -137,8 +137,9 @@ Frames are still decoded one after another; no frame-parallel decoding.
 ## What it encodes
 
 Profile 0 (8- or 10-bit 4:2:0, or monochrome with `Config::monochrome` —
-as an AVIF alpha plane is coded), one temporal unit per frame, every frame
-shown, any size from 1x1 up (frames wider than 4096 are coded in the tile
+as an AVIF alpha plane is coded), one temporal unit per frame shown (in
+alt-ref groups frames are coded out of display order, some hidden and shown
+later), any size from 1x1 up (frames wider than 4096 are coded in the tile
 columns they need):
 
 - **Rate-distortion search** (`encoder::rdo`). Every decision — the
@@ -169,10 +170,37 @@ columns they need):
   luma** (alphas fitted to the source); **palettes** (up to eight colours,
   their indices coded in the normative wavefront order) on frames that look
   like screen content.
-- **Inter**: the last two frames and a golden frame (the key frame, then
-  every 16th frame coded with a finer quantiser) as references, each
-  searched; **compound prediction**, the average of LAST and another
-  reference.
+- **Alt-ref groups** (`Config::altref`, 16 frames by default; speeds 0 to
+  8, `encoder::gop`): the frames are coded in a pyramid. The last frame of
+  a group first, hidden (`show_frame` = 0), then the frame half way to it,
+  hidden, and so on down to stretches of one or two frames, coded as they
+  are shown; each hidden frame is shown in its turn by a
+  `show_existing_frame` header of a few bytes. Every frame between two
+  coded ones refers to the nearest on both sides (`refresh_frame_flags`
+  keeps the hidden frames still to be shown, the group's anchor and the
+  latest frames; the order hints place them), and each is coded finer the
+  more frames refer to it: a key frame at a quantiser step 1.2 octaves
+  below the configured quantiser's, a group's alt-ref frame 0.6 below, its
+  top layer 0.5 above, the layers between evenly spaced. The encoder holds
+  a group's frames until the last of them is given, so the first temporal
+  unit comes out a group late (16 frames), then one a frame;
+  `Encoder::flush` hands out the rest, and a stream may end anywhere in a
+  group. Each group is coded in the call that completes it, so a caller
+  that times its calls (a live pipeline) sees one call in 16 take the
+  group's time; `Config::altref` = 0 codes every frame as it comes, for
+  16 % more bits (below).
+- **Inter**: in a group, up to four references searched (the nearest
+  frame on each side, the farthest after, the second nearest before; the
+  nearest on each side from speed 7), **compound prediction** of LAST with
+  a frame after it (and with LAST2, LAST3 or GOLDEN), **skip mode** (the
+  nearest frames on each side with their predicted vectors, no residual),
+  and the **motion field projected** from the references
+  (`use_ref_frame_mvs`: their vectors among the candidates). Without
+  groups (`Config::altref` = 0, and speeds 9 and 10), the last two frames
+  and a golden frame (the key frame, then every 16th frame coded with a
+  finer quantiser) as references, each searched, compound prediction of
+  LAST and another reference to speed 5, a key frame a step of 1 octave
+  finer.
 - **Transforms**: 4x4 to 64x64, every size; the full transform sets at the
   slow speeds (DCT, ADST, flipped ADST, identity and their mixes, chosen per
   transform block by trial coding), the reduced ones otherwise. A dead-zone
@@ -194,14 +222,18 @@ columns they need):
   and **loop restoration** (per unit: a Wiener filter fitted to the source
   by least squares, or a self-guided filter with fitted projection weights,
   or none; measured with the decoder's own restoration).
-- **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255), or
-  **average-bitrate rate control** to a target number of bits per frame
+- **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255 of
+  plain inter frames, and in a group the middle of its pyramid, each frame
+  offset from it by its role as above), or **average-bitrate rate
+  control** to a target number of bits per frame
   (`Config::target_bits_per_frame`): each frame's quantiser is planned over
   the next frames with a rate model per frame class refitted after every
   frame, the complexity measured on the source before coding (so a scene
   cut is priced before it is coded), what earlier frames over- or
-  under-spent repaid over 12 frames. Over 10-second clips it lands within
-  a few percent of the rate (below).
+  under-spent repaid over 12 frames; in groups, a group at a time, with a
+  model for each layer of the pyramid, the complexities measured on the
+  group's sources. Over 10-second clips it lands within a few percent of
+  the rate (below).
 - **Tiles and threads**: `Config::tile_cols_log2` tile columns, coded in
   parallel on `Config::threads` threads (the stream is the same as coding
   them in turn). From speed 5 the decision search of each tile also runs
@@ -331,31 +363,97 @@ chroma weights in the search (against counting chroma as luma: U and V
 (+2.0 % and −3.2 %) are where the two measures together gained the
 most.
 
+(The speed table, and the comparison with rav1e just above, were measured
+with every frame coded in display order, before alt-ref groups.)
+
+**Alt-ref groups, against rav1e.** The same five clips, 30 frames,
+quantisers and rav1e (with its own frame reordering); BD-rate of
+rivet-av1 against rav1e, PSNR-Y (PSNR-YUV), frames in display order (the
+encoder above, with rate-distortion optimised quantisation) and in
+alt-ref groups:
+
+| speed | frames in display order | alt-ref groups |
+|---|---|---|
+| 4 | +11.5 % (+26.5 %) | **−9.3 %** (−3.7 %) |
+| 6 | +23.3 % (+40.8 %) | **−0.1 %** (+6.5 %) |
+| 8 | +37.1 % (+54.4 %) | **+14.0 %** (+17.9 %) |
+
+Per clip at speed 6:
+
+| clip | frames in display order | alt-ref groups |
+|---|---|---|
+| foreman | +29.6 % (+45.5 %) | +13.5 % (+20.0 %) |
+| mobile | +33.7 % (+61.3 %) | −6.0 % (+2.8 %) |
+| akiyo | +43.9 % (+58.3 %) | +5.0 % (+8.4 %) |
+| ducks_take_off | +5.4 % (+24.2 %) | −8.9 % (−0.4 %) |
+| park_joy | +3.9 % (+14.8 %) | −4.0 % (+1.7 %) |
+
+Against display order: −16.1 % (−21.2 % PSNR-YUV) at speed 6, −14.1 %
+(−20.3 %) at speed 8, −15.8 % (−20.7 %) at speed 4. The time, one encode at a
+time interleaved (user CPU time, 30 frames at quantiser 128, before the
+rate-distortion optimised quantisation, which both sides now have): at
+speed 6 0.79x to 1.02x the time of display order (fewer bits to search
+and code in the coarser frames, two more references to search), 1.2x to
+1.7x rav1e's; at speed 8 1.0x to 1.1x, 0.85x rav1e's; at speed 4 0.9x
+to 1.2x, 4.7x to 7.1x rav1e's.
+
+Each step at speed 6, as it went in (before rate-distortion optimised
+quantisation), BD-rate PSNR-Y against the step before (the five clips,
+or the three 352x288 ones where it says so):
+
+| step | BD-rate |
+|---|---|
+| the alt-ref groups before (groups of 8, one hidden frame, no quantiser hierarchy), against display order | +1.2 % |
+| groups of 16 in a pyramid, the quantiser offset by layer (352x288 clips) | −10.6 % |
+| compound prediction of a reference before with one after (the tile walker had coded every compound pair as unidirectional, so a pair with a frame after was read as LAST and LAST3) (352x288 clips) | −11.2 % |
+| the motion field projected from the references (352x288 clips) | −1.3 % |
+| skip mode | −0.4 % |
+| the top layer 0.5 octave coarser (of 0.5, 0.7 and 0.9) | −1.5 % |
+| **all, against display order** | **−16.6 %** (−21.5 % PSNR-YUV) |
+| … at speed 4; at speed 8 | −16.3 % (−21.3 %); −14.4 % (−20.2 %) |
+| display order (`Config::altref` = 0): the finer key frame and the projected motion field | −6.1 % (−8.1 %) |
+
+Measured and left out: groups of 8 (+1.0 % against 16) and of 32 (+1.1 %);
+three references searched (+0.6 % against four) and five (−0.3 %, for the
+time of another search); four at speed 8 (−1.2 %, 13 % more time); groups
+at speeds 9 and 10, which do not search the references after a frame
+(+3 % to +7 %); and motion-compensated temporal filtering of the alt-ref
+frames (each 16x16 block matched in up to three frames on each side,
+samples averaged by how well their neighbourhood matches against the
+noise measured in the frame; the alt-ref frame alone or every hidden
+frame, several strengths): between −0.2 % and +0.5 %, so not kept. A
+chroma delta-q growing with each frame's quantiser (U and V together, −8 %
+or −16 % of the frame's quantiser index) trades as it does without
+groups: +1.0 % PSNR-Y for −0.6 % PSNR-YUV, +2.1 % for −0.9 %.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
-300 and 1000 kb/s, speed 6:
+300 and 1000 kb/s, speed 6, in alt-ref groups (the sources are 640x360
+crops of park_joy and ducks_take_off; the camera crops of the table
+before are not in the repository):
 
 | clip | 100 kb/s | 300 kb/s | 1000 kb/s |
 |---|---|---|---|
-| still | −1.4 % | −6.9 % | −65 % (quantiser 1: 351 kb/s is all it can use) |
-| pan | −0.1 % | +0.1 % | +0.6 % |
-| noise | +0.3 % | −0.1 % | −0.7 % |
-| scene cuts | +2.4 % | −0.4 % | +0.1 % |
+| still | +1.5 % | +0.7 % | −67 % (quantiser 1: 326 kb/s is all it can use) |
+| pan | +1.6 % | −1.4 % | −1.1 % |
+| noise | +0.8 % | −0.5 % | −1.9 % |
+| scene cuts | −0.2 % | −1.7 % | −2.3 % |
 
-Speeds 4 and 8 land likewise: within 2.6 %, but for the still clip at
-1000 kb/s.
+Speeds 4 and 8 land likewise, within 2.3 %, but for the still clip at
+1000 kb/s and two rates at the floor of what a group costs at quantiser
+255: the still clip at 100 kb/s (+8.1 % at speed 4, +7.3 % at speed 8) and
+the pan at 100 kb/s (+4.4 % at speed 4). Frames coded in display order
+land within 1.5 % on the same clips but for the still one (−2.7 % and
+−4.2 % at 100 and 300 kb/s).
 
 Not there yet:
 
-- **Reordering that pays**: `Config::altref` codes groups of frames with a
-  hidden alt-ref frame first (not shown, a backward reference and a
-  compound partner for the frames before it, then shown with
-  `show_existing_frame`; the encoder holds the group's frames and
-  `Encoder::flush` hands out the rest), but without temporal filtering of
-  the alt-ref frame or a quantiser hierarchy it costs more than it saves on
-  the test clips (+2.1 % BD-rate in groups of 8 at speed 4, +0.1 % at
-  speed 6), so it is off by default.
+- **Groups that follow the content**: a group is 16 frames whatever the
+  frames are (cut only by a key frame); a scene cut inside a group, or a
+  fast pan the alt-ref frame cannot be predicted across, is coded as if
+  it were not there. No temporal filtering of the alt-ref frames (built,
+  measured at ±0, left out: above).
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the
@@ -369,8 +467,9 @@ Not there yet:
   filters, film grain parameters.
 - **Profiles 1 and 2**, 12-bit, monochrome; lossless (quantiser 0 needs the
   forward Walsh-Hadamard transform).
-- **Lookahead**: rate control plans from the frames already coded (a
-  still scene undershoots high rates: it cannot use the bits).
+- **Lookahead**: rate control plans from the frames already coded and,
+  in groups, the group's sources (a still scene undershoots high rates: it
+  cannot use the bits).
 
 ## How it is checked
 
