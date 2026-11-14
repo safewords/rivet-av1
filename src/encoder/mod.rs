@@ -406,10 +406,12 @@ impl Tools {
             },
             // (Speeds 4 and 8 trade 100 for the inter tools' time: with
             // them, 150 is −2.0 % and −1.1 % BD-rate for 1.04x and 1.01x
-            // the time.)
+            // the time. Speed 4 goes to 200 for the chroma trials' time:
+            // +0.15 % / +0.18 % BD-rate, 1.028x rav1e's time to 0.994x.)
             split_threshold_small: match s {
                 0..=3 => 0,
-                4 | 8 => 150,
+                4 => 200,
+                8 => 150,
                 _ => 100,
             },
             rd_skip_best: s >= 4,

@@ -477,7 +477,7 @@ three rounds summed):
 
 | speed | BD-rate | time | against rav1e |
 |---|---|---|---|
-| 4 | −0.4 % (−0.6 %) | 1.01x | −2.6 % (+2.6 %) |
+| 4 | −0.4 % (−0.6 %) | 1.01x | −2.6 % (+2.6 %); −2.5 % (+2.8 %) with the split threshold at 200 (below) |
 | 6 | −0.4 % (−0.7 %) | 1.01x | −3.2 % (+2.1 %) |
 | 8 | −0.5 % (−0.7 %) | 1.015x | −2.8 % (+2.5 %) |
 
@@ -879,6 +879,15 @@ PSNR-Y — they improve the prediction of every plane alike — so they
 close neither foreman's gap (1.1 % of it) nor the gap between PSNR-Y and
 PSNR-YUV, which is in how chroma is quantised (above).
 
+With the chroma trials ("Chroma, again", above), speed 4 came to 1.028x rav1e's one-thread
+time (the five clips at quantisers 96 and 160, wall clock, one encode at
+a time beside rav1e, two rounds: foreman 0.83x, mobile 0.94x, akiyo
+0.60x, ducks_take_off 1.16x, park_joy 0.95x). Its small blocks' split
+threshold goes from 150 to 200 to pay for it: 0.994x (ducks_take_off
+1.12x, the others 0.60x to 0.92x) for +0.15 % / +0.18 % BD-rate, −2.47 %
+(+2.83 %) against rav1e; turning the chroma trials off at speed 4
+instead would cost +0.35 % / +0.57 %.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -908,8 +917,8 @@ Not there yet:
   it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
   clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
-- **PSNR-YUV at rav1e's time**: 2.1 % to 2.7 % behind at speeds 4, 6
-  and 8 (PSNR-Y 2.6 % to 3.2 % ahead); foreman and akiyo trail at every
+- **PSNR-YUV at rav1e's time**: 2.1 % to 2.8 % behind at speeds 4, 6
+  and 8 (PSNR-Y 2.5 % to 3.2 % ahead); foreman and akiyo trail at every
   tier, in PSNR-Y too. What is left is not in the quantisers or the
   weights, which only move along one trade (above), but in what the
   search makes of chroma: rav1e's key frames have 0.6 to 0.9 dB more U for
