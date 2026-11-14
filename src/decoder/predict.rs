@@ -184,90 +184,99 @@ impl TileDecoder<'_, '_> {
             above[EDGE_OFF - 1] = corner;
             left[EDGE_OFF - 1] = corner;
         }
-        let mut pred = [0u16; 64 * 64];
-        let maxv = (1i32 << bd) - 1;
-        if plane == 0 && self.b.use_filter_intra {
-            self.recursive_intra(&above, &left, w, h, &mut pred, maxv);
-        } else if is_directional_mode(mode) {
-            self.directional_intra(
-                plane, x, y, have_left, have_above, mode, w, h, max_x, max_y, &mut above,
-                &mut left, &mut pred, maxv,
-            );
-        } else if mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED {
-            let wx = sm_weights(log2w);
-            let wy = sm_weights(log2h);
-            let a = |i: usize| above[EDGE_OFF + i];
-            let l = |i: usize| left[EDGE_OFF + i];
-            for i in 0..h {
-                for j in 0..w {
-                    let v = if mode == SMOOTH_PRED {
-                        let s = wy[i] * a(j)
-                            + (256 - wy[i]) * l(h - 1)
-                            + wx[j] * l(i)
-                            + (256 - wx[j]) * a(w - 1);
-                        round2(s, 9)
-                    } else if mode == SMOOTH_V_PRED {
-                        round2(wy[i] * a(j) + (256 - wy[i]) * l(h - 1), 8)
-                    } else {
-                        round2(wx[j] * l(i) + (256 - wx[j]) * a(w - 1), 8)
-                    };
-                    pred[i * w + j] = v as u16;
+        // The prediction is made in a per-thread buffer: a block's own
+        // array would be cleared for every block (8 KB, for a 4x4 as much
+        // as for a 64x64), and every mode writes all of it.
+        thread_local! {
+            static PRED: std::cell::RefCell<[u16; 64 * 64]> =
+                const { std::cell::RefCell::new([0; 64 * 64]) };
+        }
+        PRED.with_borrow_mut(|pred| {
+            let pred = &mut pred[..w * h];
+            let maxv = (1i32 << bd) - 1;
+            if plane == 0 && self.b.use_filter_intra {
+                self.recursive_intra(&above, &left, w, h, pred, maxv);
+            } else if is_directional_mode(mode) {
+                self.directional_intra(
+                    plane, x, y, have_left, have_above, mode, w, h, max_x, max_y, &mut above,
+                    &mut left, pred, maxv,
+                );
+            } else if mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED {
+                let wx = sm_weights(log2w);
+                let wy = sm_weights(log2h);
+                let a = |i: usize| above[EDGE_OFF + i];
+                let l = |i: usize| left[EDGE_OFF + i];
+                for i in 0..h {
+                    for j in 0..w {
+                        let v = if mode == SMOOTH_PRED {
+                            let s = wy[i] * a(j)
+                                + (256 - wy[i]) * l(h - 1)
+                                + wx[j] * l(i)
+                                + (256 - wx[j]) * a(w - 1);
+                            round2(s, 9)
+                        } else if mode == SMOOTH_V_PRED {
+                            round2(wy[i] * a(j) + (256 - wy[i]) * l(h - 1), 8)
+                        } else {
+                            round2(wx[j] * l(i) + (256 - wx[j]) * a(w - 1), 8)
+                        };
+                        pred[i * w + j] = v as u16;
+                    }
                 }
-            }
-        } else if mode == DC_PRED {
-            let v = if have_left && have_above {
-                let mut sum = 0i32;
-                for k in 0..h {
-                    sum += left[EDGE_OFF + k];
-                }
-                for k in 0..w {
-                    sum += above[EDGE_OFF + k];
-                }
-                sum += ((w + h) >> 1) as i32;
-                sum / (w + h) as i32
-            } else if have_left {
-                let mut sum = 0i32;
-                for k in 0..h {
-                    sum += left[EDGE_OFF + k];
-                }
-                ((sum + (h >> 1) as i32) >> log2h).clamp(0, maxv)
-            } else if have_above {
-                let mut sum = 0i32;
-                for k in 0..w {
-                    sum += above[EDGE_OFF + k];
-                }
-                ((sum + (w >> 1) as i32) >> log2w).clamp(0, maxv)
+            } else if mode == DC_PRED {
+                let v = if have_left && have_above {
+                    let mut sum = 0i32;
+                    for k in 0..h {
+                        sum += left[EDGE_OFF + k];
+                    }
+                    for k in 0..w {
+                        sum += above[EDGE_OFF + k];
+                    }
+                    sum += ((w + h) >> 1) as i32;
+                    sum / (w + h) as i32
+                } else if have_left {
+                    let mut sum = 0i32;
+                    for k in 0..h {
+                        sum += left[EDGE_OFF + k];
+                    }
+                    ((sum + (h >> 1) as i32) >> log2h).clamp(0, maxv)
+                } else if have_above {
+                    let mut sum = 0i32;
+                    for k in 0..w {
+                        sum += above[EDGE_OFF + k];
+                    }
+                    ((sum + (w >> 1) as i32) >> log2w).clamp(0, maxv)
+                } else {
+                    1 << (bd - 1)
+                };
+                pred[..w * h].fill(v as u16);
             } else {
-                1 << (bd - 1)
-            };
-            pred[..w * h].fill(v as u16);
-        } else {
-            // PAETH_PRED
-            let tl = above[EDGE_OFF - 1];
-            for i in 0..h {
-                for j in 0..w {
-                    let a = above[EDGE_OFF + j];
-                    let l = left[EDGE_OFF + i];
-                    let base = a + l - tl;
-                    let p_left = (base - l).abs();
-                    let p_top = (base - a).abs();
-                    let p_top_left = (base - tl).abs();
-                    let v = if p_left <= p_top && p_left <= p_top_left {
-                        l
-                    } else if p_top <= p_top_left {
-                        a
-                    } else {
-                        tl
-                    };
-                    pred[i * w + j] = v as u16;
+                // PAETH_PRED
+                let tl = above[EDGE_OFF - 1];
+                for i in 0..h {
+                    for j in 0..w {
+                        let a = above[EDGE_OFF + j];
+                        let l = left[EDGE_OFF + i];
+                        let base = a + l - tl;
+                        let p_left = (base - l).abs();
+                        let p_top = (base - a).abs();
+                        let p_top_left = (base - tl).abs();
+                        let v = if p_left <= p_top && p_left <= p_top_left {
+                            l
+                        } else if p_top <= p_top_left {
+                            a
+                        } else {
+                            tl
+                        };
+                        pred[i * w + j] = v as u16;
+                    }
                 }
             }
-        }
-        let cur = &mut self.f.cur.planes[plane];
-        for i in 0..h {
-            let row = &mut cur.data[(y + i) * cur.stride + x..(y + i) * cur.stride + x + w];
-            row.copy_from_slice(&pred[i * w..(i + 1) * w]);
-        }
+            let cur = &mut self.f.cur.planes[plane];
+            for i in 0..h {
+                let row = &mut cur.data[(y + i) * cur.stride + x..(y + i) * cur.stride + x + w];
+                row.copy_from_slice(&pred[i * w..(i + 1) * w]);
+            }
+        });
     }
 
     /// The recursive intra prediction process (7.11.2.3).
@@ -392,22 +401,34 @@ impl TileDecoder<'_, '_> {
         };
         let a = |i: i32| above[(EDGE_OFF as i32 + i) as usize];
         let l = |i: i32| left[(EDGE_OFF as i32 + i) as usize];
-        for i in 0..hi {
-            for j in 0..wi {
-                let v = if p_angle < 90 {
-                    let idx = (i + 1) * dx;
-                    let base = (idx >> (6 - upsample_above)) + (j << upsample_above);
-                    let shift = ((idx << upsample_above) >> 1) & 0x1F;
-                    let max_base_x = (wi + hi - 1) << upsample_above;
-                    if base < max_base_x {
+        // The process of 7.11.2.4 for each sample, with the tests of the
+        // angle taken out of the loops: in the first and third ranges the
+        // position's fraction (`shift`) is the same along a row, or a
+        // column, and the edge sample advances one (or two, upsampled) a
+        // step.
+        if p_angle < 90 {
+            let max_base_x = (wi + hi - 1) << upsample_above;
+            for i in 0..hi {
+                let idx = (i + 1) * dx;
+                let base0 = idx >> (6 - upsample_above);
+                let shift = ((idx << upsample_above) >> 1) & 0x1F;
+                let row = &mut pred[i as usize * w..(i as usize + 1) * w];
+                for (j, p) in row.iter_mut().enumerate() {
+                    let base = base0 + ((j as i32) << upsample_above);
+                    let v = if base < max_base_x {
                         round2(a(base) * (32 - shift) + a(base + 1) * shift, 5)
                     } else {
                         a(max_base_x)
-                    }
-                } else if p_angle > 90 && p_angle < 180 {
+                    };
+                    *p = v as u16;
+                }
+            }
+        } else if p_angle > 90 && p_angle < 180 {
+            for i in 0..hi {
+                for j in 0..wi {
                     let idx = (j << 6) - (i + 1) * dx;
                     let base = idx >> (6 - upsample_above);
-                    if base >= -(1 << upsample_above) {
+                    let v = if base >= -(1 << upsample_above) {
                         let shift = ((idx << upsample_above) >> 1) & 0x1F;
                         round2(a(base) * (32 - shift) + a(base + 1) * shift, 5)
                     } else {
@@ -415,18 +436,30 @@ impl TileDecoder<'_, '_> {
                         let base = idx >> (6 - upsample_left);
                         let shift = ((idx << upsample_left) >> 1) & 0x1F;
                         round2(l(base) * (32 - shift) + l(base + 1) * shift, 5)
-                    }
-                } else if p_angle > 180 {
-                    let idx = (j + 1) * dy;
-                    let base = (idx >> (6 - upsample_left)) + (i << upsample_left);
-                    let shift = ((idx << upsample_left) >> 1) & 0x1F;
-                    round2(l(base) * (32 - shift) + l(base + 1) * shift, 5)
-                } else if p_angle == 90 {
-                    a(j)
-                } else {
-                    l(i)
-                };
-                pred[(i * wi + j) as usize] = v as u16;
+                    };
+                    pred[(i * wi + j) as usize] = v as u16;
+                }
+            }
+        } else if p_angle > 180 {
+            for j in 0..wi {
+                let idx = (j + 1) * dy;
+                let base0 = idx >> (6 - upsample_left);
+                let shift = ((idx << upsample_left) >> 1) & 0x1F;
+                for i in 0..hi {
+                    let base = base0 + (i << upsample_left);
+                    let v = round2(l(base) * (32 - shift) + l(base + 1) * shift, 5);
+                    pred[(i * wi + j) as usize] = v as u16;
+                }
+            }
+        } else if p_angle == 90 {
+            for row in pred[..w * h].chunks_exact_mut(w) {
+                for (j, p) in row.iter_mut().enumerate() {
+                    *p = a(j as i32) as u16;
+                }
+            }
+        } else {
+            for (i, row) in pred[..w * h].chunks_exact_mut(w).enumerate() {
+                row.fill(l(i as i32) as u16);
             }
         }
     }

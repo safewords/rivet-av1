@@ -24,7 +24,10 @@ impl Px for i32 {
 }
 
 /// Sum of absolute differences over `h` rows of `w` samples, or
-/// `u64::MAX` once the sum (checked after each row) exceeds `limit`.
+/// `u64::MAX` if it exceeds `limit`. The sum is checked against the limit
+/// as it grows, to stop early; how often does not change the result (a
+/// partial sum above the limit means the whole one is), so each version
+/// checks where it suits it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sad(
     a: &[u16],
@@ -41,7 +44,7 @@ pub(crate) fn sad(
         return unsafe { sad_avx2(a, a_stride, b, b_stride, w, h, limit) };
     }
     #[cfg(target_arch = "aarch64")]
-    if w >= 8 {
+    if w >= 4 {
         // SAFETY: NEON is part of the aarch64 baseline.
         return unsafe { sad_neon(a, a_stride, b, b_stride, w, h, limit) };
     }
@@ -136,25 +139,42 @@ unsafe fn sad_neon(
 ) -> u64 {
     use std::arch::aarch64::*;
     let mut s = 0u64;
-    for i in 0..h {
-        let ra = &a[i * a_stride..i * a_stride + w];
-        let rb = &b[i * b_stride..i * b_stride + w];
+    // Four rows at a time between checks of the limit, the lanes summed
+    // once for them (a lane holds at most 4 * 2 * 4095 per 8 samples of a
+    // row: no overflow at any width).
+    let mut i = 0;
+    while i < h {
+        let rows = (h - i).min(4);
         let mut acc = vdupq_n_u32(0);
-        let mut j = 0;
-        while j + 8 <= w {
-            // SAFETY: j + 8 <= w, the length of both rows.
-            let (x, y) = unsafe { (vld1q_u16(ra.as_ptr().add(j)), vld1q_u16(rb.as_ptr().add(j))) };
-            acc = vpadalq_u16(acc, vabdq_u16(x, y));
-            j += 8;
+        let mut acc4 = vdup_n_u32(0);
+        let mut tail = 0u32;
+        for r in i..i + rows {
+            let ra = &a[r * a_stride..r * a_stride + w];
+            let rb = &b[r * b_stride..r * b_stride + w];
+            let mut j = 0;
+            while j + 8 <= w {
+                // SAFETY: j + 8 <= w, the length of both rows.
+                let (x, y) =
+                    unsafe { (vld1q_u16(ra.as_ptr().add(j)), vld1q_u16(rb.as_ptr().add(j))) };
+                acc = vpadalq_u16(acc, vabdq_u16(x, y));
+                j += 8;
+            }
+            if j + 4 <= w {
+                // SAFETY: j + 4 <= w, the length of both rows.
+                let (x, y) =
+                    unsafe { (vld1_u16(ra.as_ptr().add(j)), vld1_u16(rb.as_ptr().add(j))) };
+                acc4 = vpadal_u16(acc4, vabd_u16(x, y));
+                j += 4;
+            }
+            for k in j..w {
+                tail += (ra[k] as i32 - rb[k] as i32).unsigned_abs();
+            }
         }
-        let mut t = vaddvq_u32(acc);
-        for k in j..w {
-            t += (ra[k] as i32 - rb[k] as i32).unsigned_abs();
-        }
-        s += t as u64;
+        s += (vaddvq_u32(acc) + vaddv_u32(acc4) + tail) as u64;
         if s > limit {
             return u64::MAX;
         }
+        i += rows;
     }
     s
 }
@@ -510,7 +530,7 @@ mod tests {
                     satd_scalar(&a, 160, &bi, w, w, h),
                     "satd i32 {w}x{h}"
                 );
-                for limit in [u64::MAX, 1000] {
+                for limit in [u64::MAX, 1000, 20_000, 0] {
                     assert_eq!(
                         sad(&a, 160, &b, 136, w, h, limit),
                         sad_scalar(&a, 160, &b, 136, w, h, limit),
@@ -521,6 +541,17 @@ mod tests {
                     sse_row(&a[..w], &b[3..3 + w]),
                     sse_row_scalar(&a[..w], &b[3..3 + w])
                 );
+            }
+            // The SAD of any rectangle, against limits it passes at
+            // different rows.
+            for (w, h) in [(4, 1), (8, 3), (12, 7), (20, 5), (6, 9), (128, 64)] {
+                for limit in [u64::MAX, 0, 100, 1000, 20_000, 300_000] {
+                    assert_eq!(
+                        sad(&a, 160, &b, 136, w, h, limit),
+                        sad_scalar(&a, 160, &b, 136, w, h, limit),
+                        "sad {w}x{h} limit {limit}"
+                    );
+                }
             }
         }
     }

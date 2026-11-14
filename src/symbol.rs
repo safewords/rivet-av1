@@ -480,6 +480,7 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: usize) {
 /// `d`. At the end it picks the code value in the final interval whose
 /// window starts with the one bit `exit_symbol()` expects, followed by
 /// zeros.
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) struct SymbolEncoder {
     out: Vec<u8>,
     /// The low end of the interval: the bits not yet flushed to `out`.
@@ -521,6 +522,60 @@ pub(crate) fn symbol_cost(cdf: &[u16], symbol: usize) -> u32 {
     cost_table()[((hi - lo) >> 3) as usize]
 }
 
+/// Where an encoder's writer sends its symbols: to be coded (a
+/// [`SymbolEncoder`], which counts them itself when trial coding), or to
+/// have their costs added up ([`CostCounter`]).
+pub(crate) trait SymbolSink {
+    fn symbol(&mut self, cdf: &mut [u16], symbol: usize);
+    fn bool(&mut self, bit: u32);
+}
+
+impl SymbolSink for SymbolEncoder {
+    #[inline(always)]
+    fn symbol(&mut self, cdf: &mut [u16], symbol: usize) {
+        self.write_symbol(cdf, symbol);
+    }
+
+    #[inline(always)]
+    fn bool(&mut self, bit: u32) {
+        self.write_bool(bit);
+    }
+}
+
+/// The costs of symbols, in 1/256 bit, as trial coding counts them
+/// ([`symbol_cost`]), with the table in hand.
+pub(crate) struct CostCounter {
+    pub(crate) bits: u64,
+    table: &'static [u32; 4097],
+}
+
+impl CostCounter {
+    pub(crate) fn new() -> Self {
+        CostCounter {
+            bits: 0,
+            table: cost_table(),
+        }
+    }
+}
+
+impl SymbolSink for CostCounter {
+    #[inline(always)]
+    fn symbol(&mut self, cdf: &mut [u16], symbol: usize) {
+        let hi = cdf[symbol] as u32;
+        let lo = if symbol > 0 {
+            cdf[symbol - 1] as u32
+        } else {
+            0
+        };
+        self.bits += self.table[((hi - lo) >> 3) as usize] as u64;
+    }
+
+    #[inline(always)]
+    fn bool(&mut self, _bit: u32) {
+        self.bits += 256;
+    }
+}
+
 impl SymbolEncoder {
     pub(crate) fn new(disable_update: bool) -> Self {
         SymbolEncoder {
@@ -545,12 +600,21 @@ impl SymbolEncoder {
         }
     }
 
-    /// Codes `symbol` with `cdf` (N + 1 entries) and adapts it.
+    /// Codes `symbol` with `cdf` (N + 1 entries) and adapts it. (Trial
+    /// coding, a table lookup, is where it is called; the coding is out of
+    /// line.)
+    #[inline(always)]
     pub(crate) fn write_symbol(&mut self, cdf: &mut [u16], symbol: usize) {
         if self.counting {
             self.bits += symbol_cost(cdf, symbol) as u64;
             return;
         }
+        self.code_symbol(cdf, symbol);
+    }
+
+    /// [`Self::write_symbol`] when not counting.
+    #[inline(never)]
+    fn code_symbol(&mut self, cdf: &mut [u16], symbol: usize) {
         let n = cdf.len() - 1;
         let r = self.range;
         let thresh = |s: isize| -> u32 {
@@ -586,6 +650,7 @@ impl SymbolEncoder {
     }
 
     /// An equiprobable bit (`read_bool()`).
+    #[inline]
     pub(crate) fn write_bool(&mut self, bit: u32) {
         if self.counting {
             self.bits += 256;
@@ -594,7 +659,7 @@ impl SymbolEncoder {
         let mut cdf = [1u16 << 14, 1 << 15, 0];
         let save = self.disable_update;
         self.disable_update = true;
-        self.write_symbol(&mut cdf, bit as usize);
+        self.code_symbol(&mut cdf, bit as usize);
         self.disable_update = save;
     }
 

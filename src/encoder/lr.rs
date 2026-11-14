@@ -253,41 +253,63 @@ fn fit_wiener(
     // Coefficients as fractions of 128: index 0 outermost.
     let mut hc = [0f64; 3];
     let mut vc = [0f64; 3];
+    // The other direction's filter at the samples the fit reads, each
+    // worked out once rather than for each of the seven positions whose
+    // line it lies on: `pre[r * ww + c]` (the same sums as before, in the
+    // same order, so the same values).
+    let mut pre = Vec::new();
     for iter in 0..3 {
         let vertical = iter % 2 == 0;
+        let other = if vertical { hc } else { vc };
         let mut m = [[0f64; 3]; 3];
         let mut v = [0f64; 3];
         for (ctx, y0, h) in rects {
             lr_window(ctx, x0, *y0, w, *h, buf);
             let win = &buf.win;
             let at = |r: usize, c: usize| win[r * ww + c] as f64;
+            // The other direction at (r, c).
+            let filtered = |r: usize, c: usize| {
+                let center = at(r, c);
+                let mut s = center;
+                for k in 0..3 {
+                    let d = 3 - k;
+                    let (a, b) = if vertical {
+                        (at(r, c - d), at(r, c + d))
+                    } else {
+                        (at(r - d, c), at(r + d, c))
+                    };
+                    s += other[k] * (a + b - 2.0 * center);
+                }
+                s
+            };
+            pre.resize(ww * (*h + 2 * LRB), 0.0);
+            if vertical {
+                // Every row, the columns of the positions fitted.
+                for r in 0..*h + 2 * LRB {
+                    for j in (0..w).step_by(step) {
+                        pre[r * ww + j + LRB] = filtered(r, j + LRB);
+                    }
+                }
+            } else {
+                // The rows of the positions fitted, every column.
+                for i in (0..*h).step_by(step) {
+                    for c in 0..ww {
+                        pre[(i + LRB) * ww + c] = filtered(i + LRB, c);
+                    }
+                }
+            }
             for i in (0..*h).step_by(step) {
                 let so = (*y0 as usize + i) * stride[plane] + x0 as usize;
                 for j in (0..w).step_by(step) {
                     // The other direction's filter applied first: the
                     // samples along this direction (7 of them).
-                    let mut line = [0f64; 7];
-                    for (t, l) in line.iter_mut().enumerate() {
-                        let (r, c) = if vertical {
-                            (i + t, j + LRB)
+                    let line: [f64; 7] = std::array::from_fn(|t| {
+                        if vertical {
+                            pre[(i + t) * ww + j + LRB]
                         } else {
-                            (i + LRB, j + t)
-                        };
-                        // The other direction at (r, c).
-                        let other = if vertical { &hc } else { &vc };
-                        let center = at(r, c);
-                        let mut s = center;
-                        for k in 0..3 {
-                            let d = 3 - k;
-                            let (a, b) = if vertical {
-                                (at(r, c - d), at(r, c + d))
-                            } else {
-                                (at(r - d, c), at(r + d, c))
-                            };
-                            s += other[k] * (a + b - 2.0 * center);
+                            pre[(i + LRB) * ww + j + t]
                         }
-                        *l = s;
-                    }
+                    });
                     let target = src[plane][so + j] as f64 - line[3];
                     let d: [f64; 3] =
                         std::array::from_fn(|k| line[k] + line[6 - k] - 2.0 * line[3]);

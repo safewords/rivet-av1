@@ -17,7 +17,7 @@ use crate::decoder::state::Mv;
 use crate::decoder::tile::{Plan, TileDecoder};
 use crate::dsp::enc::{sad, satd};
 use crate::encoder::Tools;
-use crate::encoder::fwd::{coef_bound, forward_2d};
+use crate::encoder::fwd::{Quantiser, coef_bound, forward_quantise};
 use crate::encoder::rdo::{Decision, Rdo};
 use crate::symbol::Coder;
 use crate::tables::*;
@@ -104,6 +104,38 @@ const SQUARE8: [(i32, i32); 8] = [
 thread_local! {
     /// Scratch for inter predictions.
     static PRED: std::cell::RefCell<[Vec<i32>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+}
+
+/// A transform block's levels as [`forward_quantise`] gave them, kept for
+/// when the same residual is quantised again with the same transform and
+/// quantiser: the search codes a block many times over (each candidate
+/// that holds it, then the winner again for real, at every level of the
+/// partition search above it), and over half of the transforms at the
+/// slower speeds are of residuals already transformed. The levels are a
+/// function of the residual, the size and type and the quantiser alone,
+/// all of which the entry holds, so they are the same whether they are
+/// worked out again or not.
+#[derive(Default)]
+struct QEntry {
+    /// Size, type, and the quantiser's `ac_r`, `dc_r` and dead zone (as
+    /// bits).
+    key: Option<(u8, u8, u64, u64, u64)>,
+    res: Vec<i32>,
+    levels: Vec<i32>,
+    /// The coefficients, `tw` a row.
+    coefs: Vec<f64>,
+    eob: usize,
+}
+
+/// The entries of the cache, picked by where the block lies (a block
+/// coded again is mostly coded again soon). Blocks of the 64-sample
+/// transforms are not kept: an entry is then 8 KB at most.
+const QCACHE_SLOTS: usize = 2048;
+
+thread_local! {
+    static QCACHE: std::cell::RefCell<Vec<QEntry>> = std::cell::RefCell::new(
+        (0..QCACHE_SLOTS).map(|_| QEntry::default()).collect()
+    );
 }
 
 /// The luma intra modes the encoder tries, with a rough cost in bits for
@@ -1037,9 +1069,21 @@ impl TileDecoder<'_, '_> {
                     let r0 = (x0 + dx) as usize;
                     s += sad(srow, w, &row[r0..r0 + w], w, w, 1, u64::MAX);
                 } else {
-                    for j in 0..w as i32 {
-                        let rx = (x0 + j + dx).clamp(0, last_x) as usize;
-                        s += (srow[j as usize] as i32 - row[rx] as i32).unsigned_abs() as u64;
+                    // The samples left of the reference (which read its
+                    // first), those inside it, those right of it (its
+                    // last).
+                    let (wi, rx0) = (w as i32, x0 + dx);
+                    let jl = (-rx0).clamp(0, wi) as usize;
+                    let jr = (last_x + 1 - rx0).clamp(jl as i32, wi) as usize;
+                    let edge = |part: &[u16], v: u16| -> u64 {
+                        part.iter()
+                            .map(|&a| (a as i32 - v as i32).unsigned_abs() as u64)
+                            .sum()
+                    };
+                    s += edge(&srow[..jl], row[0]) + edge(&srow[jr..], row[last_x as usize]);
+                    if jr > jl {
+                        let r0 = (rx0 + jl as i32) as usize;
+                        s += sad(&srow[jl..jr], w, &row[r0..], w, jr - jl, 1, u64::MAX);
                     }
                 }
                 if s > best {
@@ -1234,9 +1278,7 @@ impl TileDecoder<'_, '_> {
         let tw = w.min(32);
         let th = h.min(32);
         let mut res = std::mem::take(&mut self.enc.as_mut().expect("encode mode").res);
-        let mut c = std::mem::take(&mut self.enc.as_mut().expect("encode mode").fc);
         res.resize(64 * 64, 0);
-        c.resize(64 * 64, 0.0);
         let mut sum_abs = 0u32;
         {
             let e = self.enc();
@@ -1285,38 +1327,79 @@ impl TileDecoder<'_, '_> {
         // Every level zero when no coefficient can reach the dead zones.
         let top = sum_abs as f64 * coef_bound(tx_sz, tx_type);
         let enc = self.enc.as_mut().expect("encode mode");
-        enc.coefs.fill(0);
         if top * ac_r < dz && top * dc_r < 0.5 {
+            // (Only the first `tw * th`, the block's, are read: the levels
+            // below write all of them.)
+            enc.coefs[..tw * th].fill(0);
             enc.res = res;
-            enc.fc = c;
             self.plane_tx_type = tx_type;
             return 0;
         }
-        forward_2d(&res[..w * h], tx_sz, tx_type, &mut c[..w * h]);
-        const MAX_LEVEL: f64 = ((1 << 20) - 1) as f64;
-        for i in 0..th {
-            let row = &c[i * w..i * w + tw];
-            let out = &mut enc.coefs[i * tw..(i + 1) * tw];
-            for (o, &v) in out.iter_mut().zip(row) {
-                let l = (v.abs() * ac_r + (1.0 - dz)).floor().min(MAX_LEVEL) as i32;
-                *o = if v < 0.0 { -l } else { l };
-            }
-        }
-        let v = c[0];
-        let l = (v.abs() * dc_r + 0.5).floor().min(MAX_LEVEL) as i32;
-        enc.coefs[0] = if v < 0.0 { -l } else { l };
+        let mut fc = std::mem::take(&mut enc.fc);
+        fc.resize(64 * 64, 0.0);
+        // The levels, and the end of block in the scan the decoder will use
+        // (or what they were when this block was last quantised so), and
+        // the coefficients (for `rdoq`).
+        let q = Quantiser {
+            ac_r,
+            dc_r,
+            ac_round: 1.0 - dz,
+        };
+        let iscan = crate::decoder::residual::inverse_scan(tx_sz, tx_type);
+        let eob = if TX_SIZE_SQR_UP[tx_sz] == TX_64X64 {
+            forward_quantise(
+                &res[..w * h],
+                tx_sz,
+                tx_type,
+                q,
+                iscan,
+                &mut enc.coefs[..],
+                &mut fc,
+            )
+        } else {
+            let slot =
+                ((y >> 2) * 61 + (x >> 2) * 7 + plane * 3 + tx_sz * 5 + tx_type) % QCACHE_SLOTS;
+            QCACHE.with_borrow_mut(|cache| {
+                let entry = &mut cache[slot];
+                let key = (
+                    tx_sz as u8,
+                    tx_type as u8,
+                    ac_r.to_bits(),
+                    dc_r.to_bits(),
+                    dz.to_bits(),
+                );
+                if entry.key == Some(key) && entry.res[..] == res[..w * h] {
+                    enc.coefs[..tw * th].copy_from_slice(&entry.levels);
+                    for (k, row) in entry.coefs.chunks_exact(tw).enumerate() {
+                        fc[k * w..k * w + tw].copy_from_slice(row);
+                    }
+                    return entry.eob;
+                }
+                let eob = forward_quantise(
+                    &res[..w * h],
+                    tx_sz,
+                    tx_type,
+                    q,
+                    iscan,
+                    &mut enc.coefs[..],
+                    &mut fc,
+                );
+                entry.key = Some(key);
+                entry.res.clear();
+                entry.res.extend_from_slice(&res[..w * h]);
+                entry.levels.clear();
+                entry.levels.extend_from_slice(&enc.coefs[..tw * th]);
+                entry.coefs.clear();
+                for k in 0..th {
+                    entry.coefs.extend_from_slice(&fc[k * w..k * w + tw]);
+                }
+                entry.eob = eob;
+                eob
+            })
+        };
         enc.res = res;
-        enc.fc = c;
-        // The end of block in the scan the decoder will use.
+        enc.fc = fc;
         self.plane_tx_type = tx_type;
-        let scan = crate::decoder::residual::scan_for(tx_sz, tx_type);
-        let enc = self.enc.as_ref().expect("encode mode");
-        let mut eob = 0;
-        for (k, &p) in scan.iter().enumerate() {
-            if enc.coefs[p as usize] != 0 {
-                eob = k + 1;
-            }
-        }
         eob
     }
 
@@ -1509,7 +1592,7 @@ impl TileDecoder<'_, '_> {
             let bits0 = self.sd.trial_bits();
             let eob = self.coeffs(0, x, y, tx_sz);
             if eob > 0 {
-                self.reconstruct(0, x, y, tx_sz);
+                self.reconstruct_decode(0, x, y, tx_sz, eob, None);
             }
             let bits = self.sd.trial_bits() - bits0;
             let sse = self.px_sse(0, x, y, w, h);

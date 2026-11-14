@@ -1487,52 +1487,82 @@ pub(crate) fn box_filter_rect(
         // Window row of position i - 1, box rows from it - r to it + r.
         let wy = i + LRB - 1;
         let (ya, yb) = (wy - ru, wy + ru + 1);
+        // The box of position j spans window columns j + LRB - 1 - r to
+        // j + LRB + r: integral image columns xa = j + LRB - 1 - r and
+        // xb = xa + 2r + 1.
+        let x_a = LRB - 1 - ru;
+        let x_b = x_a + 2 * ru + 1;
+        let (qa, qb) = (
+            &buf.sq[ya * iw..(ya + 1) * iw],
+            &buf.sq[yb * iw..(yb + 1) * iw],
+        );
+        let (sa, sb) = (
+            &buf.sum[ya * iw..(ya + 1) * iw],
+            &buf.sum[yb * iw..(yb + 1) * iw],
+        );
+        let (ar, br) = (
+            &mut buf.a[i * aw..(i + 1) * aw],
+            &mut buf.b[i * aw..(i + 1) * aw],
+        );
         for j in 0..w + 2 {
-            let wx = j + LRB - 1;
-            let (xa, xb) = (wx - ru, wx + ru + 1);
-            let boxed =
-                |t: &[i64]| t[yb * iw + xb] - t[ya * iw + xb] - t[yb * iw + xa] + t[ya * iw + xa];
-            let a = boxed(&buf.sq);
-            let b = boxed(&buf.sum) as i32;
+            let (xa, xb) = (j + x_a, j + x_b);
+            let a = qb[xb] - qa[xb] - qb[xa] + qa[xa];
+            let b = (sb[xb] - sa[xb] - sb[xa] + sa[xa]) as i32;
             let a = round2_64(a, 2 * (bd - 8));
             let d = round2(b, bd - 8) as i64;
             let p = (a * n as i64 - d * d).max(0);
             let z = round2_64(p * s as i64, SGRPROJ_MTABLE_BITS as u32);
             let a2 = SGR_A2[z.min(255) as usize];
             let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) as i64 * b as i64 * one_over_n as i64;
-            buf.a[i * aw + j] = a2;
-            buf.b[i * aw + j] = round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
+            ar[j] = a2;
+            br[j] = round2_64(b2, SGRPROJ_RECIP_BITS as u32) as i32;
         }
     }
+    let cdef = ctx.cdef;
     for i in 0..h {
         // Row parity of the frame (rectangles start on even rows, as the
         // 4x4 blocks of the process do).
         let yabs = y0 + i as i32;
         let shift = if pass == 0 && (yabs & 1) != 0 { 4 } else { 5 };
-        for j in 0..w {
-            let mut a = 0i32;
-            let mut b = 0i32;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let weight = if pass == 0 {
-                        if ((yabs + dy) & 1) != 0 {
-                            if dx == 0 { 6 } else { 5 }
-                        } else {
-                            0
-                        }
-                    } else if dx == 0 || dy == 0 {
-                        4
-                    } else {
-                        3
-                    };
-                    let k = (i as i32 + 1 + dy) as usize * aw + (j as i32 + 1 + dx) as usize;
-                    a += weight * buf.a[k];
-                    b += weight * buf.b[k];
-                }
+        let round = (SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as u32;
+        let co = (y0 as usize + i) * cdef.stride + x0 as usize;
+        let u = &cdef.data[co..co + w];
+        let out = &mut buf.flt[pass][i * w..(i + 1) * w];
+        // The rows of A and B above, at and below the position: each
+        // position's 3x3 neighbourhood is columns j to j + 2 of them.
+        let (a0, a1, a2) = (
+            &buf.a[i * aw..(i + 1) * aw],
+            &buf.a[(i + 1) * aw..(i + 2) * aw],
+            &buf.a[(i + 2) * aw..(i + 3) * aw],
+        );
+        let (b0, b1, b2) = (
+            &buf.b[i * aw..(i + 1) * aw],
+            &buf.b[(i + 1) * aw..(i + 2) * aw],
+            &buf.b[(i + 2) * aw..(i + 3) * aw],
+        );
+        // The weights of 7.17.3: the first filter weighs the odd rows
+        // alone, 5 6 5 across (the row itself on an odd row, the rows
+        // above and below on an even one); the second 3 4 3, 4 4 4, 3 4 3.
+        let w565 = |t: &[i32], j: usize| 5 * t[j] + 6 * t[j + 1] + 5 * t[j + 2];
+        let w343 = |t: &[i32], j: usize| 3 * t[j] + 4 * t[j + 1] + 3 * t[j + 2];
+        let w444 = |t: &[i32], j: usize| 4 * (t[j] + t[j + 1] + t[j + 2]);
+        if pass == 0 && yabs & 1 != 0 {
+            for j in 0..w {
+                let v = w565(a1, j) * u[j] as i32 + w565(b1, j);
+                out[j] = round2(v, round);
             }
-            let v = a * ctx.cdef.get(x0 as usize + j, y0 as usize + i) as i32 + b;
-            buf.flt[pass][i * w + j] =
-                round2(v, (SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as u32);
+        } else if pass == 0 {
+            for j in 0..w {
+                let a = w565(a0, j) + w565(a2, j);
+                let b = w565(b0, j) + w565(b2, j);
+                out[j] = round2(a * u[j] as i32 + b, round);
+            }
+        } else {
+            for j in 0..w {
+                let a = w343(a0, j) + w444(a1, j) + w343(a2, j);
+                let b = w343(b0, j) + w444(b1, j) + w343(b2, j);
+                out[j] = round2(a * u[j] as i32 + b, round);
+            }
         }
     }
 }

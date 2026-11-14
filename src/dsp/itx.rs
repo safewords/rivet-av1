@@ -891,6 +891,44 @@ fn inverse_transform_2d_lanes(
     tx_sz: usize,
     tx_type: usize,
     bit_depth: u32,
+    within: (usize, usize),
+    residual: &mut [i32],
+) {
+    // The lines' scratch is as long as the longer side: cleared for every
+    // block, 64 lines of eight would cost a 4x4 or an 8x8 more than its
+    // transform does.
+    let n = TX_WIDTH_LOG2[tx_sz].max(TX_HEIGHT_LOG2[tx_sz]);
+    match n {
+        0..=3 => {
+            inverse_transform_2d_lanes_n::<8>(dequant, tx_sz, tx_type, bit_depth, within, residual)
+        }
+        4 => {
+            inverse_transform_2d_lanes_n::<16>(dequant, tx_sz, tx_type, bit_depth, within, residual)
+        }
+        5 => {
+            inverse_transform_2d_lanes_n::<32>(dequant, tx_sz, tx_type, bit_depth, within, residual)
+        }
+        _ => {
+            inverse_transform_2d_lanes_n::<64>(dequant, tx_sz, tx_type, bit_depth, within, residual)
+        }
+    }
+}
+
+/// [`inverse_transform_2d_lanes`] for sides of at most `N`.
+#[inline(always)]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn inverse_transform_2d_lanes_n<const N: usize>(
+    dequant: &[i32],
+    tx_sz: usize,
+    tx_type: usize,
+    bit_depth: u32,
     (rows, cols): (usize, usize),
     residual: &mut [i32],
 ) {
@@ -906,7 +944,7 @@ fn inverse_transform_2d_lanes(
     let rect = log2w.abs_diff(log2h) == 1;
     let lo = -(1i32 << (col_clamp - 1));
     let hi = (1i32 << (col_clamp - 1)) - 1;
-    let mut t = [Lanes::zero(); 64];
+    let mut t = [Lanes::zero(); N];
     // Rows, eight at a time (the 4-high sizes one by one), each clamped
     // for the column transforms as it is stored. `done` rows are stored.
     let done;

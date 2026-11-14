@@ -10,7 +10,16 @@
 //! encoder runs too: every symbol goes through `Coder`, which reads it
 //! when decoding and writes the value the encoder planted when encoding,
 //! and every context is derived from `Quant` as the specification writes
-//! it. The encoder always uses it, and it is not to be bent for speed.
+//! it. It is not to be bent for speed.
+//!
+//! Its levels and signs (`levels_reference`) have an encoder's version,
+//! `levels_encode`, which the encoder codes them with: it writes from the
+//! levels the encoder chose, with the decode-only reader's scan maps and
+//! padded level map for the contexts (below), and straight to the symbol
+//! encoder. That is where the encoder's trial coding spends its time.
+//! `levels_checked` runs both from the same state and panics unless the
+//! symbols (or their cost), the CDFs, `Quant` and what they return are the
+//! same; a test encodes with it on every transform block.
 //!
 //! `coeffs_decode` is the same syntax for decoding alone, where most of a
 //! decode's symbols are read: no encoder values to carry; each scan worked
@@ -37,6 +46,7 @@ use crate::decoder::CoefficientReader;
 use crate::decoder::record::Pass;
 use crate::decoder::tile::{TileDecoder, find_tx_size};
 use crate::dsp::itx::inverse_transform_2d;
+use crate::symbol::{Coder, CostCounter, SymbolSink};
 use crate::tables::*;
 
 impl TileDecoder<'_, '_> {
@@ -189,19 +199,11 @@ impl TileDecoder<'_, '_> {
                 Pass::Both => {
                     let (eob, dequantised) =
                         self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
+                    // The encoder reconstructs as a decoder does: what it
+                    // codes is then what the decoder outputs, by
+                    // construction.
                     if eob > 0 {
-                        if self.sd.encoding() {
-                            self.reconstruct(plane, start_x, start_y, tx_sz);
-                        } else {
-                            self.reconstruct_decode(
-                                plane,
-                                start_x,
-                                start_y,
-                                tx_sz,
-                                eob,
-                                dequantised,
-                            );
-                        }
+                        self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob, dequantised);
                     }
                 }
                 Pass::Parse => {
@@ -772,85 +774,24 @@ impl TileDecoder<'_, '_> {
             let adj = ADJUSTED_TX_SIZE[tx_sz];
             let bwl = TX_WIDTH_LOG2[adj];
             let height = TX_HEIGHT[adj];
-            for c in (0..eob).rev() {
-                let pos = scan[c] as usize;
-                let mut level;
-                if c == eob - 1 {
-                    let ctx = coeff_base_eob_ctx(c, bwl, height);
-                    let p = (self.enc_level(pos).clamp(1, 3) - 1) as usize;
-                    level = self
-                        .sd
-                        .symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], p)
-                        as u32
-                        + 1;
-                } else {
-                    let ctx = self.coeff_base_ctx(tx_sz, tx_class, bwl, height, pos);
-                    let p = self.enc_level(pos).min(3) as usize;
-                    level = self
-                        .sd
-                        .symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], p)
-                        as u32;
-                }
-                if level > NUM_BASE_LEVELS {
-                    let br_ctx = self.coeff_br_ctx(tx_sz, tx_class, pos);
-                    for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
-                        let p = (self.enc_level(pos).min(15).saturating_sub(level)).min(3) as usize;
-                        let coeff_br = self.sd.symbol(
-                            &mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype][br_ctx],
-                            p,
-                        ) as u32;
-                        level += coeff_br;
-                        if coeff_br < BR_CDF_SIZE - 1 {
-                            break;
-                        }
-                    }
-                }
-                self.quant[pos] = level as i32;
-            }
-            for c in 0..eob {
-                let pos = scan[c] as usize;
-                let sign = if self.quant[pos] != 0 {
-                    if c == 0 {
-                        let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                        let p = (self.enc_coef(pos) < 0) as usize;
-                        self.sd.symbol(&mut self.cdf.dc_sign[ptype][ctx], p) as u32
-                    } else {
-                        self.sd.literal(1, (self.enc_coef(pos) < 0) as u32)
-                    }
-                } else {
-                    0
-                };
-                if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
-                    // Encode mode: x = level - 14, coded as Exp-Golomb.
-                    let gx = self.enc_level(pos).max(15) - 14;
-                    let glen = crate::bits::floor_log2(gx) + 1;
-                    let mut length = 0;
-                    loop {
-                        length += 1;
-                        let golomb_length_bit = self.sd.literal(1, (length == glen) as u32);
-                        if golomb_length_bit != 0 {
-                            break;
-                        }
-                        if length > 32 {
-                            break;
-                        }
-                    }
-                    let mut x: u32 = 1;
-                    for i in (0..length - 1).rev() {
-                        x = (x << 1) | self.sd.literal(1, (gx >> i) & 1);
-                    }
-                    self.quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64)
-                        .min(i32::MAX as u64) as i32;
-                }
-                if pos == 0 && self.quant[pos] > 0 {
-                    dc_category = if sign != 0 { 1 } else { 2 };
-                }
-                self.quant[pos] &= 0xFFFFF;
-                cul_level += self.quant[pos] as u32;
-                if sign != 0 {
-                    self.quant[pos] = -self.quant[pos];
-                }
-            }
+            let block = LevelBlock {
+                plane,
+                tx_sz,
+                tx_sz_ctx,
+                ptype,
+                tx_class,
+                bwl,
+                height,
+                eob,
+                at: (x4, y4, w4, h4),
+            };
+            (cul_level, dc_category) = if !self.sd.encoding() {
+                self.levels_reference(&block, scan)
+            } else if CHECK_ENCODER_LEVELS.load(std::sync::atomic::Ordering::Relaxed) {
+                self.levels_checked(&block, scan)
+            } else {
+                self.levels_encode(&block)
+            };
             cul_level = cul_level.min(63);
         }
         if eob > 0
@@ -867,6 +808,168 @@ impl TileDecoder<'_, '_> {
             self.left_dc_ctx[plane][y4 + i] = dc_category;
         }
         eob
+    }
+
+    /// The levels and signs of `coeffs()` (5.11.39), from the last
+    /// coefficient back, then the signs and Golomb parts from the first:
+    /// the reference reader's, and the encoder's reference. Returns the
+    /// sum of the levels (before its `Min( 63, ... )`) and the DC
+    /// category.
+    fn levels_reference(&mut self, b: &LevelBlock, scan: &[u16]) -> (u32, u8) {
+        let LevelBlock {
+            plane,
+            tx_sz,
+            tx_sz_ctx,
+            ptype,
+            tx_class,
+            bwl,
+            height,
+            eob,
+            at: (x4, y4, w4, h4),
+        } = *b;
+        let mut cul_level = 0u32;
+        let mut dc_category = 0u8;
+        for c in (0..eob).rev() {
+            let pos = scan[c] as usize;
+            let mut level;
+            if c == eob - 1 {
+                let ctx = coeff_base_eob_ctx(c, bwl, height);
+                let p = (self.enc_level(pos).clamp(1, 3) - 1) as usize;
+                level = self
+                    .sd
+                    .symbol(&mut self.cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx], p)
+                    as u32
+                    + 1;
+            } else {
+                let ctx = self.coeff_base_ctx(tx_sz, tx_class, bwl, height, pos);
+                let p = self.enc_level(pos).min(3) as usize;
+                level = self
+                    .sd
+                    .symbol(&mut self.cdf.coeff_base[tx_sz_ctx][ptype][ctx], p)
+                    as u32;
+            }
+            if level > NUM_BASE_LEVELS {
+                let br_ctx = self.coeff_br_ctx(tx_sz, tx_class, pos);
+                for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
+                    let p = (self.enc_level(pos).min(15).saturating_sub(level)).min(3) as usize;
+                    let coeff_br = self.sd.symbol(
+                        &mut self.cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype][br_ctx],
+                        p,
+                    ) as u32;
+                    level += coeff_br;
+                    if coeff_br < BR_CDF_SIZE - 1 {
+                        break;
+                    }
+                }
+            }
+            self.quant[pos] = level as i32;
+        }
+        for c in 0..eob {
+            let pos = scan[c] as usize;
+            let sign = if self.quant[pos] != 0 {
+                if c == 0 {
+                    let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+                    let p = (self.enc_coef(pos) < 0) as usize;
+                    self.sd.symbol(&mut self.cdf.dc_sign[ptype][ctx], p) as u32
+                } else {
+                    self.sd.literal(1, (self.enc_coef(pos) < 0) as u32)
+                }
+            } else {
+                0
+            };
+            if self.quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                // Encode mode: x = level - 14, coded as Exp-Golomb.
+                let gx = self.enc_level(pos).max(15) - 14;
+                let glen = crate::bits::floor_log2(gx) + 1;
+                let mut length = 0;
+                loop {
+                    length += 1;
+                    let golomb_length_bit = self.sd.literal(1, (length == glen) as u32);
+                    if golomb_length_bit != 0 {
+                        break;
+                    }
+                    if length > 32 {
+                        break;
+                    }
+                }
+                let mut x: u32 = 1;
+                for i in (0..length - 1).rev() {
+                    x = (x << 1) | self.sd.literal(1, (gx >> i) & 1);
+                }
+                self.quant[pos] = (x as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64)
+                    .min(i32::MAX as u64) as i32;
+            }
+            if pos == 0 && self.quant[pos] > 0 {
+                dc_category = if sign != 0 { 1 } else { 2 };
+            }
+            self.quant[pos] &= 0xFFFFF;
+            cul_level += self.quant[pos] as u32;
+            if sign != 0 {
+                self.quant[pos] = -self.quant[pos];
+            }
+        }
+        (cul_level, dc_category)
+    }
+
+    /// [`Self::levels_reference`] for the encoder (see the module
+    /// documentation): the same symbols with the same CDFs, coded from the
+    /// levels the encoder chose (`EncCtx::coefs`).
+    fn levels_encode(&mut self, b: &LevelBlock) -> (u32, u8) {
+        let LevelBlock {
+            plane,
+            at: (x4, y4, w4, h4),
+            ..
+        } = *b;
+        // Taken before the coder and the CDFs are borrowed: the context of
+        // the DC sign is the neighbours'.
+        let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+        let coefs: &[i32; 1024] = &self.enc.as_ref().expect("encode mode").coefs;
+        let Coder::Enc(e) = &mut self.sd else {
+            unreachable!("the encoder's writer, encoding")
+        };
+        let at = LevelState {
+            cdf: &mut self.cdf,
+            quant: &mut self.quant,
+            levels: &mut self.levels,
+            coefs,
+        };
+        // Trial coding adds the symbols' costs up, from a table it looks
+        // up once.
+        if e.counting {
+            let mut c = CostCounter::new();
+            let r = write_levels(&mut c, b, dc_ctx, at);
+            e.bits += c.bits;
+            r
+        } else {
+            write_levels(e, b, dc_ctx, at)
+        }
+    }
+
+    /// [`Self::levels_encode`] held to [`Self::levels_reference`]: both
+    /// from the same state, which must end the same — the symbols coded
+    /// (or their cost), the CDFs, `Quant`, what they return — or this
+    /// panics. For the tests ([`set_check_encoder_levels`]).
+    fn levels_checked(&mut self, b: &LevelBlock, scan: &[u16]) -> (u32, u8) {
+        let enc = |t: &Self| match &t.sd {
+            Coder::Enc(e) => e.clone(),
+            _ => unreachable!("encoding"),
+        };
+        let (sd0, cdf0, quant0) = (enc(self), self.cdf.clone(), self.quant.clone());
+        let r_ref = self.levels_reference(b, scan);
+        let (sd_ref, cdf_ref, quant_ref) = (enc(self), self.cdf.clone(), self.quant.clone());
+        self.sd = Coder::Enc(sd0);
+        self.cdf = cdf0;
+        self.quant = quant0;
+        let r = self.levels_encode(b);
+        let same =
+            r == r_ref && enc(self) == sd_ref && self.cdf == cdf_ref && self.quant == quant_ref;
+        assert!(
+            same,
+            "the encoder's level writer differs from the reference: transform size {}, \
+             class {}, eob {}",
+            b.tx_sz, b.tx_class, b.eob
+        );
+        r
     }
 
     pub(crate) fn all_zero_ctx(
@@ -1214,9 +1317,8 @@ impl TileDecoder<'_, '_> {
         }
     }
 
-    /// The reconstruct process (7.12.3) for a decoder, which knows `eob`:
-    /// what [`Self::reconstruct`] (the reference, which the encoder runs)
-    /// does, without the work for coefficients known to be zero. Only the
+    /// The reconstruct process (7.12.3) for a decoder (and the encoder),
+    /// which knows `eob`: what [`Self::reconstruct`] (the reference) does, without the work for coefficients known to be zero. Only the
     /// first `eob` positions of the scan can hold one, so only they are
     /// dequantised (by the decode-only coefficient reader as it read
     /// them, which `dequantised` then says, or here), and the rows and
@@ -1427,6 +1529,34 @@ pub(crate) fn scan_for(tx_sz: usize, t: usize) -> &'static [u16] {
     }
 }
 
+/// The inverse of `get_scan( txSz )` for a block of transform type `t`:
+/// entry `pos` is the index of position `pos` in the scan.
+pub(crate) fn inverse_scan(tx_sz: usize, t: usize) -> &'static [u16] {
+    static MAPS: std::sync::OnceLock<Vec<Box<[u16]>>> = std::sync::OnceLock::new();
+    let maps = MAPS.get_or_init(|| {
+        let mut maps = Vec::with_capacity(TX_SIZES_ALL * 3);
+        for tx_sz in 0..TX_SIZES_ALL {
+            // A type of each class: the scan depends on the type through
+            // its class alone (see `scan_map`).
+            for t in [DCT_DCT, H_DCT, V_DCT] {
+                let scan = scan_for(tx_sz, t);
+                let mut inv = vec![0u16; scan.len()];
+                for (k, &pos) in scan.iter().enumerate() {
+                    inv[pos as usize] = k as u16;
+                }
+                maps.push(inv.into_boxed_slice());
+            }
+        }
+        maps
+    });
+    let class = match get_tx_class(t) {
+        TX_CLASS_2D => 0,
+        TX_CLASS_HORIZ => 1,
+        _ => 2,
+    };
+    &maps[tx_sz * 3 + class]
+}
+
 fn default_scan(tx_sz: usize) -> &'static [u16] {
     match tx_sz {
         TX_4X4 => &DEFAULT_SCAN_4X4,
@@ -1498,6 +1628,181 @@ pub(crate) fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32)
     } else {
         mag + 14
     }
+}
+
+/// What [`write_levels`] works on: the CDFs, `Quant`, the level map, and
+/// the levels the encoder chose.
+struct LevelState<'a> {
+    cdf: &'a mut crate::cdf::CdfContext,
+    quant: &'a mut [i32; 1024],
+    levels: &'a mut [u8; 36 * 36],
+    coefs: &'a [i32; 1024],
+}
+
+/// The body of [`TileDecoder::levels_encode`], for coding or for counting.
+fn write_levels<S: SymbolSink>(
+    e: &mut S,
+    b: &LevelBlock,
+    dc_ctx: usize,
+    at: LevelState,
+) -> (u32, u8) {
+    let LevelBlock {
+        tx_sz,
+        tx_sz_ctx,
+        ptype,
+        tx_class,
+        bwl,
+        height,
+        eob,
+        ..
+    } = *b;
+    let LevelState {
+        cdf,
+        quant,
+        levels,
+        coefs,
+    } = at;
+    let map = &scan_map(tx_sz, tx_class)[..eob];
+    let near = match tx_class {
+        TX_CLASS_2D => NEAR_2D,
+        TX_CLASS_HORIZ => NEAR_HORIZ,
+        _ => NEAR_VERT,
+    };
+    levels[..(height + 4) * LEVEL_STRIDE].fill(0);
+    let cdf_base = cdf.coeff_base[tx_sz_ctx][ptype].as_flattened_mut();
+    let cdf_br = &mut cdf.coeff_br[tx_sz_ctx.min(TX_32X32)][ptype];
+    // What `coeff_br` adds to a coefficient whose `coeff_base` symbol
+    // is `base`, and its level (at most 15: the Golomb part comes with
+    // the signs).
+    let mut above_base = |e: &mut S, quant: &[i32; 1024], pos: usize, base: u32| {
+        let width = 1usize << bwl;
+        let (row, col) = (pos >> bwl, pos & (width - 1));
+        let mut mag = 0u32;
+        for o in &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class] {
+            let (r, c) = (row + o[0] as usize, col + o[1] as usize);
+            if r < height && c < width {
+                mag += (quant[(r << bwl) + c] as u32).min(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1);
+            }
+        }
+        let br_ctx = coeff_br_ctx_of(tx_class, row, col, mag);
+        let target = coefs[pos].unsigned_abs().min(15);
+        let mut level = base;
+        for _ in 0..(COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) {
+            let coeff_br = target.saturating_sub(level).min(3);
+            e.symbol(&mut cdf_br[br_ctx], coeff_br as usize);
+            level += coeff_br;
+            if coeff_br < BR_CDF_SIZE - 1 {
+                break;
+            }
+        }
+        level
+    };
+    // The last coefficient, with CDFs of its own; never zero.
+    let c = eob - 1;
+    let entry = map[c] as usize;
+    let pos = entry >> MAP_POS_SHIFT;
+    let base = coefs[pos].unsigned_abs().clamp(1, 3);
+    let ctx = coeff_base_eob_ctx(c, bwl, height);
+    e.symbol(
+        &mut cdf.coeff_base_eob[tx_sz_ctx][ptype][ctx],
+        base as usize - 1,
+    );
+    levels[entry & MAP_LPOS] = base as u8;
+    quant[pos] = if base > NUM_BASE_LEVELS {
+        above_base(e, quant, pos, base)
+    } else {
+        base
+    } as i32;
+    // Then back to the first, each with the context of its neighbours
+    // (the first's position alone gives its context in a 2D transform,
+    // which the scan map says).
+    for c in (0..eob - 1).rev() {
+        let entry = map[c] as usize;
+        let lpos = entry & MAP_LPOS;
+        let around: &[u8; LEVEL_NEAR] = levels[lpos..lpos + LEVEL_NEAR]
+            .try_into()
+            .expect("a slice of that length");
+        let mag: usize = near.iter().map(|&o| around[o] as usize).sum();
+        let i = if c == 0 {
+            5 * coeff_base_ctx_of(tx_sz, tx_class, 0, 0, mag as u32)
+        } else {
+            MAG_CDF[mag & 15] as usize + ((entry >> MAP_CDF_SHIFT) & MAP_CDF)
+        };
+        let pos = entry >> MAP_POS_SHIFT;
+        let base = coefs[pos].unsigned_abs().min(3);
+        e.symbol(cdf_of(cdf_base, i), base as usize);
+        levels[lpos] = base as u8;
+        quant[pos] = if base > NUM_BASE_LEVELS {
+            above_base(e, quant, pos, base)
+        } else {
+            base
+        } as i32;
+    }
+    // The signs and the Golomb parts, in scan order.
+    let (mut cul_level, mut dc_category) = (0u32, 0u8);
+    for (c, &entry) in map.iter().enumerate() {
+        let pos = entry as usize >> MAP_POS_SHIFT;
+        let mut level = quant[pos];
+        if level == 0 {
+            continue;
+        }
+        let negative = coefs[pos] < 0;
+        if c == 0 {
+            e.symbol(&mut cdf.dc_sign[ptype][dc_ctx], negative as usize);
+        } else {
+            e.bool(negative as u32);
+        }
+        if level > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+            // x = level - 14, as Exp-Golomb: its length less one in
+            // zeros, then its bits from the top.
+            let gx = coefs[pos].unsigned_abs().max(15) - 14;
+            let glen = crate::bits::floor_log2(gx) + 1;
+            for k in 1..=glen {
+                e.bool((k == glen) as u32);
+            }
+            for k in (0..glen - 1).rev() {
+                e.bool((gx >> k) & 1);
+            }
+            level = (gx as u64 + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as u64).min(i32::MAX as u64)
+                as i32;
+        }
+        if pos == 0 {
+            dc_category = if negative { 1 } else { 2 };
+        }
+        level &= 0xFFFFF;
+        cul_level += level as u32;
+        quant[pos] = if negative { -level } else { level };
+    }
+    (cul_level, dc_category)
+}
+
+/// A transform block whose levels are being coded: what
+/// [`TileDecoder::levels_reference`] and its encoder's version take.
+#[derive(Clone, Copy)]
+struct LevelBlock {
+    plane: usize,
+    tx_sz: usize,
+    tx_sz_ctx: usize,
+    ptype: usize,
+    tx_class: usize,
+    /// `Log2` of the width and the height of the adjusted size.
+    bwl: usize,
+    height: usize,
+    eob: usize,
+    /// The block in units of 4 samples: `x4`, `y4`, `w4`, `h4`.
+    at: (usize, usize, usize, usize),
+}
+
+/// Whether the encoder's level writer runs alongside the reference, each
+/// transform block checked against it ([`TileDecoder::levels_checked`]).
+static CHECK_ENCODER_LEVELS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has every encoder in the process check its level writer against the
+/// reference, from now on (`true`) or no more: for the tests.
+#[cfg(test)]
+pub(crate) fn set_check_encoder_levels(on: bool) {
+    CHECK_ENCODER_LEVELS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The row stride of the decode-only reader's level map: the widest
@@ -1742,6 +2047,42 @@ pub(crate) fn coeff_base_eob_ctx(c: usize, bwl: usize, height: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encoder's level writer against the reference, on every
+    /// transform block of encodes that reach every part of it: trial
+    /// coding and coding, all the transform classes, levels from 1 to
+    /// past the Golomb part's (a fine quantiser on noise), 8 and 10 bits.
+    #[test]
+    fn encoder_level_writer_matches_the_reference() {
+        use crate::{ChromaFormat, Config, Encoder, Frame};
+        set_check_encoder_levels(true);
+        for (bit_depth, speed, q) in [(8, 1, 8), (8, 4, 60), (8, 6, 140), (10, 8, 30)] {
+            let (w, h) = (72u32, 40u32);
+            let mut cfg = Config::new(w, h);
+            cfg.bit_depth = bit_depth;
+            cfg.quantizer = q;
+            cfg.speed = speed;
+            cfg.tools = crate::Tools::for_speed(speed);
+            let mut enc = Encoder::new(cfg);
+            let mut seed = 7u32;
+            for t in 0..3u32 {
+                let mut f = Frame::new(w, h, bit_depth, ChromaFormat::Yuv420);
+                for p in 0..3 {
+                    let pl = f.planes[p];
+                    for y in 0..pl.height {
+                        for x in 0..pl.width {
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            let edge = if (x + 2 * t) % 16 < 8 { 40 } else { 200 };
+                            let v = (edge + (seed >> 16) % 48) as u16;
+                            f.set_sample(p, x, y, v << (bit_depth - 8));
+                        }
+                    }
+                }
+                enc.encode(&f).unwrap();
+            }
+        }
+        set_check_encoder_levels(false);
+    }
 
     /// A scan map entry says of its coefficient what the reference
     /// functions say: its position, its place in the level map, and, with
