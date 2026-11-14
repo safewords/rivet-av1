@@ -62,6 +62,9 @@ pub(crate) struct EncCtx {
     /// Intra block copy (the frame has `allow_intrabc`): where each 8x8
     /// of the source's luma lies, by content.
     pub(crate) ibc: Option<std::sync::Arc<IbcHash>>,
+    /// The search is probing a prediction (`encoder::inter`): the walker
+    /// predicts luma alone.
+    pub(crate) probing: bool,
 }
 
 /// The positions of the source's luma 8x8 blocks (every sample position
@@ -319,7 +322,7 @@ impl TileDecoder<'_, '_> {
     /// `(x, y, haveLeft, haveAbove, haveAboveRight, haveBelowLeft, log2W,
     /// log2H, txSz)`.
     #[allow(clippy::type_complexity)]
-    fn intra_args(
+    pub(crate) fn intra_args(
         &self,
         plane: usize,
     ) -> (usize, usize, bool, bool, bool, bool, usize, usize, usize) {
@@ -391,7 +394,7 @@ impl TileDecoder<'_, '_> {
     }
 
     /// SATD between the source and `CurrFrame` over a region.
-    fn region_satd(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> u64 {
+    pub(crate) fn region_satd(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> u64 {
         let e = self.enc();
         let cur = &self.f.cur.planes[plane];
         let st = e.stride[plane];
@@ -1203,7 +1206,7 @@ impl TileDecoder<'_, '_> {
 
     /// The single-reference prediction from `ref_frame`, unclipped.
     #[allow(clippy::too_many_arguments)]
-    fn inter_pred(
+    pub(crate) fn inter_pred(
         &self,
         plane: usize,
         x: usize,
@@ -1212,6 +1215,30 @@ impl TileDecoder<'_, '_> {
         h: usize,
         ref_frame: i32,
         mv: Mv,
+        pred: &mut Vec<i32>,
+    ) {
+        // (A block of a frame whose filter is switchable is searched with
+        // the regular filter; its others are tried on the best vector.)
+        let filt = match self.f.hdr.interpolation_filter {
+            SWITCHABLE => EIGHTTAP as u8,
+            f => f as u8,
+        };
+        self.inter_pred_with(plane, x, y, w, h, ref_frame, mv, [filt, filt], pred);
+    }
+
+    /// [`Self::inter_pred`] with the filters `filters` (`[vertical,
+    /// horizontal]`, as `interp_filter`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inter_pred_with(
+        &self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        ref_frame: i32,
+        mv: Mv,
+        filters: [u8; 2],
         pred: &mut Vec<i32>,
     ) {
         let ref_idx = self.f.hdr.ref_frame_idx[(ref_frame - LAST_FRAME) as usize];
@@ -1231,7 +1258,6 @@ impl TileDecoder<'_, '_> {
         if pred.len() < w * h {
             pred.resize(w * h, 0);
         }
-        let filt = self.f.hdr.interpolation_filter.min(BILINEAR) as u8;
         block_inter_prediction(
             &r.frame().planes[plane],
             last_x,
@@ -1242,7 +1268,7 @@ impl TileDecoder<'_, '_> {
             sty,
             w,
             h,
-            [filt, filt],
+            filters,
             rv,
             &mut pred[..w * h],
         );

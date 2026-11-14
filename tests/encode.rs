@@ -751,6 +751,87 @@ fn every_tool_round_trips() {
     round_trip(cfg, &screen);
 }
 
+/// The inter tools (switchable and dual filters, OBMC, local and global
+/// warps, the compound predictions, inter-intra): searched, then each one
+/// forced wherever the block can be coded with it, so that each is
+/// exercised whether or not the search would take it. Every unit decodes
+/// to the reconstruction, and a forced tool changes the stream.
+#[test]
+fn inter_tools_round_trip() {
+    let src = natural(6);
+    let crop = |f: &Frame| {
+        let mut c = Frame::new(128, 96, 8, ChromaFormat::Yuv420);
+        for p in 0..3 {
+            let pl = c.planes[p];
+            for y in 0..pl.height {
+                for x in 0..pl.width {
+                    c.set_sample(p, x, y, f.sample(p, x + 40, y + 30));
+                }
+            }
+        }
+        c
+    };
+    let frames: Vec<Frame> = src.iter().map(crop).collect();
+    let with_tools = |speed: u32, force: u8| {
+        let mut cfg = cfg_for(128, 96);
+        cfg.quantizer = 100;
+        if speed != cfg.speed {
+            cfg.speed = speed;
+            cfg.tools = av1::Tools::for_speed(speed);
+            cfg.threads = 2;
+        }
+        let t = &mut cfg.tools;
+        t.switchable_filter = true;
+        t.dual_filter = true;
+        t.obmc = true;
+        t.warped_motion = true;
+        t.global_motion = true;
+        t.masked_compound = true;
+        t.jnt_comp = true;
+        t.interintra = true;
+        t.force_inter_tool = force;
+        cfg
+    };
+    let (_, searched) = round_trip(with_tools(4, 0), &frames);
+    round_trip(with_tools(6, 0), &frames);
+    for force in [
+        av1::encoder::FORCE_FILTER,
+        av1::encoder::FORCE_OBMC,
+        av1::encoder::FORCE_WARP,
+        av1::encoder::FORCE_GLOBAL,
+        av1::encoder::FORCE_WEDGE,
+        av1::encoder::FORCE_DIFFWTD,
+        av1::encoder::FORCE_DISTANCE,
+        av1::encoder::FORCE_INTERINTRA,
+        av1::encoder::FORCE_WEDGE_INTERINTRA,
+    ] {
+        let (_, sizes) = round_trip(with_tools(4, force), &frames);
+        assert_ne!(sizes, searched, "tool {force} forced changes the stream");
+    }
+    // The other formats: each tool forced in 4:4:4, 4:2:2 at 10 bits,
+    // 4:2:0 at 12 bits and monochrome.
+    for (chroma, bit_depth) in [
+        (ChromaFormat::Yuv444, 8),
+        (ChromaFormat::Yuv422, 10),
+        (ChromaFormat::Yuv420, 12),
+        (ChromaFormat::Mono, 8),
+    ] {
+        let frames: Vec<Frame> = src[..4]
+            .iter()
+            .map(|f| reformat(f, 90, 66, bit_depth, chroma))
+            .collect();
+        for force in 1..=av1::encoder::FORCE_WEDGE_INTERINTRA {
+            let mut cfg = with_tools(4, force);
+            cfg.width = 90;
+            cfg.height = 66;
+            cfg.chroma = chroma;
+            cfg.bit_depth = bit_depth;
+            cfg.altref = 3;
+            round_trip(cfg, &frames);
+        }
+    }
+}
+
 #[test]
 fn natural_video_quality_tracks_the_quantiser() {
     let src = natural(6);

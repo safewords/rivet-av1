@@ -254,7 +254,22 @@ them:
   a frame after it (and with LAST2, LAST3 or GOLDEN), **skip mode** (the
   nearest frames on each side with their predicted vectors, no residual),
   and the **motion field projected** from the references
-  (`use_ref_frame_mvs`: their vectors among the candidates). Without
+  (`use_ref_frame_mvs`: their vectors among the candidates). The block's
+  best inter candidate is then tried with the **inter tools**
+  (`encoder::inter`): **switchable interpolation filters** (smooth and
+  sharp, and with `Tools::dual_filter` a filter per direction), **OBMC**,
+  **local warped motion**, **inter-intra** (each smooth mode, then the
+  wedge whose blend of the two predictions is nearest the source),
+  **distance-weighted**, **difference-weighted** and **wedge compound**;
+  and **global motion** (`encoder::gm`: each textured block of the frame
+  matched in the reference, coarse to fine, a rotation and zoom — or an
+  affine model, or a translation — fitted to the matches by random sample
+  consensus, kept when it is the motion of most of the frame) gives the
+  GLOBALMV blocks a warp. Each variant is *probed* — its mode info coded
+  in counting mode and the block predicted by the decoder's own syntax and
+  prediction, its luma SATD plus the multiplier times its bits — and the
+  two that probe cheapest of those cheaper than the candidate are
+  trialled. Which are on at which speed is below. Without
   groups (`Config::altref` = 0, and speeds 9 and 10), the last two frames
   and a golden frame (the key frame, then every 16th frame coded with a
   finer quantiser) as references, each searched, compound prediction of
@@ -726,6 +741,51 @@ gradient image, a moving pointer). Intra block copy is on at every speed
 that searches; filter intra, which gains a fifth of a percent for 5 % to
 20 % more time — less than a slower speed gains for it — is off.
 
+**The inter tools.** What each is worth with all the others on (BD-rate
+PSNR-Y / PSNR-YUV of the encoder without it against the encoder with all
+of them, so positive is what the tool gains; the five clips, 30 frames,
+quantisers 64 to 192, one thread), and the time it adds (user CPU time,
+foreman and mobile, three quantisers, one encode at a time; the machine
+was shared, so ±2 %):
+
+| tool | speed 4 | speed 6 | speed 8 | time 4 / 6 / 8 |
+|---|---|---|---|---|
+| switchable filters (smooth, sharp) | +0.89 % / +0.83 % | +0.91 % / +0.86 % | +1.02 % / +0.78 % | (a) / 1.04 / 1.09x |
+| … a filter per direction (dual) | −0.01 % / −0.03 % | −0.03 % / −0.04 % | +0.31 % / +0.26 % | 1.06x at 6 and 8 |
+| OBMC | +0.71 % / +0.65 % | +0.32 % / +0.31 % | +0.57 % / +0.55 % | (a) / 1.01 / 1.02x |
+| local warped motion | +0.51 % / +0.45 % | +0.38 % / +0.39 % | +0.52 % / +0.55 % | (a) / 1.01 / 1.00x |
+| global motion | −0.01 % / −0.02 % | +0.10 % / +0.11 % | +0.22 % / +0.21 % | 1.06 / 1.04 / 1.04x |
+| wedge and difference-weighted compound | +0.01 % / +0.02 % | −0.12 % / −0.14 % | +0.16 % / +0.11 % | 1.09 / 1.05 / 1.06x |
+| distance-weighted compound | +0.06 % / +0.08 % | −0.08 % / −0.09 % | +0.09 % / +0.08 % | 1.01 / 1.00 / 1.01x |
+| inter-intra (smooth and wedge) | +0.17 % / +0.18 % | +0.09 % / +0.02 % | +0.24 % / +0.23 % | 1.03 / 1.04 / 1.05x |
+| **all** (against none) | **−3.08 %** / −2.97 % | **−2.85 %** / −2.85 % | **−4.90 %** / −4.38 % | 1.13 / 1.30 / 1.52x |
+
+Times at speed 4 are foreman's alone; (a) the filters, OBMC and local
+warps together, 1.06x.
+
+Each alone at speed 6, against none: the filters −1.13 %, OBMC −0.64 %,
+local warps −0.77 %, global motion −0.24 %, wedge and difference-weighted
+−0.36 %, distance-weighted −0.35 %, inter-intra −0.45 % (PSNR-Y). On by
+default (`Tools::for_speed`): the switchable filters, OBMC and local warps
+at speeds 0 to 8, with distance-weighted compound and inter-intra to speed
+4 — where the slower speed's next step costs more time for each percent
+than they do. Against the encoder before them (same clips, BD-rate
+PSNR-Y / PSNR-YUV; time interleaved, every clip, all five quantisers):
+
+| speed | BD-rate | time | against rav1e, before | against rav1e, after | time against rav1e |
+|---|---|---|---|---|---|
+| 4 | @S4BD@ | @S4T@ | −9.3 % / −3.7 % | @S4R@ | @S4RT@ |
+| 6 | −2.12 % / −2.09 % | 1.05x | −0.1 % / +6.5 % | −2.3 % / +4.2 % | 1.14x |
+| 8 | −3.58 % / −3.22 % | 1.13x | +14.0 % / +17.9 % | +9.5 % / +13.6 % | 0.80x |
+
+Per clip at speed 6 against rav1e (PSNR-Y / PSNR-YUV): foreman +12.1 % /
++18.4 % (from +13.5 % / +20.0 %), mobile −12.6 % / −4.2 %, akiyo +3.8 % /
++7.2 %, ducks_take_off −9.3 % / −0.6 %, park_joy −5.5 % / +0.2 %. The
+tools gain about as much in PSNR-YUV as in PSNR-Y — they improve the
+prediction of every plane alike — so they close neither foreman's gap
+(1.2 % of its 13.5 %) nor the gap between PSNR-Y and PSNR-YUV, which is
+in how chroma is quantised (above).
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -766,8 +826,11 @@ Not there yet:
   zero. Finer chroma alone trades PSNR-Y for PSNR-YUV (above); it may pay
   together with a quantiser hierarchy, which changes what each frame's
   chroma is worth to the frames after it.
-- OBMC and warped motion, wedge / difference-weighted compound,
-  inter-intra, switchable interpolation filters.
+- **Inter tools that pay at speed 6 and up**: global motion, wedge and
+  difference-weighted compound, inter-intra and dual filters are built,
+  tested and searched, but gain less than their time there (below); a
+  vector searched for OBMC or a warp (the block's own vector is kept) and
+  a cheaper probe would make them pay.
 - **Film grain from a temporal denoiser**: the denoiser is spatial (it
   leaves part of a coarse grain in the picture coded), the strength of the
   grain is measured to within about 20 % (above), and every frame codes its

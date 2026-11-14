@@ -17,8 +17,10 @@
 mod aq;
 pub(crate) mod cdef;
 pub(crate) mod fwd;
+mod gm;
 mod gop;
 mod grain;
+mod inter;
 pub(crate) mod lr;
 mod rc;
 pub(crate) mod rdo;
@@ -267,7 +269,66 @@ pub struct Tools {
     pub rect_min: u8,
     /// See `rect_min`.
     pub rect_max: u8,
+    /// Switchable interpolation filters: each inter block's filter (regular,
+    /// smooth or sharp) chosen by its prediction (`is_filter_switchable`).
+    /// Against all the other inter tools: −0.9 % BD-rate at speeds 4 and
+    /// 6, −1.0 % at 8 (the most of any), for 5 % to 9 % more time.
+    pub switchable_filter: bool,
+    /// With `switchable_filter`, a filter for each direction
+    /// (`enable_dual_filter`). ±0 at speeds 4 and 6 (−0.3 % at 8) for 5 %
+    /// more time: off.
+    pub dual_filter: bool,
+    /// Overlapped block motion compensation (`motion_mode` OBMC). −0.3 %
+    /// to −0.7 % for 1 % to 2 % more time.
+    pub obmc: bool,
+    /// Local warped motion (`motion_mode` LOCALWARP): the block's warp
+    /// fitted to its neighbours' vectors. −0.4 % to −0.5 % for about 1 %
+    /// more time.
+    pub warped_motion: bool,
+    /// Global motion: a warp (or translation) per reference, estimated by
+    /// the encoder from the source and the reference, for GLOBALMV blocks.
+    /// ±0 at speed 4, −0.1 % at 6, −0.2 % at 8, for 4 % to 6 % more time:
+    /// off.
+    pub global_motion: bool,
+    /// Wedge and difference-weighted compound (`enable_masked_compound`).
+    /// ±0 at speed 4, +0.1 % at 6, −0.2 % at 8, for 5 % to 9 % more time:
+    /// off.
+    pub masked_compound: bool,
+    /// Distance-weighted compound (`enable_jnt_comp`). −0.1 % at speeds 4
+    /// and 8 (+0.1 % at 6) for about 1 % more time: on to speed 4.
+    pub jnt_comp: bool,
+    /// Inter-intra prediction, smooth and wedge
+    /// (`enable_interintra_compound`). −0.2 % at speeds 4 and 8, −0.1 % at
+    /// 6, for 3 % to 5 % more time: on to speed 4.
+    pub interintra: bool,
+    /// How many of the inter tools' variants of a block's best inter
+    /// candidate (those whose prediction measures cheaper) are trialled.
+    pub inter_tool_trials: u8,
+    /// Testing: an inter tool taken wherever it can be coded, whatever it
+    /// costs (`FORCE_*`; 0: none), so that every tool is exercised.
+    pub force_inter_tool: u8,
 }
+
+/// `Tools::force_inter_tool`: the sharp filter (smooth across with
+/// `dual_filter`).
+pub const FORCE_FILTER: u8 = 1;
+/// `Tools::force_inter_tool`: OBMC.
+pub const FORCE_OBMC: u8 = 2;
+/// `Tools::force_inter_tool`: local warped motion.
+pub const FORCE_WARP: u8 = 3;
+/// `Tools::force_inter_tool`: GLOBALMV with a global warp on every
+/// reference (a small rotation and zoom, whatever the motion is).
+pub const FORCE_GLOBAL: u8 = 4;
+/// `Tools::force_inter_tool`: wedge compound.
+pub const FORCE_WEDGE: u8 = 5;
+/// `Tools::force_inter_tool`: difference-weighted compound.
+pub const FORCE_DIFFWTD: u8 = 6;
+/// `Tools::force_inter_tool`: distance-weighted compound.
+pub const FORCE_DISTANCE: u8 = 7;
+/// `Tools::force_inter_tool`: smooth inter-intra.
+pub const FORCE_INTERINTRA: u8 = 8;
+/// `Tools::force_inter_tool`: wedge inter-intra.
+pub const FORCE_WEDGE_INTERINTRA: u8 = 9;
 
 impl Tools {
     /// The tools a speed setting uses (0 slowest to 10 fastest).
@@ -336,7 +397,30 @@ impl Tools {
             rect_refs: s >= 4,
             rect_min: if s >= 4 { 16 } else { 8 },
             rect_max: if s >= 4 { 16 } else { 128 },
+            // The inter tools (`encoder::inter`) where the search runs:
+            // see each field for what it was measured to be worth.
+            switchable_filter: s <= 8,
+            dual_filter: false,
+            obmc: s <= 8,
+            warped_motion: s <= 8,
+            global_motion: false,
+            masked_compound: false,
+            jnt_comp: s <= 4,
+            interintra: s <= 4,
+            inter_tool_trials: 2,
+            force_inter_tool: 0,
         }
+    }
+
+    /// Whether any of the inter tools of `encoder::inter` is searched.
+    pub(crate) fn inter_tools(&self) -> bool {
+        self.switchable_filter
+            || self.obmc
+            || self.warped_motion
+            || self.masked_compound
+            || self.jnt_comp
+            || self.interintra
+            || self.force_inter_tool != 0
     }
 
     /// Sets the switch called `name` (a field name; numbers as 0 / 1 or a
@@ -383,6 +467,16 @@ impl Tools {
             "rect_refs" => self.rect_refs = b,
             "rect_min" => self.rect_min = value.min(128) as u8,
             "rect_max" => self.rect_max = value.min(128) as u8,
+            "switchable_filter" => self.switchable_filter = b,
+            "dual_filter" => self.dual_filter = b,
+            "obmc" => self.obmc = b,
+            "warped_motion" => self.warped_motion = b,
+            "global_motion" => self.global_motion = b,
+            "masked_compound" => self.masked_compound = b,
+            "jnt_comp" => self.jnt_comp = b,
+            "interintra" => self.interintra = b,
+            "inter_tool_trials" => self.inter_tool_trials = value.min(255) as u8,
+            "force_inter_tool" => self.force_inter_tool = value.min(255) as u8,
             _ => return false,
         }
         true
@@ -548,6 +642,11 @@ struct FrameParams {
     /// `allow_intrabc`, and the source's hash for its search.
     intrabc: bool,
     ibc: Option<Arc<tile::IbcHash>>,
+    /// Each reference's global motion (`gm_type`, `gm_params`), indexed by
+    /// reference frame (`LAST_FRAME..=ALTREF_FRAME`), and the parameters
+    /// they are coded against (`PrevGmParams`).
+    gm: [(u32, [i32; 6]); 8],
+    prev_gm: [[i32; 6]; 8],
 }
 
 impl FrameParams {
@@ -629,12 +728,12 @@ impl Encoder {
             use_128x128_superblock: false,
             enable_filter_intra: cfg.tools.filter_intra,
             enable_intra_edge_filter: true,
-            enable_interintra_compound: false,
-            enable_masked_compound: false,
-            enable_warped_motion: false,
-            enable_dual_filter: false,
+            enable_interintra_compound: cfg.tools.interintra,
+            enable_masked_compound: cfg.tools.masked_compound,
+            enable_warped_motion: cfg.tools.warped_motion,
+            enable_dual_filter: cfg.tools.switchable_filter && cfg.tools.dual_filter,
             enable_order_hint: true,
-            enable_jnt_comp: false,
+            enable_jnt_comp: cfg.tools.jnt_comp,
             // The motion field projected from the references (7.9): their
             // vectors as candidates (-1.8 % BD-rate without alt-ref groups,
             // -1.1 % with them).
@@ -1173,6 +1272,9 @@ impl Encoder {
             let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
             p.ibc = Some(Arc::new(tile::IbcHash::new(&src[0], stride[0], w, h)));
         }
+        if !p.key && (tools.global_motion || tools.force_inter_tool == FORCE_GLOBAL) {
+            self.global_motion(&mut p, &src, &stride);
+        }
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         let filters = p.filters();
         if (filters && (tools.lf_search || tools.cdef || tools.restoration))
@@ -1262,6 +1364,36 @@ impl Encoder {
         let mut out = Vec::new();
         write_obu(&mut out, OBU_FRAME, &payload);
         Ok((p, f, out))
+    }
+
+    /// Each searched reference's global motion (`FrameParams::gm`),
+    /// estimated against its reconstruction.
+    fn global_motion(&self, p: &mut FrameParams, src: &[Vec<u16>], stride: &[usize]) {
+        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        for &rf in &p.search_refs {
+            let slot = p.ref_slots[(rf - LAST_FRAME) as usize];
+            let Some(r) = self.dec.refs[slot].as_ref() else {
+                continue;
+            };
+            let model = if self.cfg.tools.force_inter_tool == FORCE_GLOBAL {
+                // A small rotation and zoom about the frame's centre.
+                gm::forced(w, h)
+            } else {
+                let pl = &r.frame().planes[0];
+                gm::estimate(
+                    &src[0],
+                    stride[0],
+                    pl.data.as_slice(),
+                    pl.stride,
+                    w,
+                    h,
+                    self.cfg.bit_depth,
+                )
+            };
+            if let Some(m) = model {
+                p.gm[rf as usize] = m;
+            }
+        }
     }
 
     /// The header parameters of the next frame (before the in-loop filter
@@ -1385,6 +1517,15 @@ impl Encoder {
             intrabc,
             ibc: None,
             grain: self.next_grain.clone(),
+            gm: [(IDENTITY, gm::IDENTITY_PARAMS); 8],
+            // PrevGmParams: those of LAST's slot (primary_ref_frame).
+            prev_gm: if key {
+                [gm::IDENTITY_PARAMS; 8]
+            } else {
+                self.dec.ref_state.slots[ref_slots[0]]
+                    .as_ref()
+                    .map_or([gm::IDENTITY_PARAMS; 8], |s| s.gm_params)
+            },
         }
     }
 
@@ -1442,6 +1583,13 @@ impl Encoder {
         let mut r = BitReader::new(&header);
         let hdr = FrameHeader::parse(&mut r, &seq, &mut self.dec.ref_state, 0, 0)?;
         let mut f = self.dec.setup_frame(seq, hdr)?;
+        for rf in LAST_FRAME as usize..=ALTREF_FRAME as usize {
+            debug_assert_eq!(
+                (f.hdr.gm_type[rf], f.hdr.gm_params[rf]),
+                p.gm[rf],
+                "global motion of reference {rf} as parsed"
+            );
+        }
         let ti = f.hdr.tile_info.clone();
         let num_tiles = ti.cols * ti.rows;
         let mut replay = replay;
@@ -1558,6 +1706,7 @@ impl Encoder {
             me_hints: Vec::new(),
             aq: p.aq.clone(),
             ibc: p.ibc.clone(),
+            probing: false,
         })
     }
 
@@ -1598,9 +1747,12 @@ impl Encoder {
             // has nothing to write, then render_size().
             w.flag(false); // render_and_frame_size_different
             w.flag(false); // allow_high_precision_mv
-            w.flag(false); // is_filter_switchable
-            w.f(2, EIGHTTAP);
-            w.flag(false); // is_motion_mode_switchable
+            let tools = &self.cfg.tools;
+            w.flag(tools.switchable_filter); // is_filter_switchable
+            if !tools.switchable_filter {
+                w.f(2, EIGHTTAP);
+            }
+            w.flag(tools.obmc || tools.warped_motion); // is_motion_mode_switchable
             if seq.enable_ref_frame_mvs {
                 w.flag(true); // use_ref_frame_mvs
             }
@@ -1725,11 +1877,12 @@ impl Encoder {
                 w.flag(true); // skip_mode_present
             }
         }
+        if !key && seq.enable_warped_motion {
+            w.flag(true); // allow_warped_motion
+        }
         w.flag(p.reduced_tx_set); // reduced_tx_set
         if !key {
-            for _ in LAST_FRAME..=ALTREF_FRAME {
-                w.flag(false); // is_global
-            }
+            gm::write_params(&mut w, &p.gm, &p.prev_gm);
         }
         // film_grain_params(): every frame is shown or showable.
         if seq.film_grain_params_present {

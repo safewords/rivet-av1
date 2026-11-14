@@ -23,6 +23,7 @@ use crate::Result;
 use crate::consts::*;
 use crate::decoder::state::Mi;
 use crate::decoder::tile::{Plan, TileDecoder};
+use crate::encoder::inter::ProbeFrom;
 use crate::tables::*;
 
 /// One decision, in coding order.
@@ -214,6 +215,12 @@ impl TileDecoder<'_, '_> {
 
     /// Puts back the state saved in `s`.
     pub(crate) fn restore(&mut self, s: &Snap) {
+        self.restore_parts(s, true);
+    }
+
+    /// Puts back the state saved in `s`, the samples only with `pixels`
+    /// (a probe of a prediction writes nothing the next one reads).
+    pub(crate) fn restore_parts(&mut self, s: &Snap, pixels: bool) {
         let (r0, r1, c0, c1) = (s.r0, s.r1, s.c0, s.c1);
         let w = c1 - c0;
         let f = &mut *self.f;
@@ -244,7 +251,7 @@ impl TileDecoder<'_, '_> {
             let (x0, x1) = (pc0 * 4, (pc1 * 4).min(pl.w));
             let (y0, y1) = (pr0 * 4, (pr1 * 4).min(pl.h));
             let xw = x1 - x0;
-            for (i, y) in (y0..y1).enumerate() {
+            for (i, y) in (y0..y1).enumerate().filter(|_| pixels) {
                 pl.data[y * pl.stride + x0..y * pl.stride + x1]
                     .copy_from_slice(&s.pix[p][i * xw..(i + 1) * xw]);
             }
@@ -551,6 +558,9 @@ impl TileDecoder<'_, '_> {
         };
         let refine = tools.tx_type_rd || tools.tx_size;
         let mut fast_best: (f64, Plan) = (f64::MAX, cands[0]);
+        // The best inter candidate coded with a residual, for the inter
+        // tools.
+        let mut inter_best: (f64, Plan) = (f64::MAX, cands[0]);
         let mut fast_zero = false;
         let mut best_inter_fast = f64::MAX;
         for &p in &cands {
@@ -566,6 +576,9 @@ impl TileDecoder<'_, '_> {
             if p.is_inter {
                 best_inter_fast = best_inter_fast.min(cost);
             }
+            if p.is_inter && !p.skip && cost < inter_best.0 {
+                inter_best = (cost, p);
+            }
             // No residual: the skip flag says so for less.
             if !p.skip
                 && (zero
@@ -577,6 +590,42 @@ impl TileDecoder<'_, '_> {
                 let (cost, _, seg) = trial(self, q, false)?;
                 if cost < best.0 {
                     best = (cost, q, seg);
+                }
+            }
+        }
+        // The inter tools: the variants of the best inter candidate that
+        // probe cheaper, the best of them trialled (or the one a test
+        // forces, whatever it costs).
+        if inter_best.0 < f64::MAX && tools.inter_tools() {
+            let from = ProbeFrom {
+                snap: &snap,
+                b: &saved_b,
+                log_start,
+            };
+            let v = self.inter_variants(&from, inter_best.1)?;
+            let trials = v.better.into_iter().take(tools.inter_tool_trials as usize);
+            for (q, forced) in trials
+                .map(|q| (q, false))
+                .chain(v.forced.map(|q| (q, true)))
+            {
+                let (cost, zero, seg) = trial(self, q, refine)?;
+                // A forced variant is taken, and refined, as if it were the
+                // best.
+                if cost < best.0 || forced {
+                    best = (cost, q, seg);
+                }
+                if cost < fast_best.0 || forced {
+                    fast_best = (cost, q);
+                    fast_zero = zero;
+                }
+                if zero {
+                    let mut q = q;
+                    q.skip = true;
+                    q.tx_depth = 0;
+                    let (cost, _, seg) = trial(self, q, false)?;
+                    if cost < best.0 {
+                        best = (cost, q, seg);
+                    }
                 }
             }
         }

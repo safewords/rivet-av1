@@ -22,7 +22,12 @@ impl TileDecoder<'_, '_> {
         };
         let sub_block_mi_row = self.b.mi_row & sb_mask;
         let sub_block_mi_col = self.b.mi_col & sb_mask;
-        let planes = 1 + if self.b.has_chroma { 2 } else { 0 };
+        // (The encoder's probes of a prediction measure its luma alone.)
+        let planes = if self.enc.as_ref().is_some_and(|e| e.probing) {
+            1
+        } else {
+            1 + if self.b.has_chroma { 2 } else { 0 }
+        };
         for plane in 0..planes {
             let plane_sz = self.f.plane_residual_size(self.b.mi_size, plane);
             let num4x4_w = NUM_4X4_BLOCKS_WIDE[plane_sz];

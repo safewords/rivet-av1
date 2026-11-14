@@ -125,7 +125,33 @@ pub(crate) struct Plan {
     /// Intra block copy (`use_intrabc`): the block predicted from the
     /// frame's own reconstruction, displaced by `mv[0]` (whole samples).
     pub(crate) use_intrabc: bool,
+    /// `interp_filter[ dir ]`, where the frame's filter is switchable.
+    pub(crate) interp_filter: [u8; 2],
+    /// `motion_mode` (`SIMPLE`, `OBMC`, `LOCALWARP`), where it is coded.
+    pub(crate) motion_mode: u8,
+    /// Inter-intra: `interintra`, `interintra_mode`, `wedge_interintra`.
+    pub(crate) interintra: bool,
+    pub(crate) interintra_mode: u8,
+    pub(crate) wedge_interintra: bool,
+    /// `wedge_index` and `wedge_sign` (wedge compound and wedge
+    /// inter-intra), `mask_type` (difference-weighted compound).
+    pub(crate) wedge_index: u8,
+    pub(crate) wedge_sign: u8,
+    pub(crate) mask_type: u8,
+    /// The compound prediction of a compound block: one of the `PLAN_*`
+    /// below (average, distance-weighted, wedge, difference-weighted).
+    pub(crate) compound: u8,
 }
+
+/// `Plan::compound`: the average of the two predictions (the default).
+pub(crate) const PLAN_AVERAGE: u8 = 0;
+/// `Plan::compound`: weighted by the references' distances (`jnt_comp`).
+pub(crate) const PLAN_DISTANCE: u8 = 1;
+/// `Plan::compound`: a wedge mask (`COMPOUND_WEDGE`).
+pub(crate) const PLAN_WEDGE: u8 = 2;
+/// `Plan::compound`: a mask from the predictions' difference
+/// (`COMPOUND_DIFFWTD`).
+pub(crate) const PLAN_DIFFWTD: u8 = 3;
 
 /// The decoder of one tile: the symbol decoder, the tile's CDFs, the
 /// above/left contexts, and the block being decoded.
@@ -730,6 +756,55 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     /// `decode_block( r, c, subSize )`.
     pub(crate) fn decode_block(&mut self, r: usize, c: usize, sub_size: usize) -> Result<()> {
+        self.decode_block_prediction(r, c, sub_size)?;
+        self.residual()?;
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size];
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size];
+        let cols = self.f.ms;
+        let rows = self.f.mi_rows + 32;
+        for y in 0..bh4 {
+            if r + y >= rows {
+                break;
+            }
+            for x in 0..bw4 {
+                if c + x >= cols {
+                    break;
+                }
+                let b = &self.b;
+                let idx = (r + y) * cols + c + x;
+                let m = &mut self.f.mi[idx];
+                m.is_inter = b.is_inter;
+                m.skip_mode = b.skip_mode;
+                m.skip = b.skip;
+                m.tx_size = b.tx_size as u8;
+                m.mi_size = b.mi_size as u8;
+                m.segment_id = b.segment_id as u8;
+                m.palette_size = [b.palette_size_y as u8, b.palette_size_uv as u8];
+                for i in 0..FRAME_LF_COUNT {
+                    m.delta_lf[i] = self.delta_lf[i] as i8;
+                }
+                self.f.segment_ids[idx] = b.segment_id as u8;
+                if b.palette_size_y > 0 {
+                    self.f.palette_colors[0][idx] = b.palette_colors_y;
+                }
+                if b.palette_size_uv > 0 {
+                    self.f.palette_colors[1][idx] = b.palette_colors_u;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `decode_block()` up to its prediction: the block's mode info coded
+    /// and stored, and the block predicted (the encoder's search measures
+    /// a prediction by this alone).
+    #[inline]
+    pub(crate) fn decode_block_prediction(
+        &mut self,
+        r: usize,
+        c: usize,
+        sub_size: usize,
+    ) -> Result<()> {
         let ssx = self.ssx();
         let ssy = self.ssy();
         self.b = Block {
@@ -826,37 +901,6 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             self.record_block();
         } else {
             self.compute_prediction();
-        }
-        self.residual()?;
-        for y in 0..bh4 {
-            if r + y >= rows {
-                break;
-            }
-            for x in 0..bw4 {
-                if c + x >= cols {
-                    break;
-                }
-                let b = &self.b;
-                let idx = (r + y) * cols + c + x;
-                let m = &mut self.f.mi[idx];
-                m.is_inter = b.is_inter;
-                m.skip_mode = b.skip_mode;
-                m.skip = b.skip;
-                m.tx_size = b.tx_size as u8;
-                m.mi_size = b.mi_size as u8;
-                m.segment_id = b.segment_id as u8;
-                m.palette_size = [b.palette_size_y as u8, b.palette_size_uv as u8];
-                for i in 0..FRAME_LF_COUNT {
-                    m.delta_lf[i] = self.delta_lf[i] as i8;
-                }
-                self.f.segment_ids[idx] = b.segment_id as u8;
-                if b.palette_size_y > 0 {
-                    self.f.palette_colors[0][idx] = b.palette_colors_y;
-                }
-                if b.palette_size_uv > 0 {
-                    self.f.palette_colors[1][idx] = b.palette_colors_u;
-                }
-            }
         }
         Ok(())
     }
@@ -1987,8 +2031,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             for dir in 0..dirs {
                 if self.needs_interp_filter() {
                     let ctx = self.interp_filter_ctx(dir);
+                    let planned = self.plan.interp_filter[dir] as usize;
                     self.b.interp_filter[dir] =
-                        self.sd.read_symbol(&mut self.cdf.interp_filter[ctx]) as u32;
+                        self.sd.symbol(&mut self.cdf.interp_filter[ctx], planned) as u32;
                 } else {
                     self.b.interp_filter[dir] = EIGHTTAP;
                 }
@@ -2016,7 +2061,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         }
     }
 
-    fn interp_filter_ctx(&self, dir: usize) -> usize {
+    pub(crate) fn interp_filter_ctx(&self, dir: usize) -> usize {
         let b = &self.b;
         let mut ctx = ((dir & 1) * 2 + (b.ref_frame[1] > INTRA_FRAME) as usize) * 4;
         let mut left_type = 3;
@@ -2451,17 +2496,28 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             && (BLOCK_8X8..=BLOCK_32X32).contains(&ms)
         {
             let ctx = SIZE_GROUP[ms] - 1;
-            self.b.interintra = self.sd.read_symbol(&mut self.cdf.inter_intra[ctx]) != 0;
+            let p = self.plan;
+            self.b.interintra = self
+                .sd
+                .symbol(&mut self.cdf.inter_intra[ctx], p.interintra as usize)
+                != 0;
             if self.b.interintra {
-                self.b.interintra_mode = self.sd.read_symbol(&mut self.cdf.inter_intra_mode[ctx]);
+                self.b.interintra_mode = self.sd.symbol(
+                    &mut self.cdf.inter_intra_mode[ctx],
+                    p.interintra_mode as usize,
+                );
                 self.b.ref_frame[1] = INTRA_FRAME;
                 self.b.angle_delta_y = 0;
                 self.b.angle_delta_uv = 0;
                 self.b.use_filter_intra = false;
-                self.b.wedge_interintra =
-                    self.sd.read_symbol(&mut self.cdf.wedge_inter_intra[ms]) != 0;
+                self.b.wedge_interintra = self.sd.symbol(
+                    &mut self.cdf.wedge_inter_intra[ms],
+                    p.wedge_interintra as usize,
+                ) != 0;
                 if self.b.wedge_interintra {
-                    self.b.wedge_index = self.sd.read_symbol(&mut self.cdf.wedge_index[ms]);
+                    self.b.wedge_index = self
+                        .sd
+                        .symbol(&mut self.cdf.wedge_index[ms], p.wedge_index as usize);
                     self.b.wedge_sign = 0;
                 }
             }
@@ -2498,10 +2554,12 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             || !self.f.hdr.allow_warped_motion
             || self.f.is_scaled(self.b.ref_frame[0])
         {
-            let use_obmc = self.sd.read_symbol(&mut self.cdf.use_obmc[ms]);
+            let planned = (self.plan.motion_mode as u32 == OBMC) as usize;
+            let use_obmc = self.sd.symbol(&mut self.cdf.use_obmc[ms], planned);
             self.b.motion_mode = if use_obmc != 0 { OBMC } else { SIMPLE };
         } else {
-            self.b.motion_mode = self.sd.read_symbol(&mut self.cdf.motion_mode[ms]) as u32;
+            let planned = self.plan.motion_mode as usize;
+            self.b.motion_mode = self.sd.symbol(&mut self.cdf.motion_mode[ms], planned) as u32;
         }
     }
 
@@ -2515,16 +2573,21 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let ms = self.b.mi_size;
         if is_compound {
             let n = WEDGE_BITS[ms];
+            let p = self.plan;
+            let masked = p.compound == PLAN_WEDGE || p.compound == PLAN_DIFFWTD;
             if self.f.seq.enable_masked_compound {
                 let ctx = self.comp_group_idx_ctx();
-                self.b.comp_group_idx =
-                    self.sd.read_symbol(&mut self.cdf.comp_group_idx[ctx]) as u32;
+                self.b.comp_group_idx = self
+                    .sd
+                    .symbol(&mut self.cdf.comp_group_idx[ctx], masked as usize)
+                    as u32;
             }
             if self.b.comp_group_idx == 0 {
                 if self.f.seq.enable_jnt_comp {
                     let ctx = self.compound_idx_ctx();
+                    let planned = (p.compound != PLAN_DISTANCE) as usize;
                     self.b.compound_idx =
-                        self.sd.read_symbol(&mut self.cdf.compound_idx[ctx]) as u32;
+                        self.sd.symbol(&mut self.cdf.compound_idx[ctx], planned) as u32;
                     self.b.compound_type = if self.b.compound_idx != 0 {
                         COMPOUND_AVERAGE
                     } else {
@@ -2536,13 +2599,23 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             } else if n == 0 {
                 self.b.compound_type = COMPOUND_DIFFWTD;
             } else {
-                self.b.compound_type = self.sd.read_symbol(&mut self.cdf.compound_type[ms]) as u32;
+                let planned = if p.compound == PLAN_WEDGE {
+                    COMPOUND_WEDGE
+                } else {
+                    COMPOUND_DIFFWTD
+                };
+                self.b.compound_type = self
+                    .sd
+                    .symbol(&mut self.cdf.compound_type[ms], planned as usize)
+                    as u32;
             }
             if self.b.compound_type == COMPOUND_WEDGE {
-                self.b.wedge_index = self.sd.read_symbol(&mut self.cdf.wedge_index[ms]);
-                self.b.wedge_sign = self.sd.read_literal(1) as usize;
+                self.b.wedge_index = self
+                    .sd
+                    .symbol(&mut self.cdf.wedge_index[ms], p.wedge_index as usize);
+                self.b.wedge_sign = self.sd.literal(1, p.wedge_sign as u32) as usize;
             } else if self.b.compound_type == COMPOUND_DIFFWTD {
-                self.b.mask_type = self.sd.read_literal(1) as usize;
+                self.b.mask_type = self.sd.literal(1, p.mask_type as u32) as usize;
             }
         } else if self.b.interintra {
             self.b.compound_type = if self.b.wedge_interintra {
