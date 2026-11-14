@@ -6,8 +6,8 @@ An **AV1** decoder and encoder in Rust: no C, no system libraries, no build
 script, nothing to install on a build host. Written from the *AV1
 Bitstream & Decoding Process Specification* (AOMedia), not translated from
 any other implementation. The decoder is bit-exact on **all 244** of
-AOMedia's public AV1 test vectors and on all 3 015 of the Argon
-conformance streams (the numbers are
+AOMedia's public AV1 test vectors, on all 3 015 of the Argon
+conformance streams and all 571 of their large-scale-tile streams (the numbers are
 [below](#how-it-is-checked)); the encoder writes key and inter frames that
 decode to exactly what it reconstructed.
 
@@ -61,6 +61,15 @@ process recommends, and `Decoder::decode_all` returns every one.
 `Decoder::set_apply_grain(false)` leaves film grain synthesis out: frames
 come out as decoded, for a player that cannot afford the grain.
 
+**Large scale tile decoding** (7.3) too: a tile list OBU names tiles of
+coded "camera" frames, each predicted from one of up to 128 anchor frames
+the application provides (`Decoder::set_anchor_frames`; typically the
+frames the stream shows first, which is how AOMedia's light field example
+takes them). With the frame header in force as the camera frame header
+(one that comes without tile groups), each tile list decodes to one output
+frame, its tiles side by side in the list's order, returned as a shown
+frame is; `Decoder::tile_list_layout` says where each tile is.
+
 Not there yet:
 
 - **Speed 4 at rav1e's speed**: 4.4x its time on one thread (speed 6
@@ -68,9 +77,15 @@ Not there yet:
   four references searched exhaustively, every sub-sample candidate
   predicted with the normative filters — which only a search that tries
   less would change.
-- **Large-scale tile decoding** (tile list OBUs, 7.3). Optional for
-  conformance; reported as `Error::Unsupported`.
-- **A frame-buffer pool.** Every frame allocates its buffers.
+- **Tile lists in flight**: a tile list is decoded in place, not by a
+  decoder with frames in flight (`queue`).
+- **A frame-buffer pool for `CurrFrame`.** The copies the post-filters
+  start from are made into the planes of frames nothing holds any more,
+  but `CurrFrame` is allocated, zeroed, every frame: zeroing a recycled
+  plane measured 4 % to 7 % slower than the system's zeroed pages, and
+  recycling it without zeroing would need every sample to be shown
+  written before it is read. The pool as it is is neither faster nor
+  slower (below).
 - **Error recovery.** A corrupt frame returns `Error::Bitstream`; there is
   no concealment, so decoding should resume at the next key frame.
   Malformed input has not made it panic under the property tests below,
@@ -138,6 +153,27 @@ decodes at 34.7 MP/s on one thread.
 
 The first column is the decoder before this work (single-threaded scalar).
 Frames are still decoded one after another; no frame-parallel decoding.
+
+The planes the post-filters write (`CdefFrame` copied from `CurrFrame`,
+`LrFrame` from `CdefFrame`) come from a pool of the planes that frames no
+longer need: reference frames pushed out of every slot, and `CurrFrame`
+and `CdefFrame` once they have been filtered. Measured against the
+decoder without it, the two builds taking turns (best of 60 decodes each,
+megapixels a second, on an Apple silicon machine shared with other work):
+neither faster nor slower.
+
+| stream | threads | without | with |
+|---|---|---|---|
+| mandelbrot 1280x720 (SVT-AV1, CRF 35, 60 frames) | 1 / 4 | 196.5 / 387.1 | 196.5 / 386.4 |
+| mandelbrot 1920x1080 | 1 / 4 | 205.9 / 445.6 | 204.5 / 450.2 |
+| mandelbrot 1280x720 10-bit | 1 / 4 | 219.8 / 450.0 | 218.1 / 448.8 |
+| av1-1-b8-02-allintra | 1 | 23.9 | 23.8 |
+| av1-1-b10-00-quantizer-10 | 1 | 39.1 | 38.8 |
+
+Recycling `CurrFrame` too (zeroed, as it must start) was 4 % to 7 %
+slower at one thread and at four: zeroing a recycled plane costs more than
+the zeroed pages the system hands out. On this machine allocation was not
+a cost to begin with (the system time of a decode is about 1 % of it).
 
 ## What it encodes
 
@@ -786,9 +822,22 @@ Not there yet:
   The suite also carries, per stream, reference output for each operating
   point (`layers/N`, about 75 000 more decodes of the same streams with
   layers dropped): the operating point 1 set was run, **2 763 / 2 763 pass**
-  (`ARGON_LAYERS=1`); the others were not run for time. The large-scale-tile directories (tile
-  list OBUs, unsupported) and the error-resilience directories (no
-  reference output) are not run.
+  (`ARGON_LAYERS=1`); the others were not run for time. The
+  error-resilience directories (no reference output) are not run.
+
+  The large-scale-tile directories (tile list OBUs, 7.3) have reference
+  output made with AOMedia's `lightfield_tile_list_decoder`: the frames
+  the first N temporal units show are the anchor frames, and the output of
+  each of the next L tile lists is written tile by tile (each tile as a
+  picture of its own, in the list's order: the output frame of 7.3.1 cut
+  at its tiles, without the samples no tile covers). `tests/argon.rs`
+  decodes them that way and hashes the same bytes (`ARGON_FILTER=large`
+  runs only these). **All 571 pass**:
+
+  | group | pass |
+  |---|---|
+  | profile0_large_scale_tile, profile1_large_scale_tile, profile2_large_scale_tile | 140 / 140, 136 / 136, 139 / 139 |
+  | profile0_large_scale_tile_special, profile1_large_scale_tile_special, profile2_large_scale_tile_special | 54 / 54, 54 / 54, 48 / 48 |
 - **The encoder** (`tests/encode.rs`, and every run of
   `examples/av1_rdcurve.rs`): every temporal unit, decoded by a fresh decoder
   with the padding check on, equals the encoder's reconstruction exactly —
