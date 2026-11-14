@@ -305,10 +305,16 @@ them:
   the next frames with a rate model per frame class refitted after every
   frame, the complexity measured on the source before coding (so a scene
   cut is priced before it is coded), what earlier frames over- or
-  under-spent repaid over 12 frames; in groups, a group at a time, with a
-  model for each layer of the pyramid, the complexities measured on the
-  group's sources. Over 10-second clips it lands within a few percent of
-  the rate (below).
+  under-spent repaid over 12 frames; in groups, a group at a time and
+  again after every frame of it, with a model for each layer of the
+  pyramid, the complexities from a **lookahead** on the group's sources
+  (at half size, the SATD of each block's cheapest prediction: intra, or
+  motion-searched from the frames it will be predicted from in the
+  pyramid), and a key frame planned with the group after it (it is held
+  until that group is, so its temporal unit comes out with the group's).
+  Over 10-second clips it lands within a few percent of the rate, and
+  short clips and segments coded on their own within 5 % from their first
+  group (below).
 - **Tiles and threads**: `Config::tile_cols_log2` tile columns, coded in
   parallel on `Config::threads` threads (the stream is the same as coding
   them in turn). From speed 4 the decision search of each tile also runs
@@ -891,23 +897,70 @@ instead would cost +0.35 % / +0.57 %.
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
-300 and 1000 kb/s, speed 6, in alt-ref groups (the sources are 640x360
-crops of park_joy and ducks_take_off; the camera crops of the table
-before are not in the repository):
+300 and 1000 kb/s, speed 6, in alt-ref groups. The sources are 640x360
+centre crops of park_joy and ducks_take_off (the crops of the table
+before were not kept, so the figures in brackets are develop at a328e71
+on these):
 
 | clip | 100 kb/s | 300 kb/s | 1000 kb/s |
 |---|---|---|---|
-| still | +1.5 % | +0.7 % | −67 % (quantiser 1: 326 kb/s is all it can use) |
-| pan | +1.6 % | −1.4 % | −1.1 % |
-| noise | +0.8 % | −0.5 % | −1.9 % |
-| scene cuts | −0.2 % | −1.7 % | −2.3 % |
+| still | −3.5 % (+8.9 %) | −1.1 % (+0.1 %) | −46 % (−67 %; quantiser 1: it cannot use more) |
+| pan | +0.4 % (+0.6 %) | −0.4 % (−0.5 %) | +0.0 % (−1.1 %) |
+| noise | +0.2 % (+1.4 %) | +0.1 % (−1.4 %) | +0.1 % (−1.5 %) |
+| scene cuts | +0.3 % (+0.8 %) | +0.1 % (−0.7 %) | +0.0 % (−1.2 %) |
 
-Speeds 4 and 8 land likewise, within 2.3 %, but for the still clip at
-1000 kb/s and two rates at the floor of what a group costs at quantiser
-255: the still clip at 100 kb/s (+8.1 % at speed 4, +7.3 % at speed 8) and
-the pan at 100 kb/s (+4.4 % at speed 4). Frames coded in display order
-land within 1.5 % on the same clips but for the still one (−2.7 % and
-−4.2 % at 100 and 300 kb/s).
+**From the first group.** Until the change below, the first group of a
+clip was planned before rate control had seen a frame of it coded: the
+layers' models were guesses, and the plan was made once a group. A long
+clip repays the error in the groups after, but a short one, and the
+start of every segment coded on its own, does not: a 1-second clip came
+out at 1.3 times its rate, 40 small noisy frames at 1.6 to 2.3 times.
+Now the key frame is planned with the group after it (the two spend their
+shares between them, at their offsets, so the key frame is not coded at
+a quantiser the group cannot follow), the complexities come from the
+lookahead (an alt-ref frame is priced across the whole group, a frame of
+the top layer between its neighbours), the layers' first guesses are
+fitted against the key frame's model, and the group is planned again
+after every frame it codes (by at most 24 finer or 48 coarser a frame;
+after the first group, only when the plan's prediction for the frames
+left has strayed a tenth from what the group has left).
+A key frame, or the first alt-ref frame, far from its prediction is coded
+again (as a key frame was before); a frame that costs twice its
+prediction, half of what the group has left and four frames' shares is
+coded again, coarser. `examples/av1_ratetest.rs` measures the rate over
+the clip and over its first group (the key frame and the 16 frames
+after it), at speed 6 (before → after, the clip; the first group):
+
+| clips | kb/s | before | after |
+|---|---|---|---|
+| foreman, mobile, akiyo (CIF), 24 and 40 frames at 24 frames/s | 300, 1000 | −27 % to +120 %; first group −36 % to +196 % | −0.8 % to +4.8 %; −0.1 % to +0.3 % |
+| ducks_take_off, park_joy (720p), 24 and 40 frames at 24 frames/s | 1000, 3000 | −19 % to +17 %; −37 % to +55 % | −0.9 % to +1.6 %; +0.1 % to +4.4 % |
+| noise over a drifting pattern, 160x96 and 64x64 (`tools/noisy-y4m.py`), 24 and 40 frames | 100, 300; 30, 100 | −42 % to +241 %; −41 % to +355 % | −0.2 % to +2.9 %; +0.3 % to +2.4 % |
+| foreman, mobile, akiyo cut into 4-second segments, each coded on its own (300 frames at 30 frames/s: two segments and a 2-second one) | 300, 1000 | −9.3 % to +0.2 %; −50 % to +156 % | −0.3 % to +1.1 %; −0.1 % to +0.8 % |
+| still, pan, noise and cuts (the clips above from CIF sources), 24 and 40 frames | 300, 1000 | −57 % to +70 %; −77 % to +127 % | −56 % to +5.0 %; −28 % to +7.2 % |
+
+Every natural and noisy clip and every segment lands within 5 % (52 of
+the 62 cases; 56 of 62 first groups within 5 %, against 15 and 1
+before); the ten that do not are short synthetic clips: the still frame
+(it cannot spend 300 kb/s in 24 or 40 frames without refining a frame
+the encoder copies; at 1000 kb/s the quantiser is 1), the fast pan in 24
+frames and at 300 kb/s in 40 (−6 % to −11 %), the noise at 300 kb/s (−8 %
+and −7 %) and the scene cuts at 1000 kb/s in 24 frames (+5.0 %).
+Speeds 4 and 8 land likewise: at speed 4, 54 of 62 within 5 % and every
+first group (the eight others the still and pan clips and the noise at
+1000 kb/s in 24 frames, +6.5 %), at speed 8, 51 of 62 and 56 of 62
+first groups (of the natural clips, foreman at 1000 kb/s in 24 frames,
++5.1 %). The lookahead costs about 1 % of the
+encoding time (0.4 ms a CIF frame, 3.3 ms a 720p one, one thread), and a
+second coding of a frame is rare (one key frame in 300 frames of foreman
+or mobile). But the quantisers are spread differently, and that is not
+free: at the same rate, one encode at a time against develop, three
+rounds, 300 frames of foreman at 300 kb/s take 1.06x the time, of mobile
+at 1000 kb/s 1.05x, 30 frames of park_joy at 3000 kb/s 1.01x, and 40
+frames of the small noisy clip 1.44x (0.26 s more: its key frame and a
+frame of its first group coded again). With constant quantisers nothing
+changes (`av1_rdcurve` on the five clips at
+speeds 4, 6 and 8: the same bytes and PSNR at every point).
 
 Not there yet:
 
@@ -945,9 +998,15 @@ Not there yet:
 - **Intra block copy for blocks under 8x8**, and copies that are not exact
   (the search finds where a block's source appears again exactly, and the
   stack's vectors).
-- **Lookahead**: rate control plans from the frames already coded and,
-  in groups, the group's sources (a still scene undershoots high rates: it
-  cannot use the bits).
+- **Rate control on what the lookahead cannot see**: its estimates are
+  within about a factor of two of what a frame costs (more for noise the
+  encoder refines, or a frame of a still scene it refines rather than
+  copies), and planning again after every frame does the rest; a short
+  clip's last frames cannot repay a misprediction, so a still scene
+  undershoots (it cannot use the bits) and a 24-frame fast pan lands 8 %
+  to 11 % low. The groups themselves are planned with their key frames
+  only at the start of a clip or after a key frame; no lookahead past the
+  group.
 
 ## How it is checked
 
@@ -1017,7 +1076,10 @@ Not there yet:
   intra block copy, film grain (the synthesised grain about as strong as
   the grain the source had); PSNR falls and size falls as the quantiser
   rises; inter frames cost less than the key frame; rate control lands
-  near its target. The formats and tools were also decoded by libdav1d
+  near its target, and from the first group of a 24-frame clip of
+  natural video and of the same with noise in every frame (within 6 %;
+  before, the first group of the first of them came to 0.65 times its
+  share). The formats and tools were also decoded by libdav1d
   (through FFmpeg, as a black box) to the same output as this crate's
   decoder, sample for sample, at speeds 4, 6 and 8 (not part of the
   tests).

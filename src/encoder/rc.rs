@@ -23,21 +23,37 @@
 //! Inter quantisers fall by at most `MAX_FALL` a frame, so the plan cannot
 //! swing into refining a whole frame at once.
 //!
-//! With alt-ref groups the plan is made once a group, before its first
-//! frame is coded: the quantiser at which the group's frames, each at its
-//! layer's offset, are predicted to spend the group's share of the budget
-//! (what earlier frames left or overspent repaid as above). Each layer of
-//! the pyramid has a model of its own (`k_layer * pixels * (inter + C0) /
-//! qstep^E`, the complexities measured on the group's sources in display
-//! order): an alt-ref frame predicted across the whole group costs more
-//! per unit of complexity than a frame of the top layer between two
-//! references. The alt-ref frame, the finest of its group, also carries
-//! the refinement term of the anchor it is predicted from (in a static
-//! scene it is most of its cost); the other layers are coarser than the
-//! frames they refer to. Until a group has been coded the layers' models
-//! are guesses, each a fraction of the one below; when the first alt-ref
-//! frame costs far from its guess they are all scaled by its error, and
-//! the group planned and the alt-ref frame coded again.
+//! With alt-ref groups the plan is made a group at a time, before its
+//! first frame is coded, and again after each of its frames: the quantiser
+//! at which the frames still to code, each at its layer's offset, are
+//! predicted to spend what is left of the group's budget (the group's
+//! shares, plus what earlier frames left or minus what they overspent,
+//! repaid over the group). A key frame is held until the group after it
+//! is, and planned with it at its own offset: a key frame and its group
+//! spend their shares between them, so the first group of a clip, or of a
+//! segment coded on its own, lands on the rate instead of leaving the
+//! groups after it to repay it.
+//!
+//! A group's complexities come from the lookahead (`lookahead`), measured
+//! on its sources before it is coded: per 16x16 block, the SATD of the
+//! cheapest of an intra prediction and the predictions from the frames the
+//! block's frame will be predicted from in the pyramid (an alt-ref frame
+//! across the whole group, a frame of the top layer from its neighbours).
+//! Each layer has a model of its own (`k_layer * pixels * (inter + C0) /
+//! qstep^E`); until a frame of a layer is coded its model is a guess
+//! against the key frame's (`LAYER_PRIOR`), and the first frame of each
+//! layer scales the guesses of the layers not yet coded by its error. A
+//! frame coded finer than the frames it is predicted from (the alt-ref
+//! frame and its anchor, in a static scene most of its cost; a frame
+//! planned again finer than the frames before it) carries their refinement
+//! term. Planning again after every frame is what holds a group to its
+//! budget: the models' first guesses are within about a factor of two,
+//! and the frames coded first, the alt-ref frame and the layers below the
+//! top, are the dearest. A key frame planned with its group, or the first
+//! alt-ref frame, far from its prediction is coded again with the model
+//! refitted; a frame that costs far beyond its prediction and what is left
+//! of the group's budget (noise it refines that the source did not show)
+//! is coded again, coarser.
 
 use crate::tables::AC_QLOOKUP;
 
@@ -54,7 +70,7 @@ const KEY_SHARE: f64 = 0.1;
 const REPAY: f64 = 12.0;
 /// The most an inter frame's quantiser index falls below the last inter
 /// frame's.
-const MAX_FALL: u32 = 8;
+pub(crate) const MAX_FALL: u32 = 8;
 
 /// A frame's class: what the model and the quantiser offset depend on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,8 +89,15 @@ const LAYERS: usize = 6;
 /// one, all of them at 255 at the end (a rate below what the top layer
 /// costs at 255 could not be reached otherwise).
 pub(crate) const MAX_GROUP_Q: u32 = 255 + 64;
-/// The first guess of each layer's model against the layer below's.
-const LAYER_PRIOR: f64 = 0.7;
+/// The first guess of each layer's model against the key frame's, its
+/// complexity measured by the lookahead (`lookahead`): the median over the
+/// test clips' first groups at quantisers 24 to 240 (a frame predicted
+/// across the whole group costs more per unit of its residual than the
+/// key frame does per unit of its own; the top layers' residuals are
+/// mostly left uncoded).
+const LAYER_PRIOR: [f64; LAYERS] = [1.2, 1.2, 1.1, 0.9, 0.6, 0.6];
+/// The first guess of the key frame's model.
+const KEY_PRIOR: f64 = 25.0;
 
 impl Class {
     /// The class's model.
@@ -103,6 +126,30 @@ pub(crate) struct Planned {
     pub(crate) base: u32,
     pub(crate) c: Complexity,
     pub(crate) predicted: f64,
+    /// The quantiser of the reference whose error the frame refines when
+    /// it is coded finer (see `refinement`).
+    pub(crate) ref_q: Option<u32>,
+}
+
+/// What a frame of a group is predicted from, for its refinement term:
+/// the finest of the frames already coded it refers to (the group's anchor
+/// among them; the frames of the group it refers to not yet coded are
+/// coded finer than it, at their layers' offsets), and whether it refers
+/// to a key frame planned with the group, not yet coded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Refs {
+    pub(crate) key: bool,
+    pub(crate) coded: Option<u32>,
+}
+
+impl Refs {
+    /// The quantiser refined, the key frame's `key_q`.
+    fn q(self, key_q: Option<u32>) -> Option<u32> {
+        [key_q.filter(|_| self.key), self.coded]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 pub(crate) struct RateControl {
@@ -152,7 +199,11 @@ impl RateControl {
             pixels: width as f64 * height as f64,
             spent: 0.0,
             frames: 0,
-            k: [25.0, 12.0, 12.0, 12.0, 12.0, 12.0, 12.0, 12.0],
+            k: std::array::from_fn(|m| match m {
+                0 => KEY_PRIOR,
+                1 => 0.5 * KEY_PRIOR,
+                _ => KEY_PRIOR * LAYER_PRIOR[m - 2],
+            }),
             fitted: [false; 2 + LAYERS],
             inter_complexity: None,
             prev: None,
@@ -194,15 +245,13 @@ impl RateControl {
             Class::Inter => {
                 self.k[1] * (c.inter + C0) * self.scale(qidx) + self.refinement(c, qidx, ref_q)
             }
-            // (The alt-ref frame, the finest of its group, refines the
-            // anchor it is predicted from as an inter frame does.)
-            Class::Layer(l) => {
+            // (A frame of a group, coded finer than what it is predicted
+            // from, refines it as an inter frame does: the alt-ref frame,
+            // the finest of its group, its anchor; a frame planned again
+            // finer than the frames coded before it, them.)
+            Class::Layer(_) => {
                 self.k[class.model()] * (c.inter + C0) * self.scale(qidx)
-                    + if l == 0 {
-                        self.refinement(c, qidx, ref_q)
-                    } else {
-                        0.0
-                    }
+                    + self.refinement(c, qidx, ref_q)
             }
         }
     }
@@ -345,33 +394,47 @@ impl RateControl {
             base: q,
             c,
             predicted: self.bits(class, &c, qf, self.ref_q),
+            ref_q: self.ref_q,
         }
     }
 
-    /// The plan's quantiser for a group of frames: `group` their layers and
-    /// complexities, `frame_q(q, layer)` a frame's quantiser when the
-    /// plan's is `q`.
+    /// The plan's quantiser for the frames of a group still to code:
+    /// `group` their layers, complexities and references, `key` the
+    /// complexity of the key frame planned with them when it is not yet
+    /// coded, `budget` what they are to spend, `frame_q(q, layer)` a frame's
+    /// quantiser (`None`: the key frame's) when the plan's is `q`; the plan
+    /// falls at most `falls` times `MAX_FALL` (and a little more while
+    /// earlier frames have left bits unspent) below the last group's first
+    /// plan, and stays at `keep` while that is predicted to spend within
+    /// a tenth of the budget.
     pub(crate) fn plan_group(
         &self,
-        group: &[(u8, Complexity)],
-        frame_q: impl Fn(u32, u8) -> u32,
+        group: &[(u8, Complexity, Refs)],
+        key: Option<Complexity>,
+        falls: Option<u32>,
+        keep: Option<u32>,
+        budget: f64,
+        frame_q: impl Fn(u32, Option<u8>) -> u32,
     ) -> u32 {
-        let n = group.len() as f64;
         let owed = self.owed();
-        let adj = (owed / REPAY).clamp(-0.5 * self.target, 0.5 * self.target);
-        let budget = (self.target + adj) * n;
         let cost = |q: u32| -> f64 {
-            group
+            // (A key frame planned with the group is its anchor.)
+            let key_q = key.map(|_| frame_q(q, None));
+            let k = key.map_or(0.0, |c| self.bits(Class::Key, &c, frame_q(q, None), None));
+            k + group
                 .iter()
-                .map(|&(l, c)| self.bits(Class::Layer(l), &c, frame_q(q, l), self.ref_q))
-                .sum()
+                .map(|&(l, c, r)| self.bits(Class::Layer(l), &c, frame_q(q, Some(l)), r.q(key_q)))
+                .sum::<f64>()
         };
-        // The plan falls slowly (faster while earlier frames have left
-        // bits unspent), a group's worth of frames at a time.
-        let floor = self.last_inter_q.map_or(1, |l| {
+        let floor = self.last_inter_q.zip(falls).map_or(1, |(l, n)| {
             let fall = MAX_FALL + (owed.max(0.0) / self.target).min(3.0 * MAX_FALL as f64) as u32;
-            l.saturating_sub(2 * fall).max(1)
+            l.saturating_sub(n * fall).max(1)
         });
+        if let Some(q) = keep
+            && (0.9 * budget..=1.1 * budget).contains(&cost(q))
+        {
+            return q;
+        }
         // (Beyond 255 the finer layers coarsen towards the top one, which
         // stays at 255: see `frame_q`.)
         (floor..=MAX_GROUP_Q)
@@ -379,12 +442,60 @@ impl RateControl {
             .unwrap_or(MAX_GROUP_Q)
     }
 
+    /// The budget of a group of `n` frames: their shares, plus what earlier
+    /// frames left or minus what they took, repaid over the group (at most
+    /// half a share a frame left, three quarters taken: see `plan`).
+    pub(crate) fn group_budget(&self, n: usize) -> f64 {
+        let n = n as f64;
+        let adj = (self.owed() / n).clamp(-0.75 * self.target, 0.5 * self.target);
+        (self.target + adj) * n
+    }
+
+    /// A group's first plan, `q`: where the next group's plan falls from.
+    pub(crate) fn start_group(&mut self, q: u32) {
+        self.last_inter_q = Some(q);
+    }
+
+    /// The quantiser of the last key or alt-ref frame (a group's anchor).
+    pub(crate) fn anchor_q(&self) -> Option<u32> {
+        self.ref_q
+    }
+
+    /// A frame of a group to code again, coarser: it cost twice its
+    /// prediction, more than half of what was left of the group's budget,
+    /// `left`, and more than four frames' shares (a frame that refines the
+    /// noise of the frames before it, which the model did not see; a frame
+    /// planned again into refining a still scene). The quantiser at which
+    /// it costs its prediction, or two fifths of what was left, by the
+    /// model's slope.
+    pub(crate) fn redo_layer(&self, p: &Planned, bits: u64, left: f64) -> Option<Planned> {
+        let bits = bits as f64;
+        if bits <= 2.0 * p.predicted || bits <= (0.5 * left).max(4.0 * self.target) {
+            return None;
+        }
+        let goal = p.predicted.max(0.4 * left);
+        let s0 = self.scale(p.qidx);
+        let q = (p.qidx..=255)
+            .find(|&q| bits * self.scale(q) / s0 <= goal)
+            .unwrap_or(255);
+        (q > p.qidx).then_some(Planned {
+            qidx: q,
+            predicted: goal,
+            ..*p
+        })
+    }
+
+    /// Bits spent so far.
+    pub(crate) fn spent(&self) -> f64 {
+        self.spent
+    }
+
     /// Whether the group should be planned again (and its first frame
     /// coded again): the first frame coded with a layer's model, far from
     /// its prediction. The models no frame has fitted yet are scaled by
     /// what it cost against its prediction.
     pub(crate) fn rescale_layers(&mut self, p: &Planned, bits: u64) -> bool {
-        let refined = self.refinement(&p.c, p.qidx, self.ref_q);
+        let refined = self.refinement(&p.c, p.qidx, p.ref_q);
         let part = (bits as f64 - refined).max(0.25 * bits as f64);
         let r = part / (p.predicted - refined).max(1.0);
         if (0.75..=1.33).contains(&r) || self.fitted[p.class.model()] {
@@ -398,15 +509,37 @@ impl RateControl {
         true
     }
 
-    /// A frame of a group planned at the group's quantiser `base`.
-    pub(crate) fn planned(&self, layer: u8, c: Complexity, base: u32, qidx: u32) -> Planned {
+    /// A frame of a group predicted from `refs` (or, without, the key
+    /// frame planned with it) planned at the group's quantiser `base`.
+    pub(crate) fn planned(
+        &self,
+        class: Class,
+        c: Complexity,
+        refs: Option<Refs>,
+        base: u32,
+        qidx: u32,
+    ) -> Planned {
+        let ref_q = refs.and_then(|r| r.q(None));
         Planned {
-            class: Class::Layer(layer),
+            class,
             qidx,
             base,
             c,
-            predicted: self.bits(Class::Layer(layer), &c, qidx, self.ref_q),
+            predicted: self.bits(class, &c, qidx, ref_q),
+            ref_q,
         }
+    }
+
+    /// Whether a key frame planned with its group should be planned again
+    /// with it (and coded again): far from its prediction, the model
+    /// refitted to it.
+    pub(crate) fn refit_key(&mut self, p: &Planned, bits: u64) -> bool {
+        let r = bits as f64 / p.predicted.max(1.0);
+        if (0.75..=1.33).contains(&r) {
+            return false;
+        }
+        self.refit(p, bits, true);
+        true
     }
 
     /// A new plan when the frame should be coded again (once): a key frame,
@@ -461,22 +594,21 @@ impl RateControl {
         let ci = p.class.model();
         let (part, cx) = match p.class {
             Class::Key => (bits as f64, p.c.intra),
-            Class::Layer(l) => (
-                if l == 0 {
-                    (bits as f64 - self.refinement(&p.c, p.qidx, self.ref_q))
-                        .max(0.25 * bits as f64)
-                } else {
-                    bits as f64
-                },
-                p.c.inter,
-            ),
-            Class::Inter => (
-                (bits as f64 - self.refinement(&p.c, p.qidx, self.ref_q)).max(0.25 * bits as f64),
+            Class::Layer(_) | Class::Inter => (
+                (bits as f64 - self.refinement(&p.c, p.qidx, p.ref_q)).max(0.25 * bits as f64),
                 p.c.inter,
             ),
         };
         let obs = part.max(1.0) / ((cx + C0) * self.scale(p.qidx));
-        self.k[ci] = if replace || !self.fitted[ci] {
+        self.k[ci] = if let Class::Layer(_) = p.class {
+            // (Its guess replaced by at most four times or a quarter of it,
+            // then halfway in proportion and at most twice or half: a
+            // group's frames are many and small, and one that codes far
+            // from the rest, a tenth or ten times its prediction, is not
+            // what the frames after it will cost.)
+            let r = (obs / self.k[ci]).clamp(0.25, 4.0);
+            self.k[ci] * if self.fitted[ci] { r.sqrt() } else { r }
+        } else if replace || !self.fitted[ci] {
             obs
         } else {
             0.5 * self.k[ci] + 0.5 * obs
@@ -484,14 +616,11 @@ impl RateControl {
         self.fitted[ci] = true;
         if p.class == Class::Key {
             // Until an inter frame says otherwise, inter frames cost half
-            // as much per unit of complexity, and a group's frames less
-            // the higher their layer (nearer their references; a group of
-            // 16 frames of foreman at a fixed quantiser: the top layer a
-            // quarter of the alt-ref frame's).
+            // as much per unit of complexity, and a group's frames as
+            // `LAYER_PRIOR` says.
             for m in 1..2 + LAYERS {
                 if !self.fitted[m] {
-                    let layer = m.saturating_sub(Class::Layer(0).model()) as i32;
-                    self.k[m] = 0.5 * self.k[ci] * LAYER_PRIOR.powi(layer);
+                    self.k[m] = self.k[ci] * if m == 1 { 0.5 } else { LAYER_PRIOR[m - 2] };
                 }
             }
         }
@@ -518,16 +647,29 @@ impl RateControl {
     /// quantiser (not a golden or alt-ref frame), `shown` whether it is
     /// shown now (an alt-ref frame is shown later).
     pub(crate) fn update(&mut self, p: &Planned, bits: u64, plain: bool, shown: bool) {
+        if let Class::Layer(_) = p.class
+            && !self.fitted[p.class.model()]
+        {
+            // The first frame of its layer: the layers no frame has fitted
+            // yet are as far from their guesses as it was from its.
+            let refined = self.refinement(&p.c, p.qidx, p.ref_q);
+            let part = (bits as f64 - refined).max(0.25 * bits as f64);
+            let r = (part / (p.predicted - refined).max(1.0)).clamp(0.25, 4.0);
+            for m in Class::Layer(0).model()..2 + LAYERS {
+                if !self.fitted[m] && m != p.class.model() {
+                    self.k[m] *= r;
+                }
+            }
+        }
         self.refit(p, bits, false);
         self.spent += bits as f64;
         self.frames += shown as u64;
         if p.class != Class::Key && shown {
             self.inter_complexity = Some(p.c.inter);
         }
-        if plain {
-            // (The plan's: a frame of a group's top layer is coded coarser.)
+        if plain && p.class == Class::Inter {
             self.last_inter_q = Some(p.base);
-        } else if p.class == Class::Key {
+        } else if p.class == Class::Key && !self.groups {
             self.last_inter_q = None;
         }
         if let Class::Layer(l) = p.class {

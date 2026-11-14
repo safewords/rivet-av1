@@ -885,6 +885,56 @@ fn rate_control_tracks_the_target() {
     }
 }
 
+/// Rate control holds its target from the first group: a 24-frame clip in
+/// groups of 16 (a key frame, a group of 16, one of 7), of natural video
+/// and of the same with fresh noise in every frame, spends its rate over
+/// the key frame and the first group, and over the clip, within 6 % (before
+/// the key frame was planned with its group and the group planned again
+/// after each frame, the first group of such a clip took 1.3 to 2.3 times
+/// its share, and later groups repaid it; `examples/av1_ratetest.rs`
+/// measures short clips and segments at length).
+#[test]
+fn rate_control_first_group_on_target() {
+    let clean = natural(24);
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let noisy: Vec<Frame> = clean
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            for v in f.data.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *v = (*v as i32 + ((s >> 40) % 21) as i32 - 10).clamp(0, 255) as u8;
+            }
+            f
+        })
+        .collect();
+    for (name, src) in [("natural", &clean), ("noisy", &noisy)] {
+        for target in [8_000u64, 30_000] {
+            let mut cfg = cfg_for(src[0].width, src[0].height);
+            cfg.keyframe_interval = 240;
+            cfg.target_bits_per_frame = Some(target);
+            let (_, sizes) = round_trip(cfg, src);
+            let rate = |n: usize| {
+                sizes[..n].iter().map(|&s| s as f64 * 8.0).sum::<f64>() / (target * n as u64) as f64
+            };
+            let (first, all) = (rate(17), rate(sizes.len()));
+            eprintln!(
+                "rate control, {name}, {target} bits a frame: first group {first:.3}x, clip {all:.3}x"
+            );
+            assert!(
+                (0.94..1.06).contains(&first),
+                "{name} {target}: first group {first:.3}x"
+            );
+            assert!(
+                (0.94..1.06).contains(&all),
+                "{name} {target}: clip {all:.3}x"
+            );
+        }
+    }
+}
+
 /// The README table: sizes and PSNR at several quantisers on 8 frames of
 /// natural video (a key frame then seven inter frames). Run with
 /// `cargo test --release --test encode -- --ignored --nocapture`.

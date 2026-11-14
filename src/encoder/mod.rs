@@ -21,6 +21,7 @@ mod gm;
 mod gop;
 mod grain;
 mod inter;
+mod lookahead;
 pub(crate) mod lr;
 mod rc;
 pub(crate) mod rdo;
@@ -633,6 +634,9 @@ pub struct Encoder {
     /// The last frame taken (film grain: its noise is measured against
     /// it).
     grain_prev: Option<Frame>,
+    /// Rate control's lookahead: the half-size luma of the next group's
+    /// anchor (the last group's alt-ref frame).
+    anchor_plane: Option<lookahead::Plane>,
 }
 
 /// The slot the golden frame (the key frame, or a periodic boosted frame)
@@ -647,12 +651,41 @@ struct GroupPlan {
     first: u64,
     /// Each frame's layer and complexity, in display order.
     frames: Vec<(u8, rc::Complexity)>,
+    /// What each is predicted from: the frames of the group (indices in
+    /// display order) coded before it nearest on either side, `None` on
+    /// the left the anchor.
+    refs: Vec<(Option<usize>, Option<usize>)>,
+    /// Which of them are coded, and at what quantiser.
+    coded: Vec<Option<u32>>,
+    /// The key frame planned with the group, coded before it: its
+    /// complexity, and whether it is coded.
+    key: Option<(rc::Complexity, bool)>,
+    /// The quantiser of the group's anchor, once it is coded.
+    anchor_q: Option<u32>,
+    /// The group's budget, and rate control's spending when it was made.
+    budget: f64,
+    spent: f64,
 }
 
 impl GroupPlan {
     /// The layer and complexity of the frame of display index `hint`.
     fn frame(&self, hint: u64) -> (u8, rc::Complexity) {
         self.frames[(hint - self.first) as usize]
+    }
+
+    /// What frame `i` (in display order) is predicted from.
+    fn refs(&self, i: usize) -> rc::Refs {
+        let (left, right) = self.refs[i];
+        let anchor = left.is_none().then_some(self.anchor_q).flatten();
+        rc::Refs {
+            key: left.is_none() && self.anchor_q.is_none(),
+            coded: [left, right]
+                .into_iter()
+                .flatten()
+                .filter_map(|j| self.coded[j])
+                .chain(anchor)
+                .min(),
+        }
     }
 }
 
@@ -856,6 +889,7 @@ impl Encoder {
             next_screen_content: false,
             next_grain: Default::default(),
             grain_prev: None,
+            anchor_plane: None,
         }
     }
 
@@ -984,11 +1018,41 @@ impl Encoder {
     fn pump(&mut self, all: bool) -> Result<()> {
         while let Some(&(_, key, _)) = self.queue.front() {
             if key {
+                // With rate control, a key frame is planned with the group
+                // after it (held until that group is): its quantiser and
+                // theirs, at their offsets, the quantiser at which the key
+                // frame and the group spend their share.
+                let mut g = 0;
+                if self.rc.is_some() {
+                    let interval = self.cfg.keyframe_interval.max(1) as u64;
+                    g = self.group_len().min(interval.saturating_sub(1).max(1)) as usize;
+                    if let Some(k) = self.queue.iter().skip(1).position(|q| q.1) {
+                        g = g.min(k);
+                    }
+                    if self.queue.len() < g + 1 && !all {
+                        break;
+                    }
+                    g = g.min(self.queue.len() - 1);
+                }
+                if g > 0 {
+                    self.plan_group(g, true);
+                }
                 let (frame, _, grain) = self.queue.pop_front().expect("a frame");
                 self.next_grain = grain;
                 let (obus, recon) = self.code_one(&frame, Role::Key)?;
+                let anchor_q = self.rc.as_ref().and_then(|rc| rc.anchor_q());
+                if let Some(plan) = self.group_plan.as_mut()
+                    && let Some((_, coded)) = plan.key.as_mut()
+                {
+                    *coded = true;
+                    plan.anchor_q = anchor_q;
+                    self.replan_group();
+                }
                 let tu = self.temporal_unit(true, &[], &obus);
                 self.ready.push_back((tu, recon, true));
+                if g > 0 {
+                    self.code_group(g)?;
+                }
                 continue;
             }
             // The group: up to the alt-ref interval, not past the next key
@@ -1022,8 +1086,8 @@ impl Encoder {
             .max()
             .unwrap_or(0);
         let base = self.shown;
-        if self.rc.is_some() {
-            self.plan_group(&steps, top, g);
+        if self.rc.is_some() && self.group_plan.is_none() {
+            self.plan_group(g, false);
         }
         // Frames not shown go out in the temporal unit of the next one shown.
         let mut hidden = Vec::new();
@@ -1041,6 +1105,11 @@ impl Encoder {
                         show,
                     };
                     let (obus, recon) = self.code_one(&frame, role)?;
+                    if self.group_plan.is_some() {
+                        // The frames after it planned again, with what it
+                        // cost.
+                        self.replan_group();
+                    }
                     if show {
                         let tu = self.temporal_unit(false, &hidden, &obus);
                         hidden.clear();
@@ -1062,29 +1131,67 @@ impl Encoder {
         Ok(())
     }
 
-    /// Rate control's plan for the group of the next `g` frames held,
-    /// coded in `steps` with `top` its top layer: their complexities
-    /// measured in display order, then the quantiser.
-    fn plan_group(&mut self, steps: &[gop::Step], top: u8, g: usize) {
-        let mut layers = vec![top; g];
-        for s in steps {
-            if let gop::Step::Code { idx, layer, .. } = *s {
-                layers[idx as usize - 1] = layer;
+    /// Rate control's plan for the group of `g` frames held next (after
+    /// the key frame held first, planned with them, when `key`): their
+    /// complexities measured in display order, then the quantiser.
+    fn plan_group(&mut self, g: usize, key: bool) {
+        let off = key as usize;
+        let planes: Vec<_> = (0..g + off)
+            .map(|i| lookahead::Plane::new(&self.queue[i].0))
+            .collect();
+        // (On the scale of the mean absolute deviations `rc::measure`
+        // takes: a SATD is about twice that.)
+        let complexity = |(intra, best): (f64, f64)| rc::Complexity {
+            intra: 0.5 * intra,
+            inter: 0.5 * best,
+        };
+        let key = key.then(|| (complexity(lookahead::costs(&planes[0], &[])), false));
+        let mut planes = planes.into_iter();
+        let anchor = if key.is_some() {
+            planes.next()
+        } else {
+            self.anchor_plane.take()
+        };
+        let planes: Vec<_> = planes.collect();
+        // Each frame from the frames coded before it nearest on either
+        // side, in the order they are coded.
+        let mut group = vec![(0, complexity((0.0, 0.0))); g];
+        let mut refs = vec![(None, None); g];
+        let mut coded = vec![false; g];
+        for s in gop::plan(g as u32) {
+            if let gop::Step::Code { idx, layer, .. } = s {
+                let i = idx as usize - 1;
+                let left = (0..i).rev().find(|&j| coded[j]);
+                let right = (i + 1..g).find(|&j| coded[j]);
+                refs[i] = (left, right);
+                let refs: Vec<_> = [
+                    left.map(|j| &planes[j]).or(anchor.as_ref()),
+                    right.map(|j| &planes[j]),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                group[i] = (layer, complexity(lookahead::costs(&planes[i], &refs)));
+                coded[i] = true;
             }
         }
-        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
-        let mut group = Vec::with_capacity(g);
-        for (i, &layer) in layers.iter().enumerate() {
-            let (src, stride) = self.source_planes(&self.queue[i].0);
-            let rc = self.rc.as_mut().expect("rate control");
-            group.push((layer, rc.measure(&src[0], stride[0], w, h, true)));
-        }
+        self.anchor_plane = planes.into_iter().last();
+        let rc = self.rc.as_ref().expect("rate control");
+        let anchor_q = if key.is_some() { None } else { rc.anchor_q() };
         self.group_plan = Some(GroupPlan {
+            anchor_q,
             q: 0,
-            first: self.shown,
+            first: self.shown + off as u64,
+            refs,
+            coded: vec![None; g],
+            key,
+            budget: rc.group_budget(g + off),
+            spent: rc.spent(),
             frames: group,
         });
         self.replan_group();
+        let q = self.group_plan.as_ref().expect("a group plan").q;
+        self.rc.as_mut().expect("rate control").start_group(q);
     }
 
     /// The group's quantiser planned (again) from rate control's models.
@@ -1094,17 +1201,48 @@ impl Encoder {
             return;
         };
         let top = plan.frames.iter().map(|g| g.0).max().unwrap_or(0);
-        let frame_q = |q: u32, layer: u8| {
-            let role = Role::Group {
+        // (`None`: the key frame.)
+        let frame_q = |q: u32, layer: Option<u8>| {
+            let role = layer.map_or(Role::Key, |layer| Role::Group {
                 hint: 0,
                 layer,
                 top: layer == top,
                 depth: top,
                 show: true,
-            };
+            });
             frame_qidx(q, role, false, true, true, bit_depth)
         };
-        plan.q = rc.plan_group(&plan.frames, frame_q);
+        // (The frames still to code, and what is left of the budget.)
+        let rest: Vec<_> = (0..plan.frames.len())
+            .filter(|&i| plan.coded[i].is_none())
+            .map(|i| (plan.frames[i].0, plan.frames[i].1, plan.refs(i)))
+            .collect();
+        if rest.is_empty() {
+            return;
+        }
+        let key = plan.key.filter(|k| !k.1).map(|k| k.0);
+        let budget = plan.budget - (rc.spent() - plan.spent);
+        // (A group planned with its key frame, or planned again once a
+        // frame of it is coded, falls as far as it needs to: what it
+        // overspends, the frames after it repay.)
+        let falls = (plan.key.is_none() && plan.coded.iter().all(Option::is_none)).then_some(2);
+        // (A group after the first keeps its plan while it is near: a
+        // plan that moves with every frame codes the frames of a group,
+        // which refer to each other, less well than one that holds.)
+        let replan = plan.coded.iter().any(Option::is_some);
+        let keep = (replan && plan.key.is_none()).then_some(plan.q);
+        let q = rc.plan_group(&rest, key, falls, keep, budget, frame_q);
+        // (Once a frame is coded, two falls or four rises at most a frame:
+        // a frame far from its prediction moves the frames after it, not
+        // to the far end of the range at once.)
+        plan.q = if plan.coded.iter().any(Option::is_some) {
+            q.clamp(
+                plan.q.saturating_sub(3 * rc::MAX_FALL),
+                plan.q + 6 * rc::MAX_FALL,
+            )
+        } else {
+            q
+        };
     }
 
     /// A temporal unit: the delimiter, on key frames the sequence header and
@@ -1187,7 +1325,25 @@ impl Encoder {
             if let (Role::Group { hint, layer, .. }, Some(plan)) = (role, &self.group_plan) {
                 // The group's plan.
                 let c = plan.frame(hint).1;
-                planned = Some(rc.planned(layer, c, plan.q, frame_q(plan.q)));
+                let refs = plan.refs((hint - plan.first) as usize);
+                planned = Some(rc.planned(
+                    rc::Class::Layer(layer),
+                    c,
+                    Some(refs),
+                    plan.q,
+                    frame_q(plan.q),
+                ));
+            } else if let (
+                Role::Key,
+                Some(GroupPlan {
+                    key: Some((c, _)),
+                    q,
+                    ..
+                }),
+            ) = (role, &self.group_plan)
+            {
+                // Planned with its group.
+                planned = Some(rc.planned(rc::Class::Key, *c, None, *q, frame_q(*q)));
             } else {
                 let class = if key {
                     rc::Class::Key
@@ -1211,10 +1367,47 @@ impl Encoder {
             self.replan_group();
             let plan = self.group_plan.as_ref().expect("a group plan");
             let rc = self.rc.as_ref().expect("rate control");
-            *pl = rc.planned(0, plan.frame(hint).1, plan.q, frame_q(plan.q));
+            let i = (hint - plan.first) as usize;
+            *pl = rc.planned(
+                rc::Class::Layer(0),
+                plan.frames[i].1,
+                Some(plan.refs(i)),
+                plan.q,
+                frame_q(plan.q),
+            );
+            (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
+        }
+        if let (Some(pl), Some(rc), Some(plan)) =
+            (planned.as_mut(), self.rc.as_ref(), self.group_plan.as_ref())
+            && let Role::Group { .. } = role
+            && let Some(again) = rc.redo_layer(
+                pl,
+                obus.len() as u64 * 8,
+                plan.budget - (rc.spent() - plan.spent),
+            )
+        {
+            // Far beyond its prediction and what the group has left: coded
+            // again, coarser.
+            *pl = again;
+            (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
+        }
+        let joint = key && self.group_plan.is_some();
+        if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
+            && joint
+            && rc.refit_key(pl, obus.len() as u64 * 8)
+        {
+            // A key frame planned with its group, far from its prediction:
+            // the models refitted, both planned again and the key frame
+            // coded again.
+            self.replan_group();
+            let plan = self.group_plan.as_ref().expect("a group plan");
+            let rc = self.rc.as_ref().expect("rate control");
+            let c = plan.key.expect("a key frame").0;
+            *pl = rc.planned(rc::Class::Key, c, None, plan.q, frame_q(plan.q));
             (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
         }
         if let (Some(pl), Some(rc)) = (planned.as_mut(), self.rc.as_mut())
+            && !joint
             && let Some(again) = rc.redo(pl, obus.len() as u64 * 8, frame_q)
         {
             // Far from the plan: planned again and coded again.
@@ -1259,6 +1452,9 @@ impl Encoder {
             self.since_key = if key { 1 } else { self.since_key + 1 };
         }
         self.frame_num += 1;
+        if let (Role::Group { hint, .. }, Some(plan)) = (role, self.group_plan.as_mut()) {
+            plan.coded[(hint - plan.first) as usize] = Some(p.qidx);
+        }
         if let (Some(pl), Some(rc)) = (planned.as_ref(), self.rc.as_mut()) {
             rc.update(
                 pl,
