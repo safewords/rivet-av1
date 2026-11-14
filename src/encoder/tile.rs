@@ -17,7 +17,7 @@ use crate::decoder::state::Mv;
 use crate::decoder::tile::{Plan, TileDecoder};
 use crate::dsp::enc::{sad, satd};
 use crate::encoder::Tools;
-use crate::encoder::fwd::{Quantiser, coef_bound, forward_quantise};
+use crate::encoder::fwd::{Quantiser, coef_bound, forward_quantise, forward_wht};
 use crate::encoder::rdo::{Decision, Rdo};
 use crate::symbol::Coder;
 use crate::tables::*;
@@ -238,6 +238,9 @@ impl TileDecoder<'_, '_> {
 
     /// The modes of the block about to be coded (encode mode): sets `plan`.
     pub(crate) fn enc_decide_block(&mut self) -> Result<()> {
+        // The block's `Lossless` (its segment's; the encoder codes no
+        // segmentation), which mode info would only set after the decision.
+        self.b.lossless = self.f.hdr.lossless_array[0];
         if self.enc().tools.rdo {
             return self.enc_decide_block_rd();
         }
@@ -1346,6 +1349,16 @@ impl TileDecoder<'_, '_> {
                     sum_abs += r.unsigned_abs();
                 }
             }
+        }
+        if self.b.lossless {
+            // Lossless (quantiser index 0): the levels the decoder's
+            // Walsh-Hadamard transform takes back to the residual exactly.
+            let iscan = crate::decoder::residual::inverse_scan(tx_sz, tx_type);
+            let enc = self.enc.as_mut().expect("encode mode");
+            let eob = forward_wht(&res[..16], iscan, &mut enc.coefs[..16]);
+            enc.res = res;
+            self.plane_tx_type = tx_type;
+            return eob;
         }
         let bd = self.f.bit_depth;
         let bdi = ((bd - 8) >> 1) as usize;

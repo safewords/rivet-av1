@@ -444,6 +444,47 @@ fn profiles_one_and_two() {
 }
 
 #[test]
+fn lossless_round_trips_sample_exact() {
+    // Quantiser 0: every frame decodes to the source itself, key frames
+    // and inter frames (in alt-ref groups and in display order), at each
+    // bit depth and in each chroma format, at the speeds' searches.
+    let src = natural(5);
+    for (chroma, bit_depth, speed, altref) in [
+        (ChromaFormat::Yuv420, 8, 4, 16),
+        (ChromaFormat::Yuv420, 8, 8, 0),
+        (ChromaFormat::Yuv420, 10, 6, 16),
+        (ChromaFormat::Yuv444, 8, 6, 16),
+        (ChromaFormat::Yuv422, 12, 8, 16),
+        (ChromaFormat::Mono, 8, 6, 16),
+        (ChromaFormat::Yuv420, 8, 10, 0),
+    ] {
+        let (w, h) = (70, 50);
+        let frames: Vec<Frame> = src
+            .iter()
+            .map(|f| reformat(f, w, h, bit_depth, chroma))
+            .collect();
+        let mut cfg = Config::new(w, h);
+        cfg.chroma = chroma;
+        cfg.bit_depth = bit_depth;
+        cfg.quantizer = 0;
+        cfg.speed = if cfg!(debug_assertions) { 8 } else { speed };
+        cfg.tools = av1::Tools::for_speed(cfg.speed);
+        cfg.altref = altref;
+        let (dec, sizes) = round_trip(cfg, &frames);
+        for (i, (a, b)) in frames.iter().zip(&dec).enumerate() {
+            assert!(
+                a.data == b.data,
+                "{chroma:?} {bit_depth}-bit speed {speed}: frame {i} is not the source"
+            );
+        }
+        // Lossless costs more than a fine quantiser, but not absurdly.
+        let raw = frames[0].data.len() * frames.len();
+        let total: usize = sizes.iter().sum();
+        assert!(total < raw, "{total} bytes for {raw} of samples");
+    }
+}
+
+#[test]
 fn every_tool_round_trips() {
     let src = natural(4);
     let crop = |f: &Frame| {

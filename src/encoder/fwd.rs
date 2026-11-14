@@ -261,6 +261,61 @@ pub(crate) fn forward_quantise(
     })
 }
 
+/// The inverse of the decoder's 1D inverse Walsh-Hadamard transform
+/// (7.13.2.10) with its input shift left out: the four values `t` that
+/// the inverse takes to `out`. The inverse is a chain of lifting steps
+/// (each adds to one value a function of the others), so it is undone
+/// exactly by the same steps, in the reverse order, subtracting.
+fn forward_wht_1d(out: [i32; 4]) -> [i32; 4] {
+    // The inverse: a += c; d -= b; e = (a - d) >> 1; b = e - b; c = e - c;
+    // a -= b; d += c, its inputs (a, c, d, b) and outputs (a, b, c, d).
+    let [a2, b1, c1, d2] = out;
+    let d1 = d2 - c1;
+    let a1 = a2 + b1;
+    let e = (a1 - d1) >> 1;
+    let c0 = e - c1;
+    let b0 = e - b1;
+    let d0 = d1 + b0;
+    let a0 = a1 - c0;
+    [a0, c0, d0, b0]
+}
+
+/// The lossless transform: the levels of a 4x4 residual (row by row) whose
+/// dequantised coefficients the decoder's inverse Walsh-Hadamard transform
+/// (7.13.3, `Lossless`) takes back to exactly that residual, into
+/// `levels` (row by row, `Quant`'s layout); returns the end of block in
+/// the scan `iscan` inverts.
+///
+/// Quantiser index 0 has a step of 4 at every bit depth, and the inverse
+/// shifts its row inputs right by 2, so a level is what the row transform
+/// takes in: the residual is taken back through the column transform,
+/// then through the row transform.
+pub(crate) fn forward_wht(residual: &[i32], iscan: &[u16], levels: &mut [i32]) -> usize {
+    let mut mid = [[0i32; 4]; 4];
+    for j in 0..4 {
+        let col = forward_wht_1d([
+            residual[j],
+            residual[4 + j],
+            residual[8 + j],
+            residual[12 + j],
+        ]);
+        for i in 0..4 {
+            mid[i][j] = col[i];
+        }
+    }
+    let mut eob = 0;
+    for (i, m) in mid.iter().enumerate() {
+        let row = forward_wht_1d(*m);
+        for j in 0..4 {
+            levels[i * 4 + j] = row[j];
+            if row[j] != 0 {
+                eob = eob.max(iscan[i * 4 + j] as usize + 1);
+            }
+        }
+    }
+    eob
+}
+
 /// The 2D transform of the residual into `sc.col` (coefficient `k` of
 /// column `j` at `col[k * tw + j]`, unscaled), the AVX2 build where there
 /// is one.
@@ -513,6 +568,54 @@ fn flips(tx_type: usize) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lossless transform's levels, dequantised with quantiser index
+    /// 0's step and through the decoder's inverse Walsh-Hadamard
+    /// transform, give back the residual exactly, at every bit depth's
+    /// range of residuals.
+    #[test]
+    fn forward_wht_inverts_the_inverse() {
+        let iscan = crate::decoder::residual::inverse_scan(TX_4X4, DCT_DCT);
+        let mut seed = 12345u32;
+        for bd in [8u32, 10, 12] {
+            let max = (1i32 << bd) - 1;
+            for n in 0..20000 {
+                let mut res = [0i32; 16];
+                for r in res.iter_mut() {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    // Extremes, small values and everything between.
+                    *r = match n % 3 {
+                        0 => (seed >> 8) as i32 % (2 * max + 1) - max,
+                        1 => ((seed >> 8) as i32 % 7) - 3,
+                        _ => {
+                            if seed & 0x100 != 0 {
+                                max
+                            } else {
+                                -max
+                            }
+                        }
+                    };
+                }
+                let mut levels = [0i32; 16];
+                let eob = forward_wht(&res, iscan, &mut levels);
+                let mut dequant = [0i32; 64 * 4];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        dequant[i * 64 + j] = levels[i * 4 + j] * 4;
+                    }
+                }
+                let mut out = [0i32; 16];
+                crate::dsp::itx::inverse_transform_2d_scalar(
+                    &dequant, TX_4X4, DCT_DCT, true, bd, &mut out,
+                );
+                assert_eq!(out, res, "{bd}-bit residual {res:?}");
+                let last = (0..16)
+                    .filter(|&p| levels[p] != 0)
+                    .map(|p| iscan[p] as usize + 1);
+                assert_eq!(eob, last.max().unwrap_or(0));
+            }
+        }
+    }
 
     /// The transform one row at a time (the rows by [`forward_line`]),
     /// as it was before the rows were made lanes.

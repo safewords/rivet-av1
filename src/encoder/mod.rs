@@ -54,7 +54,10 @@ pub struct Config {
     /// Bits per sample: 8, 10 or 12 (12 is profile 2's).
     pub bit_depth: u32,
     /// The quantiser index, 1 (finest) to 255 (coarsest); the starting
-    /// point under rate control.
+    /// point under rate control. 0 (without rate control) is lossless:
+    /// every frame at quantiser index 0, its residuals coded with the
+    /// Walsh-Hadamard transform, no in-loop filters, the output the input
+    /// sample for sample.
     pub quantizer: u32,
     /// A key frame every this many frames (1: all key frames).
     pub keyframe_interval: u32,
@@ -481,6 +484,15 @@ struct FrameParams {
     order_hint: u64,
 }
 
+impl FrameParams {
+    /// Whether the in-loop filters are coded: not in a lossless frame
+    /// (`CodedLossless`), whose loop filter, CDEF and loop restoration
+    /// parameters the header leaves out (5.9.11, 5.9.19, 5.9.20).
+    fn filters(&self) -> bool {
+        self.qidx > 0
+    }
+}
+
 /// What a coded frame is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -713,6 +725,11 @@ impl Encoder {
     pub fn flush(&mut self) -> Result<Option<Vec<u8>>> {
         self.pump(true)?;
         Ok(self.pop_ready())
+    }
+
+    /// Whether every frame is lossless: quantiser 0, without rate control.
+    fn lossless(&self) -> bool {
+        self.cfg.quantizer == 0 && self.cfg.target_bits_per_frame.is_none()
     }
 
     /// Whether frames are coded in alt-ref groups: asked for, and with the
@@ -1045,6 +1062,7 @@ impl Encoder {
         let (src, stride) = (src.clone(), stride.to_vec());
         let mut p = self.frame_params(role, qidx);
         if tools.aq
+            && p.qidx > 0
             && let Some(prev) = self.prev_src.as_ref()
         {
             let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
@@ -1071,12 +1089,15 @@ impl Encoder {
             }
         }
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
-        if tools.lf_search || tools.cdef || tools.restoration || coded.tiles.is_empty() {
+        let filters = p.filters();
+        if (filters && (tools.lf_search || tools.cdef || tools.restoration))
+            || coded.tiles.is_empty()
+        {
             // The in-loop filters' parameters, chosen on the first pass's
             // reconstruction; then the frame again with them, replaying the
             // first pass's decisions.
             let mut f = coded.f;
-            if tools.lf_search && self.cfg.loop_filter.is_none() {
+            if filters && tools.lf_search && self.cfg.loop_filter.is_none() {
                 p.lf = search_lf(&mut f, &src, &stride, p.lf, self.cfg.threads.max(1));
             }
             f.hdr.loop_filter_level = p.lf.map(|l| l as i32);
@@ -1085,7 +1106,7 @@ impl Encoder {
             }
             let mut cdef_table = None;
             let lambda = rd_lambda(&self.cfg, p.qidx);
-            if tools.cdef {
+            if filters && tools.cdef {
                 let (params, table) = cdef::search(
                     &f,
                     &src,
@@ -1110,7 +1131,7 @@ impl Encoder {
                 cdef_table = Some(table);
             }
             let mut lr_plan = None;
-            if tools.restoration {
+            if filters && tools.restoration {
                 let cdef_frame = crate::decoder::postfilter::cdef(&f, self.cfg.threads.max(1));
                 let plan = lr::search(
                     &f,
@@ -1171,16 +1192,21 @@ impl Encoder {
         let golden = role == Role::Inter
             && tools.multi_ref
             && self.since_key.is_multiple_of(GOLDEN_INTERVAL);
-        let qidx = planned_q.unwrap_or_else(|| {
-            frame_qidx(
-                self.quantizer(),
-                role,
-                golden,
-                self.altref_groups(),
-                false,
-                self.cfg.bit_depth,
-            )
-        });
+        let qidx = if self.lossless() {
+            0
+        } else {
+            planned_q.unwrap_or_else(|| {
+                frame_qidx(
+                    self.quantizer(),
+                    role,
+                    golden,
+                    self.altref_groups(),
+                    false,
+                    self.cfg.bit_depth,
+                )
+            })
+        };
+        let filters = qidx > 0;
         let mut refresh = 0xFFu8;
         let mut ref_slots = [0usize; REFS_PER_FRAME];
         let mut search_refs = Vec::new();
@@ -1245,22 +1271,26 @@ impl Encoder {
             refresh,
             ref_slots,
             search_refs,
-            lf: [lf, lf, chroma_lf, chroma_lf],
-            cdef: if tools.cdef {
+            lf: if filters {
+                [lf, lf, chroma_lf, chroma_lf]
+            } else {
+                [0; 4]
+            },
+            cdef: if tools.cdef && filters {
                 Some(cdef::CdefParams::off())
             } else {
                 None
             },
             // Switchable in every plane on the first pass, every unit off:
             // the units exist for the search.
-            lr: if tools.restoration {
+            lr: if tools.restoration && filters {
                 Some([RESTORE_SWITCHABLE; 3])
             } else {
                 None
             },
             reference_select,
             screen_content,
-            tx_select: tools.tx_size && tools.rdo,
+            tx_select: tools.tx_size && tools.rdo && qidx > 0,
             reduced_tx_set: !(tools.full_tx_set && tools.rdo),
             tile_cols_log2: self.cfg.tile_cols_log2,
             aq: None,
@@ -1535,15 +1565,17 @@ impl Encoder {
                 w.flag(false); // delta_lf_present
             }
         }
-        // loop_filter_params()
-        w.f(6, p.lf[0]);
-        w.f(6, p.lf[1]);
-        if chroma && (p.lf[0] != 0 || p.lf[1] != 0) {
-            w.f(6, p.lf[2]);
-            w.f(6, p.lf[3]);
+        // loop_filter_params(), unless the frame is lossless.
+        if p.filters() {
+            w.f(6, p.lf[0]);
+            w.f(6, p.lf[1]);
+            if chroma && (p.lf[0] != 0 || p.lf[1] != 0) {
+                w.f(6, p.lf[2]);
+                w.f(6, p.lf[3]);
+            }
+            w.f(3, 0); // loop_filter_sharpness
+            w.flag(false); // loop_filter_delta_enabled
         }
-        w.f(3, 0); // loop_filter_sharpness
-        w.flag(false); // loop_filter_delta_enabled
         // cdef_params()
         if let Some(c) = &p.cdef {
             w.f(2, c.damping_minus_3);
@@ -1590,8 +1622,11 @@ impl Encoder {
                 }
             }
         }
-        // read_tx_mode(): TX_MODE_SELECT when transform sizes are searched.
-        w.flag(p.tx_select);
+        // read_tx_mode(): TX_MODE_SELECT when transform sizes are searched
+        // (a lossless frame has ONLY_4X4, not coded).
+        if p.qidx > 0 {
+            w.flag(p.tx_select);
+        }
         if !key {
             w.flag(p.reference_select); // reference_select
             if p.reference_select && self.skip_mode_allowed(p) {
