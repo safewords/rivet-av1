@@ -271,19 +271,18 @@ pub struct Tools {
     pub rect_max: u8,
     /// Switchable interpolation filters: each inter block's filter (regular,
     /// smooth or sharp) chosen by its prediction (`is_filter_switchable`).
-    /// Against all the other inter tools: −0.9 % BD-rate at speeds 4 and
-    /// 6, −1.0 % at 8 (the most of any), for 5 % to 9 % more time.
+    /// The most of the inter tools: with OBMC and local warps, −2.0 % to
+    /// −2.2 % BD-rate at speeds 4 to 8 for 1.04x to 1.09x the time (the
+    /// README has each tool's share).
     pub switchable_filter: bool,
     /// With `switchable_filter`, a filter for each direction
     /// (`enable_dual_filter`). ±0 at speeds 4 and 6 (−0.3 % at 8) for 5 %
     /// more time: off.
     pub dual_filter: bool,
-    /// Overlapped block motion compensation (`motion_mode` OBMC). −0.3 %
-    /// to −0.7 % for 1 % to 2 % more time.
+    /// Overlapped block motion compensation (`motion_mode` OBMC).
     pub obmc: bool,
     /// Local warped motion (`motion_mode` LOCALWARP): the block's warp
-    /// fitted to its neighbours' vectors. −0.4 % to −0.5 % for about 1 %
-    /// more time.
+    /// fitted to its neighbours' vectors.
     pub warped_motion: bool,
     /// Global motion: a warp (or translation) per reference, estimated by
     /// the encoder from the source and the reference, for GLOBALMV blocks.
@@ -295,12 +294,16 @@ pub struct Tools {
     /// off.
     pub masked_compound: bool,
     /// Distance-weighted compound (`enable_jnt_comp`). −0.1 % at speeds 4
-    /// and 8 (+0.1 % at 6) for about 1 % more time: on to speed 4.
+    /// and 8 (+0.1 % at 6) for about 1 % more time: on to speed 3.
     pub jnt_comp: bool,
     /// Inter-intra prediction, smooth and wedge
     /// (`enable_interintra_compound`). −0.2 % at speeds 4 and 8, −0.1 % at
-    /// 6, for 3 % to 5 % more time: on to speed 4.
+    /// 6, for 3 % to 5 % more time: on to speed 3.
     pub interintra: bool,
+    /// The inter tools are tried only for blocks whose best inter
+    /// candidate costs at least this many hundredths of the Lagrange
+    /// multiplier per sample (0: every block).
+    pub inter_tool_threshold: u16,
     /// How many of the inter tools' variants of a block's best inter
     /// candidate (those whose prediction measures cheaper) are trialled.
     pub inter_tool_trials: u8,
@@ -379,8 +382,12 @@ impl Tools {
                 0..=3 => 0,
                 _ => 15,
             },
+            // (Speeds 4 and 8 trade 100 for the inter tools' time: with
+            // them, 150 is −2.0 % and −1.1 % BD-rate for 1.04x and 1.01x
+            // the time.)
             split_threshold_small: match s {
                 0..=3 => 0,
+                4 | 8 => 150,
                 _ => 100,
             },
             rd_skip_best: s >= 4,
@@ -405,9 +412,11 @@ impl Tools {
             warped_motion: s <= 8,
             global_motion: false,
             masked_compound: false,
-            jnt_comp: s <= 4,
-            interintra: s <= 4,
-            inter_tool_trials: 2,
+            jnt_comp: s <= 3,
+            interintra: s <= 3,
+            inter_tool_threshold: 0,
+            // One trial from speed 4: as much gain for less time.
+            inter_tool_trials: if s >= 4 { 1 } else { 2 },
             force_inter_tool: 0,
         }
     }
@@ -475,6 +484,7 @@ impl Tools {
             "masked_compound" => self.masked_compound = b,
             "jnt_comp" => self.jnt_comp = b,
             "interintra" => self.interintra = b,
+            "inter_tool_threshold" => self.inter_tool_threshold = value.min(65535) as u16,
             "inter_tool_trials" => self.inter_tool_trials = value.min(255) as u8,
             "force_inter_tool" => self.force_inter_tool = value.min(255) as u8,
             _ => return false,

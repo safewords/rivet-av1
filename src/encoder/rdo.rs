@@ -596,7 +596,13 @@ impl TileDecoder<'_, '_> {
         // The inter tools: the variants of the best inter candidate that
         // probe cheaper, the best of them trialled (or the one a test
         // forces, whatever it costs).
-        if inter_best.0 < f64::MAX && tools.inter_tools() {
+        // (Not for a block its best inter candidate already codes for
+        // little per sample: `Tools::inter_tool_threshold`.)
+        let area = (block_width(size) * block_height(size)) as f64;
+        let rd_lambda = self.enc.as_ref().expect("encode mode").rd_lambda;
+        let worth = inter_best.0 >= tools.inter_tool_threshold as f64 / 100.0 * rd_lambda * area;
+        if inter_best.0 < f64::MAX && tools.inter_tools() && (worth || tools.force_inter_tool != 0)
+        {
             let from = ProbeFrom {
                 snap: &snap,
                 b: &saved_b,

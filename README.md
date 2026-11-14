@@ -268,8 +268,8 @@ them:
   GLOBALMV blocks a warp. Each variant is *probed* — its mode info coded
   in counting mode and the block predicted by the decoder's own syntax and
   prediction, its luma SATD plus the multiplier times its bits — and the
-  two that probe cheapest of those cheaper than the candidate are
-  trialled. Which are on at which speed is below. Without
+  one that probes cheapest of those cheaper than the candidate is
+  trialled (two below speed 4). Which are on at which speed is below. Without
   groups (`Config::altref` = 0, and speeds 9 and 10), the last two frames
   and a golden frame (the key frame, then every 16th frame coded with a
   finer quantiser) as references, each searched, compound prediction of
@@ -746,7 +746,8 @@ PSNR-Y / PSNR-YUV of the encoder without it against the encoder with all
 of them, so positive is what the tool gains; the five clips, 30 frames,
 quantisers 64 to 192, one thread), and the time it adds (user CPU time,
 foreman and mobile, three quantisers, one encode at a time; the machine
-was shared, so ±2 %):
+was shared, so ±2 %), measured on the search before the tiers below were
+set to rav1e's time (develop at 2a05339, two trials):
 
 | tool | speed 4 | speed 6 | speed 8 | time 4 / 6 / 8 |
 |---|---|---|---|---|
@@ -765,26 +766,43 @@ warps together, 1.06x.
 
 Each alone at speed 6, against none: the filters −1.13 %, OBMC −0.64 %,
 local warps −0.77 %, global motion −0.24 %, wedge and difference-weighted
-−0.36 %, distance-weighted −0.35 %, inter-intra −0.45 % (PSNR-Y). On by
-default (`Tools::for_speed`): the switchable filters, OBMC and local warps
-at speeds 0 to 8, with distance-weighted compound and inter-intra to speed
-4 — where the slower speed's next step costs more time for each percent
-than they do. Against the encoder before them (same clips, BD-rate
-PSNR-Y / PSNR-YUV; time interleaved, every clip, all five quantisers):
+−0.36 %, distance-weighted −0.35 %, inter-intra −0.45 % (PSNR-Y).
 
-| speed | BD-rate | time | against rav1e, before | against rav1e, after | time against rav1e (from the table above times this one's) |
-|---|---|---|---|---|---|
-| 4 | −3.03 % / −2.93 % | 1.11x | −9.3 % / −3.7 % | −12.1 % / −6.6 % | 4.9x |
-| 6 | −2.12 % / −2.09 % | 1.05x | −0.1 % / +6.5 % | −2.3 % / +4.2 % | 1.14x |
-| 8 | −3.58 % / −3.22 % | 1.13x | +14.0 % / +17.9 % | +9.5 % / +13.6 % | 0.80x |
+On the tiers (speeds 4, 6 and 8 each searching what rav1e spends, above)
+the tools were chosen again so that each tier stays within rav1e's
+one-thread time. Against the tiers without them, the switchable filters,
+OBMC and local warps (one trial) are −2.2 % / −2.1 % at speed 6 for
+1.04x the time, −2.2 % / −2.0 % at speed 4 and −2.1 % / −2.0 % at speed 8
+for 1.09x and 1.05x — more than speeds 4 and 8 had to spare (rav1e's
+time is 1.04x theirs). The extra time there is bought back with the
+small blocks' split threshold (`split_threshold_small` 100 to 150: on its
+own +2.0 % at speed 8; with the tools −1.1 % for 1.01x the time, and at
+speed 4 −2.0 % for 1.04x). Two trials instead of one gain nothing for
+1.02x; inter-intra and distance-weighted compound add −0.3 % to −0.5 %
+for about 1.07x (timed beside other runs) and stay at speeds 0 to 3; halving fewer blocks
+(`rect_max`), fewer inter candidates, or a cost threshold below which a
+block skips the tools (`Tools::inter_tool_threshold`) give up more than
+the tools gain. On by default (`Tools::for_speed`): the switchable
+filters, OBMC and local warps at speeds 0 to 8, with distance-weighted
+compound and inter-intra at speeds 0 to 3.
 
-Per clip at speed 6 against rav1e (PSNR-Y / PSNR-YUV): foreman +12.1 % /
-+18.4 % (from +13.5 % / +20.0 %), mobile −12.6 % / −4.2 %, akiyo +3.8 % /
-+7.2 %, ducks_take_off −9.3 % / −0.6 %, park_joy −5.5 % / +0.2 %. The
-tools gain about as much in PSNR-YUV as in PSNR-Y — they improve the
-prediction of every plane alike — so they close neither foreman's gap
-(1.2 % of its 13.5 %) nor the gap between PSNR-Y and PSNR-YUV, which is
-in how chroma is quantised (above).
+Against rav1e 0.8.1, the same clips, BD-rate PSNR-Y (PSNR-YUV), one
+thread (time: the tiers' interleaved CPU time against rav1e above, times
+the tools' interleaved against the tiers without them, every clip, all
+five quantisers):
+
+| speed | tiers | with the inter tools | against the tiers | time / rav1e |
+|---|---|---|---|---|
+| 4 | −0.3 % (+5.1 %) | **−2.2 %** (+3.3 %) | −2.0 % (−1.8 %) | 0.96x → **1.00x** |
+| 6 | −0.5 % (+5.0 %) | **−2.8 %** (+2.8 %) | −2.2 % (−2.1 %) | 0.89x → **0.93x** |
+| 8 | −1.2 % (+4.2 %) | **−2.3 %** (+3.3 %) | −1.1 % (−1.0 %) | 0.96x → **0.97x** |
+
+Per clip at speed 6 against rav1e: foreman +7.8 % (+12.4 %), mobile
+−10.2 % (−3.7 %), akiyo +3.8 % (+7.2 %), ducks_take_off −9.9 % (−1.6 %),
+park_joy −5.3 % (−0.2 %). The tools gain about as much in PSNR-YUV as in
+PSNR-Y — they improve the prediction of every plane alike — so they
+close neither foreman's gap (1.1 % of it) nor the gap between PSNR-Y and
+PSNR-YUV, which is in how chroma is quantised (above).
 
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
@@ -826,9 +844,10 @@ Not there yet:
   zero. Finer chroma alone trades PSNR-Y for PSNR-YUV (above); it may pay
   together with a quantiser hierarchy, which changes what each frame's
   chroma is worth to the frames after it.
-- **Inter tools that pay at speed 6 and up**: global motion, wedge and
-  difference-weighted compound, inter-intra and dual filters are built,
-  tested and searched, but gain less than their time there (below); a
+- **Inter tools that pay at the tiers**: global motion, wedge and
+  difference-weighted compound, inter-intra, distance-weighted compound
+  and dual filters are built, tested and searched, but at speeds 4 to 8
+  gain less than their time there (above); a
   vector searched for OBMC or a warp (the block's own vector is kept) and
   a cheaper probe would make them pay.
 - **Film grain from a temporal denoiser**: the denoiser is spatial (it
