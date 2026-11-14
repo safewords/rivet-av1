@@ -437,6 +437,45 @@ impl TileDecoder<'_, '_> {
         cost as f64 / 256.0
     }
 
+    /// Whether this frame's trials quantise chroma by rate and distortion
+    /// (`Tools::rdoq_uv`).
+    fn rdoq_uv_trials(&self) -> bool {
+        match self.enc().tools.rdoq_uv {
+            0 => false,
+            1 => self.f.hdr.frame_is_intra,
+            _ => true,
+        }
+    }
+
+    /// The chroma intra modes but chroma from luma, best first, for a block
+    /// whose luma mode is `y_mode`: by the SATD of each plane's prediction,
+    /// weighted by the square root of the plane's `rdo::CHROMA_WEIGHT` (a
+    /// weight on squared error is its square root on the error), plus the
+    /// mode's rate under the CDFs in force. Leaves `uv_mode` changed.
+    pub(crate) fn ranked_uv_modes(&mut self, y_mode: usize) -> Vec<usize> {
+        let lambda = self.enc().lambda;
+        let ms = self.b.mi_size;
+        let cfl_allowed = !self.b.lossless && block_width(ms).max(block_height(ms)) <= 32;
+        let w = crate::encoder::rdo::CHROMA_WEIGHT.map(|q| (q as f64 / 4.0).sqrt());
+        let mut ranked: Vec<(f64, usize)> = (DC_PRED..UV_CFL_PRED)
+            .map(|m| {
+                self.b.uv_mode = m;
+                let cdf = if cfl_allowed {
+                    &self.cdf.uv_mode_cfl_allowed[y_mode][..]
+                } else {
+                    &self.cdf.uv_mode_cfl_not_allowed[y_mode][..]
+                };
+                let bits = Coder::cost(cdf, m) as f64 / 256.0;
+                let cost = w[1] * self.try_intra(1, m) as f64
+                    + w[2] * self.try_intra(2, m) as f64
+                    + lambda * bits;
+                (cost, m)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        ranked.into_iter().map(|r| r.1).collect()
+    }
+
     /// The candidates the rate-distortion search trials for this block:
     /// the best intra modes by SATD (plus their rate), then the best inter
     /// modes and vectors per reference.
@@ -482,7 +521,10 @@ impl TileDecoder<'_, '_> {
         }
         ys.sort_by(|a, b| a.2.total_cmp(&b.2));
         let mut best_uv = DC_PRED;
-        if self.b.has_chroma {
+        if self.b.has_chroma && tools.uv_modes {
+            self.b.y_mode = ys[0].0;
+            best_uv = self.ranked_uv_modes(ys[0].0)[0];
+        } else if self.b.has_chroma {
             self.b.y_mode = ys[0].0;
             let mut best = f64::MAX;
             for &m in &[DC_PRED, V_PRED, H_PRED, SMOOTH_PRED, PAETH_PRED] {
@@ -1667,7 +1709,10 @@ impl TileDecoder<'_, '_> {
         // (`Tools::rdoq` 1): those levels, which the trials then stand in
         // for, are the sparser (0.70 measured best of 0.62 to 0.78, −0.5 %
         // BD-rate PSNR-Y and −0.4 % PSNR-YUV at speed 6).
-        let dz = if self.enc().tools.rdoq == 1 && self.sd.counting() {
+        let dz = if self.enc().tools.rdoq == 1
+            && self.sd.counting()
+            && !(plane > 0 && self.rdoq_uv_trials())
+        {
             0.70
         } else {
             0.62
@@ -1877,7 +1922,7 @@ impl TileDecoder<'_, '_> {
         let eob = self.quantise_block(plane, x, y, tx_sz, tx_type);
         let on = match self.enc().tools.rdoq {
             0 => false,
-            1 => !self.sd.counting(),
+            1 => !self.sd.counting() || (plane > 0 && self.rdoq_uv_trials()),
             2 => !type_search,
             _ => true,
         };

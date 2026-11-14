@@ -304,6 +304,28 @@ pub struct Tools {
     /// candidate costs at least this many hundredths of the Lagrange
     /// multiplier per sample (0: every block).
     pub inter_tool_threshold: u16,
+    /// Every chroma intra mode (the thirteen but chroma from luma) ranked
+    /// for the block by its SATD, each plane's weighted by the square root
+    /// of its `rdo::CHROMA_WEIGHT`, plus its rate under the CDFs in force;
+    /// else DC, V, H, smooth and Paeth with a fixed rate. Off: with the
+    /// inter tools in, +0.2 % BD-rate PSNR-Y and +0.1 % PSNR-YUV at speed 6
+    /// against the five modes (it was −0.5 % and −0.4 % before them).
+    pub uv_modes: bool,
+    /// How many more chroma modes (the next best by the ranking of
+    /// `uv_modes`) are trialled on a block the search chose intra, with
+    /// its luma decisions as they are: the preselection's SATD misjudges
+    /// what a chroma block's residual costs.
+    pub uv_trials: u8,
+    /// `uv_trials` in inter frames too, not only in intra frames (at speed
+    /// 6, −0.53 % / −0.82 % BD-rate PSNR-Y / PSNR-YUV with `rdoq_uv` 2,
+    /// against −0.42 % / −0.66 % in intra frames only, for 1.08x the time
+    /// against about none).
+    pub uv_trials_inter: bool,
+    /// With `rdoq` 1, the chroma transform blocks of the search's trials
+    /// are quantised by rate and distortion too (not only the blocks
+    /// coded): their levels then follow the chroma weights, as the coded
+    /// ones do. 0: never; 1: in intra frames; 2: in every frame.
+    pub rdoq_uv: u8,
     /// How many of the inter tools' variants of a block's best inter
     /// candidate (those whose prediction measures cheaper) are trialled.
     pub inter_tool_trials: u8,
@@ -415,6 +437,15 @@ impl Tools {
             jnt_comp: s <= 3,
             interintra: s <= 3,
             inter_tool_threshold: 0,
+            uv_modes: false,
+            // One at speed 4, which has no time to spare: as much gain.
+            uv_trials: match s {
+                4 => 1,
+                0..=8 => 2,
+                _ => 0,
+            },
+            uv_trials_inter: false,
+            rdoq_uv: if s <= 8 { 1 } else { 0 },
             // One trial from speed 4: as much gain for less time.
             inter_tool_trials: if s >= 4 { 1 } else { 2 },
             force_inter_tool: 0,
@@ -485,6 +516,10 @@ impl Tools {
             "jnt_comp" => self.jnt_comp = b,
             "interintra" => self.interintra = b,
             "inter_tool_threshold" => self.inter_tool_threshold = value.min(65535) as u16,
+            "uv_modes" => self.uv_modes = b,
+            "uv_trials" => self.uv_trials = value.min(12) as u8,
+            "uv_trials_inter" => self.uv_trials_inter = b,
+            "rdoq_uv" => self.rdoq_uv = value.min(2) as u8,
             "inter_tool_trials" => self.inter_tool_trials = value.min(255) as u8,
             "force_inter_tool" => self.force_inter_tool = value.min(255) as u8,
             _ => return false,
@@ -1802,7 +1837,11 @@ impl Encoder {
         }
         // quantization_params()
         w.f(8, p.qidx);
-        w.flag(false); // DeltaQYDc
+        let y_dc = luma_dc_delta(p.qidx, self.cfg.bit_depth);
+        w.flag(y_dc != 0); // DeltaQYDc
+        if y_dc != 0 {
+            w.f(7, (y_dc & 0x7F) as u32); // su(1 + 6)
+        }
         let chroma = self.seq.color.num_planes > 1;
         if chroma {
             w.flag(false); // DeltaQUDc
@@ -2062,6 +2101,23 @@ fn frame_qidx(
     };
     scaled_qidx(q, log2, bit_depth)
 }
+
+/// `DeltaQYDc`: luma's DC coded coarser than its AC, by `LUMA_DC_Q`
+/// octaves of quantiser step (0 for a lossless frame). A block's DC is
+/// mostly predicted well and its error is spread over every sample, so a
+/// coarser step costs little; and the bits it saves are taken where they
+/// count more.
+fn luma_dc_delta(qidx: u32, bit_depth: u32) -> i32 {
+    if qidx == 0 || LUMA_DC_Q == 0.0 {
+        return 0;
+    }
+    (scaled_qidx(qidx, LUMA_DC_Q, bit_depth) as i32 - qidx as i32).clamp(-64, 63)
+}
+
+/// See [`luma_dc_delta`]: 0.5 measured best of 0.3, 0.5 and 0.8 at speed
+/// 6 (−0.2 % BD-rate PSNR-Y and PSNR-YUV; 0.3 −0.2 % and −0.1 %, 0.8 −0.0 %
+/// and −0.2 %; finer, −0.3, +0.3 % and +0.4 %).
+const LUMA_DC_Q: f64 = 0.5;
 
 /// The quantiser index (1 to 255) whose step is nearest `2^log2` times the
 /// step of `q`.

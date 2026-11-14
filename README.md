@@ -469,6 +469,81 @@ chroma weights in the search (against counting chroma as luma: U and V
 (+2.0 % and −3.2 %) are where the two measures together gained the
 most.
 
+**Chroma, again (after the inter tools).** At speeds 4 to 8, against
+develop at a9e6435 (the five clips, 30 frames, quantisers 64 to 192, one
+thread; BD-rate PSNR-Y (PSNR-YUV); times one encode at a time,
+interleaved, foreman, akiyo and park_joy at quantiser 128, best of two or
+three rounds summed):
+
+| speed | BD-rate | time | against rav1e |
+|---|---|---|---|
+| 4 | −0.4 % (−0.6 %) | 1.01x | −2.6 % (+2.6 %) |
+| 6 | −0.4 % (−0.7 %) | 1.01x | −3.2 % (+2.1 %) |
+| 8 | −0.5 % (−0.7 %) | 1.015x | −2.8 % (+2.5 %) |
+
+Per clip against rav1e, PSNR-YUV at speeds 4 / 6 / 8: foreman +11.3 % /
++11.4 % / +11.8 %, mobile −4.2 % / −4.3 % / −1.8 %, akiyo +6.8 % / +5.6 % /
++4.6 %, ducks_take_off −0.8 % / −1.8 % / −1.8 %, park_joy +0.2 % / −0.5 % /
+−0.4 %.
+
+Three changes, each kept for what it was worth with the others in (speed
+6): luma's DC coded half an octave coarser than its AC (`DeltaQYDc`,
+−0.1 % (−0.1 %), no time); in intra frames, a block the search chose
+intra trialled again with the next two chroma modes (one at speed 4) by
+the SATD ranking of every chroma mode (`Tools::uv_trials`), and the
+search's chroma transform blocks quantised by rate and distortion as the
+coded ones are (`Tools::rdoq_uv` 1): together −0.3 % (−0.5 %), the two
+apart worth little (the trials' choice is only as good as the chroma
+levels they measure). In inter frames as well, −0.1 % (−0.2 %) more for
+1.08x the time; all thirteen chroma modes in the preselection
+(`Tools::uv_modes`), +0.2 % (+0.1 %); the luma DC 0.3 or 0.8 octave
+coarser, less.
+
+What did not pay, measured at speed 6 (before the inter tools unless it
+says otherwise), each against the encoder without it:
+
+- Chroma quantiser offsets, by any rule: the same for every frame (all U
+  and V AC −0.5 octave, +1.7 % (−0.9 %)), finer in the frames others refer
+  to (half the frame's own octave offset: +1.7 % (−0.8 %)), in the key
+  frame alone (+1.1 % (−0.6 %)), chroma DC only (+0.4 % (±0)), and offsets
+  matched to the chroma weights (U −0.29 and V −0.79 octave, the step that
+  the weight's Lagrange multiplier asks for: +2.9 % (−1.2 %)). Every one
+  lies on the line the chroma weights draw (about −0.5 % PSNR-YUV for
+  each +1 % PSNR-Y). A finer chroma step is the dearer way along it: on
+  ducks_take_off at quantiser 150, U −0.5 and V −1 octave took U from
+  323 to 423 kbit for +0.36 dB, U weighted 4 to 422 kbit for +0.71 dB
+  (rate-distortion optimised quantisation keeps the nearest level, one
+  less or none, which at a finer step leaves too many levels coded).
+- Chroma weights by frame: lighter in the top layer (1 and 1, ±0), heavier
+  in the key and alt-ref frames (2 and 4: +0.5 % (−0.2 %)), lighter in the
+  key frame (1 and 1: −0.8 % (+0.7 %)); and weights set each frame from the
+  planes' measured error (what a 6:1:1 PSNR-YUV makes a squared error in
+  each plane worth, scaled: from −1.1 % (+0.9 %) to −0.3 % (+0.1 %)). On the
+  same line.
+- The in-loop filters' chroma: loop restoration of the chroma planes
+  alone, +0.2 % (−0.0 %) (rav1e codes it in its headers, and its units are
+  almost all off: about 1 % of chroma units restored on foreman and
+  akiyo); CDEF's chroma error weighted as the search weighs it, ±0; the
+  chroma deblocking levels searched up to 3 times the starting ones,
+  −0.1 % (−0.0 %).
+- Chroma from luma with alphas fitted to the reconstructed luma, a second
+  trial: ±0. The chroma dead zone of the trials (0.62 or 0.55 for 0.70):
+  −0.1 % (−0.2 %), ±0.
+
+Why chroma trails, read from the streams with rivet-av1's own parser (its
+bits measured per plane): at the same total bits rivet-av1 and rav1e spend
+about the same on foreman's chroma residual (5.7 % and 6.2 % of the
+stream), and rav1e has 0.5 dB more U and 1.2 dB more V; on ducks_take_off
+rav1e spends 2.3 times rivet-av1's U bits and 4.3 times its V in the inter
+frames (17 % of the stream against 9.5 %), and rivet-av1 has 9 % fewer bits
+for the same luma. In the key frame alone rav1e's U is 0.6 to 0.9 dB and
+its V 0.4 dB better than rivet-av1's for the same chroma bits at speed 6,
+and on rivet-av1's line at its speed 10 (the same delta-q, a lesser
+search): the difference is in its search, not in its quantisers; rivet-av1
+at speed 0 gains 0.2 dB of it. In inter frames rivet-av1 leaves more
+blocks unskipped (24 % of the area against 11.5 % on foreman) but codes
+chroma in fewer of them (11 % of their V transform blocks against 21 %).
+
 (The speed table, and the comparison with rav1e just above, were measured
 with every frame coded in display order, before alt-ref groups.)
 
@@ -833,17 +908,20 @@ Not there yet:
   it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
   clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
-- **PSNR-YUV at rav1e's time**: 4 % to 5 % behind at speeds 4, 6 and 8
-  (PSNR-Y at parity), the chroma that rav1e's finer chroma quantisers
-  buy; foreman and akiyo trail at every tier, in PSNR-Y too.
+- **PSNR-YUV at rav1e's time**: 2.1 % to 2.7 % behind at speeds 4, 6
+  and 8 (PSNR-Y 2.6 % to 3.2 % ahead); foreman and akiyo trail at every
+  tier, in PSNR-Y too. What is left is not in the quantisers or the
+  weights, which only move along one trade (above), but in what the
+  search makes of chroma: rav1e's key frames have 0.6 to 0.9 dB more U for
+  the same U bits.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the
   test clips; off by default. No segmentation.
 - **Chroma quantiser offsets**: the frame header's delta-q for U and V is
-  zero. Finer chroma alone trades PSNR-Y for PSNR-YUV (above); it may pay
-  together with a quantiser hierarchy, which changes what each frame's
-  chroma is worth to the frames after it.
+  zero (luma's DC is half an octave coarser). Finer chroma, in every
+  frame, by layer, in the key frame or matched to the weights, trades
+  PSNR-Y for PSNR-YUV on the same line as the weights (above).
 - **Inter tools that pay at the tiers**: global motion, wedge and
   difference-weighted compound, inter-intra, distance-weighted compound
   and dual filters are built, tested and searched, but at speeds 4 to 8

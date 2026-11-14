@@ -683,6 +683,36 @@ impl TileDecoder<'_, '_> {
                 }
             }
         }
+        // A chosen intra block: more chroma modes, by trial, its luma as it
+        // is (the preselection ranks them by SATD, which misjudges what
+        // the residual of a chroma block costs).
+        if tools.uv_trials > 0
+            && (tools.uv_trials_inter || self.f.hdr.frame_is_intra)
+            && saved_b.has_chroma
+            && !best.1.is_inter
+            && !best.1.use_intrabc
+            && best.1.palette_n == 0
+        {
+            let base = best.1;
+            self.b = saved_b.clone();
+            self.b.y_mode = base.y_mode;
+            let ranked = self.ranked_uv_modes(base.y_mode);
+            for &m in ranked
+                .iter()
+                .filter(|&&m| m != base.uv_mode)
+                .take(tools.uv_trials as usize)
+            {
+                let q = Plan {
+                    uv_mode: m,
+                    angle_delta_uv: 0,
+                    ..base
+                };
+                let (cost, _, seg) = trial(self, q, false)?;
+                if cost < best.0 {
+                    best = (cost, q, seg);
+                }
+            }
+        }
         self.restore(&snap);
         self.release(snap);
         self.b = saved_b;
