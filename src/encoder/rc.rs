@@ -467,10 +467,25 @@ impl RateControl {
     /// noise of the frames before it, which the model did not see; a frame
     /// planned again into refining a still scene). The quantiser at which
     /// it costs its prediction, or two fifths of what was left, by the
-    /// model's slope.
-    pub(crate) fn redo_layer(&self, p: &Planned, bits: u64, left: f64) -> Option<Planned> {
+    /// model's slope. In a group whose overspending the groups after it
+    /// may not repay (`strict`: the clip's last, and the first after a key
+    /// frame, on which a short clip or a segment coded on its own hangs),
+    /// also a frame that leaves less than a tenth of what was left, from
+    /// one share up: a frame planned finer than the frames it is predicted
+    /// from can code again what they left out (with noise, the noise) for
+    /// ten times its prediction, and at a low rate in under four shares.
+    pub(crate) fn redo_layer(
+        &self,
+        p: &Planned,
+        bits: u64,
+        left: f64,
+        strict: bool,
+    ) -> Option<Planned> {
         let bits = bits as f64;
-        if bits <= 2.0 * p.predicted || bits <= (0.5 * left).max(4.0 * self.target) {
+        if bits <= 2.0 * p.predicted
+            || (bits <= (0.5 * left).max(4.0 * self.target)
+                && !(strict && bits > (0.9 * left).max(self.target)))
+        {
             return None;
         }
         let goal = p.predicted.max(0.4 * left);

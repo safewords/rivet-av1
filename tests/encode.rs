@@ -893,6 +893,14 @@ fn rate_control_tracks_the_target() {
 /// after each frame, the first group of such a clip took 1.3 to 2.3 times
 /// its share, and later groups repaid it; `examples/av1_ratetest.rs`
 /// measures short clips and segments at length).
+///
+/// Whatever the search: at speeds 4, 6 and 8, and with speed 4's small
+/// blocks split more and less readily. (The noisy clip's last group, of
+/// 7 frames, is the hard part: a frame of it planned finer than the frames
+/// it is predicted from codes the noise again for five times its
+/// prediction, and until such a frame was coded again in the groups no
+/// later group repays the clip came out at 1.00x to 1.09x by the search
+/// settings alone.)
 #[test]
 fn rate_control_first_group_on_target() {
     let clean = natural(24);
@@ -910,29 +918,47 @@ fn rate_control_first_group_on_target() {
             f
         })
         .collect();
-    for (name, src) in [("natural", &clean), ("noisy", &noisy)] {
-        for target in [8_000u64, 30_000] {
-            let mut cfg = cfg_for(src[0].width, src[0].height);
-            cfg.keyframe_interval = 240;
-            cfg.target_bits_per_frame = Some(target);
-            let (_, sizes) = round_trip(cfg, src);
-            let rate = |n: usize| {
-                sizes[..n].iter().map(|&s| s as f64 * 8.0).sum::<f64>() / (target * n as u64) as f64
-            };
-            let (first, all) = (rate(17), rate(sizes.len()));
-            eprintln!(
-                "rate control, {name}, {target} bits a frame: first group {first:.3}x, clip {all:.3}x"
-            );
-            assert!(
-                (0.94..1.06).contains(&first),
-                "{name} {target}: first group {first:.3}x"
-            );
-            assert!(
-                (0.94..1.06).contains(&all),
-                "{name} {target}: clip {all:.3}x"
-            );
+    // (speed, the small blocks' split threshold; debug builds code at
+    // speed 8 alone, for the time.)
+    let searches: &[(u32, Option<u32>)] = if cfg!(debug_assertions) {
+        &[(8, None)]
+    } else {
+        &[
+            (4, None),
+            (4, Some(50)),
+            (4, Some(100)),
+            (6, None),
+            (8, None),
+        ]
+    };
+    std::thread::scope(|scope| {
+        for &(speed, split) in searches {
+            for (name, src) in [("natural", &clean), ("noisy", &noisy)] {
+                for target in [8_000u64, 30_000] {
+                    scope.spawn(move || {
+                        let mut cfg = cfg_for(src[0].width, src[0].height);
+                        cfg.speed = speed;
+                        cfg.tools = av1::Tools::for_speed(speed);
+                        if let Some(t) = split {
+                            cfg.tools.split_threshold_small = t as u16;
+                        }
+                        cfg.keyframe_interval = 240;
+                        cfg.target_bits_per_frame = Some(target);
+                        let (_, sizes) = round_trip(cfg, src);
+                        let rate = |n: usize| {
+                            sizes[..n].iter().map(|&s| s as f64 * 8.0).sum::<f64>()
+                                / (target * n as u64) as f64
+                        };
+                        let (first, all) = (rate(17), rate(sizes.len()));
+                        let at = format!("speed {speed}, split threshold {split:?}, {name}, {target} bits a frame");
+                        eprintln!("rate control, {at}: first group {first:.3}x, clip {all:.3}x");
+                        assert!((0.94..1.06).contains(&first), "{at}: first group {first:.3}x");
+                        assert!((0.94..1.06).contains(&all), "{at}: clip {all:.3}x");
+                    });
+                }
+            }
         }
-    }
+    });
 }
 
 /// The README table: sizes and PSNR at several quantisers on 8 frames of

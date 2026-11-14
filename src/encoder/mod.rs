@@ -715,6 +715,8 @@ struct GroupPlan {
     /// The group's budget, and rate control's spending when it was made.
     budget: f64,
     spent: f64,
+    /// The clip's last frames: no group after it repays what it overspends.
+    last: bool,
 }
 
 impl GroupPlan {
@@ -1087,7 +1089,8 @@ impl Encoder {
                     g = g.min(self.queue.len() - 1);
                 }
                 if g > 0 {
-                    self.plan_group(g, true);
+                    let last = all && self.queue.len() == g + 1;
+                    self.plan_group(g, true, last);
                 }
                 let (frame, _, grain) = self.queue.pop_front().expect("a frame");
                 self.next_grain = grain;
@@ -1103,7 +1106,7 @@ impl Encoder {
                 let tu = self.temporal_unit(true, &[], &obus);
                 self.ready.push_back((tu, recon, true));
                 if g > 0 {
-                    self.code_group(g)?;
+                    self.code_group(g, false)?;
                 }
                 continue;
             }
@@ -1120,14 +1123,15 @@ impl Encoder {
                 break;
             }
             g = g.min(self.queue.len());
-            self.code_group(g)?;
+            let last = all && g == self.queue.len();
+            self.code_group(g, last)?;
         }
         Ok(())
     }
 
     /// Codes the next `g` frames held as a group (see `gop`): its temporal
-    /// units, one a frame, made ready.
-    fn code_group(&mut self, g: usize) -> Result<()> {
+    /// units, one a frame, made ready; `last` the clip's last frames.
+    fn code_group(&mut self, g: usize, last: bool) -> Result<()> {
         let steps = gop::plan(g as u32);
         let top = steps
             .iter()
@@ -1139,7 +1143,7 @@ impl Encoder {
             .unwrap_or(0);
         let base = self.shown;
         if self.rc.is_some() && self.group_plan.is_none() {
-            self.plan_group(g, false);
+            self.plan_group(g, false, last);
         }
         // Frames not shown go out in the temporal unit of the next one shown.
         let mut hidden = Vec::new();
@@ -1184,9 +1188,10 @@ impl Encoder {
     }
 
     /// Rate control's plan for the group of `g` frames held next (after
-    /// the key frame held first, planned with them, when `key`): their
-    /// complexities measured in display order, then the quantiser.
-    fn plan_group(&mut self, g: usize, key: bool) {
+    /// the key frame held first, planned with them, when `key`; `last` the
+    /// clip's last frames): their complexities measured in display order,
+    /// then the quantiser.
+    fn plan_group(&mut self, g: usize, key: bool, last: bool) {
         let off = key as usize;
         let planes: Vec<_> = (0..g + off)
             .map(|i| lookahead::Plane::new(&self.queue[i].0))
@@ -1239,6 +1244,7 @@ impl Encoder {
             key,
             budget: rc.group_budget(g + off),
             spent: rc.spent(),
+            last,
             frames: group,
         });
         self.replan_group();
@@ -1436,6 +1442,8 @@ impl Encoder {
                 pl,
                 obus.len() as u64 * 8,
                 plan.budget - (rc.spent() - plan.spent),
+                // (Strict where nothing repays it: see `redo_layer`.)
+                plan.last || plan.key.is_some(),
             )
         {
             // Far beyond its prediction and what the group has left: coded
