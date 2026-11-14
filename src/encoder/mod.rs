@@ -175,6 +175,16 @@ pub struct Tools {
     /// Palettes (screen content tools) on frames that look like screen
     /// content: few colours, sharp edges.
     pub palette: bool,
+    /// Filter intra (`enable_filter_intra`): the five recursive filter
+    /// predictors of `DC_PRED` luma blocks of 32x32 or less ranked with the
+    /// other intra modes by SATD, the best trialled with them.
+    pub filter_intra: bool,
+    /// Intra block copy (`allow_intrabc`) in key frames that look like
+    /// screen content (as palettes are offered): blocks of 8x8 or more
+    /// copied from earlier in the frame, where their source appears again
+    /// (found by hashing the source's 8x8 blocks) or where the stack's
+    /// vectors point. Such a frame codes no in-loop filters.
+    pub intrabc: bool,
     /// Motion search by descending square steps from the best of the
     /// predicted, neighbouring and zero vectors (else an exhaustive window
     /// around the predicted one), and a cross-shaped sub-sample refinement.
@@ -264,6 +274,8 @@ impl Tools {
             restoration_thorough: s <= 2,
             compound: s <= 5,
             palette: s <= 8,
+            filter_intra: false,
+            intrabc: false,
             fast_me: s >= 5,
             fast_tx_refine: s >= 5,
             restoration_fast: s >= 5,
@@ -316,6 +328,8 @@ impl Tools {
             "restoration_thorough" => self.restoration_thorough = b,
             "compound" => self.compound = b,
             "palette" => self.palette = b,
+            "filter_intra" => self.filter_intra = b,
+            "intrabc" => self.intrabc = b,
             "fast_me" => self.fast_me = b,
             "fast_tx_refine" => self.fast_tx_refine = b,
             "restoration_fast" => self.restoration_fast = b,
@@ -482,14 +496,18 @@ struct FrameParams {
     show: bool,
     /// The frame's display index.
     order_hint: u64,
+    /// `allow_intrabc`, and the source's hash for its search.
+    intrabc: bool,
+    ibc: Option<Arc<tile::IbcHash>>,
 }
 
 impl FrameParams {
     /// Whether the in-loop filters are coded: not in a lossless frame
-    /// (`CodedLossless`), whose loop filter, CDEF and loop restoration
-    /// parameters the header leaves out (5.9.11, 5.9.19, 5.9.20).
+    /// (`CodedLossless`) nor one with intra block copy, whose loop filter,
+    /// CDEF and loop restoration parameters the header leaves out (5.9.11,
+    /// 5.9.19, 5.9.20).
     fn filters(&self) -> bool {
-        self.qidx > 0
+        self.qidx > 0 && !self.intrabc
     }
 }
 
@@ -560,7 +578,7 @@ impl Encoder {
             delta_frame_id_length_minus_2: 0,
             additional_frame_id_length_minus_1: 0,
             use_128x128_superblock: false,
-            enable_filter_intra: false,
+            enable_filter_intra: cfg.tools.filter_intra,
             enable_intra_edge_filter: true,
             enable_interintra_compound: false,
             enable_masked_compound: false,
@@ -574,7 +592,7 @@ impl Encoder {
             enable_ref_frame_mvs: true,
             // Screen content tools chosen per frame when palettes may be
             // used.
-            seq_force_screen_content_tools: if cfg.tools.palette {
+            seq_force_screen_content_tools: if cfg.tools.palette || cfg.tools.intrabc {
                 SELECT_SCREEN_CONTENT_TOOLS
             } else {
                 0
@@ -937,7 +955,7 @@ impl Encoder {
     /// OBU, and its reconstruction when it is shown.
     fn code_one(&mut self, frame: &Frame, role: Role) -> Result<(Vec<u8>, Option<Frame>)> {
         let key = role == Role::Key;
-        if self.cfg.tools.palette {
+        if self.cfg.tools.palette || self.cfg.tools.intrabc {
             self.next_screen_content = looks_like_screen_content(frame);
         }
         let seq = self.seq.clone();
@@ -1088,6 +1106,10 @@ impl Encoder {
                 p.aq = Some(Arc::new(tile::AqMap { sb_cols, q, lambda }));
             }
         }
+        if p.intrabc {
+            let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+            p.ibc = Some(Arc::new(tile::IbcHash::new(&src[0], stride[0], w, h)));
+        }
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         let filters = p.filters();
         if (filters && (tools.lf_search || tools.cdef || tools.restoration))
@@ -1206,7 +1228,8 @@ impl Encoder {
                 )
             })
         };
-        let filters = qidx > 0;
+        let intrabc = key && tools.intrabc && tools.rdo && self.next_screen_content;
+        let filters = qidx > 0 && !intrabc;
         let mut refresh = 0xFFu8;
         let mut ref_slots = [0usize; REFS_PER_FRAME];
         let mut search_refs = Vec::new();
@@ -1264,7 +1287,7 @@ impl Encoder {
                 .any(|&r| self.slot_frame[ref_slots[(r - LAST_FRAME) as usize]] > order_hint);
         let reference_select =
             !key && search_refs.len() > 1 && ((tools.compound && tools.multi_ref) || bidir);
-        let screen_content = tools.palette && self.next_screen_content;
+        let screen_content = (tools.palette || tools.intrabc) && self.next_screen_content;
         FrameParams {
             key,
             qidx,
@@ -1296,6 +1319,8 @@ impl Encoder {
             aq: None,
             show: !matches!(role, Role::Group { show: false, .. }),
             order_hint,
+            intrabc,
+            ibc: None,
         }
     }
 
@@ -1468,6 +1493,7 @@ impl Encoder {
             palette_map: Box::new([[0; 64]; 64]),
             me_hints: Vec::new(),
             aq: p.aq.clone(),
+            ibc: p.ibc.clone(),
         })
     }
 
@@ -1517,7 +1543,7 @@ impl Encoder {
         } else {
             w.flag(false); // render_and_frame_size_different
             if p.screen_content {
-                w.flag(false); // allow_intrabc
+                w.flag(p.intrabc); // allow_intrabc
             }
         }
         w.flag(false); // disable_frame_end_update_cdf
@@ -1562,7 +1588,9 @@ impl Encoder {
             w.flag(p.aq.is_some()); // delta_q_present
             if p.aq.is_some() {
                 w.f(2, 0); // delta_q_res
-                w.flag(false); // delta_lf_present
+                if !p.intrabc {
+                    w.flag(false); // delta_lf_present
+                }
             }
         }
         // loop_filter_params(), unless the frame is lossless.

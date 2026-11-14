@@ -118,6 +118,13 @@ pub(crate) struct Plan {
     /// A luma palette: its size (0: none) and colours, ascending.
     pub(crate) palette_n: u8,
     pub(crate) palette_colors: [u16; 8],
+    /// Filter intra (`use_filter_intra`) and its mode, for a `DC_PRED`
+    /// luma block of 32x32 or less without a palette.
+    pub(crate) use_filter_intra: bool,
+    pub(crate) filter_intra_mode: u8,
+    /// Intra block copy (`use_intrabc`): the block predicted from the
+    /// frame's own reconstruction, displaced by `mv[0]` (whole samples).
+    pub(crate) use_intrabc: bool,
 }
 
 /// The decoder of one tile: the symbol decoder, the tile's CDFs, the
@@ -895,7 +902,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         self.read_deltas = false;
         self.b.ref_frame = [INTRA_FRAME, NONE];
         self.b.use_intrabc = if self.f.hdr.allow_intrabc {
-            self.sd.read_symbol(&mut self.cdf.intrabc) != 0
+            self.sd
+                .symbol(&mut self.cdf.intrabc, self.plan.use_intrabc as usize)
+                != 0
         } else {
             false
         };
@@ -1255,9 +1264,12 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             && self.b.palette_size_y == 0
             && block_width(ms).max(block_height(ms)) <= 32
         {
-            self.b.use_filter_intra = self.sd.read_symbol(&mut self.cdf.filter_intra[ms]) != 0;
+            // (Encode mode: the planned filter.)
+            let planned = self.plan.use_filter_intra as usize;
+            self.b.use_filter_intra = self.sd.symbol(&mut self.cdf.filter_intra[ms], planned) != 0;
             if self.b.use_filter_intra {
-                self.b.filter_intra_mode = self.sd.read_symbol(&mut self.cdf.filter_intra_mode);
+                let mode = self.plan.filter_intra_mode as usize;
+                self.b.filter_intra_mode = self.sd.symbol(&mut self.cdf.filter_intra_mode, mode);
             }
         }
     }
@@ -2291,24 +2303,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 get_mode(self.b.y_mode, i)
             };
             if self.b.use_intrabc {
-                self.b.pred_mv[0] = self.b.ref_stack_mv[0][0];
-                if self.b.pred_mv[0] == [0, 0] {
-                    self.b.pred_mv[0] = self.b.ref_stack_mv[1][0];
-                }
-                if self.b.pred_mv[0] == [0, 0] {
-                    let sb_size = if self.f.seq.use_128x128_superblock {
-                        BLOCK_128X128
-                    } else {
-                        BLOCK_64X64
-                    };
-                    let sb_size4 = NUM_4X4_BLOCKS_HIGH[sb_size] as i32;
-                    if (self.b.mi_row as i32) - sb_size4 < self.mi_row_start as i32 {
-                        self.b.pred_mv[0] =
-                            [0, -(sb_size4 * MI_SIZE as i32 + INTRABC_DELAY_PIXELS) * 8];
-                    } else {
-                        self.b.pred_mv[0] = [-(sb_size4 * MI_SIZE as i32 * 8), 0];
-                    }
-                }
+                self.b.pred_mv[0] = self.intrabc_pred_mv();
             } else if comp_mode == GLOBALMV {
                 self.b.pred_mv[i] = self.b.global_mvs[i];
             } else {
@@ -2328,6 +2323,30 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                 self.b.mv[i] = self.b.pred_mv[i];
             }
         }
+    }
+
+    /// `PredMv[ 0 ]` of an intra block copy (assign_mv, 5.11.26): the
+    /// first non-zero vector of the stack's first two, else a default one
+    /// superblock up (or left, in the tile's first superblock row).
+    pub(crate) fn intrabc_pred_mv(&self) -> Mv {
+        let mut pred = self.b.ref_stack_mv[0][0];
+        if pred == [0, 0] {
+            pred = self.b.ref_stack_mv[1][0];
+        }
+        if pred == [0, 0] {
+            let sb_size = if self.f.seq.use_128x128_superblock {
+                BLOCK_128X128
+            } else {
+                BLOCK_64X64
+            };
+            let sb_size4 = NUM_4X4_BLOCKS_HIGH[sb_size] as i32;
+            pred = if (self.b.mi_row as i32) - sb_size4 < self.mi_row_start as i32 {
+                [0, -(sb_size4 * MI_SIZE as i32 + INTRABC_DELAY_PIXELS) * 8]
+            } else {
+                [-(sb_size4 * MI_SIZE as i32 * 8), 0]
+            };
+        }
+        pred
     }
 
     fn read_mv(&mut self, r: usize) {

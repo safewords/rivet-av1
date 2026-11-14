@@ -484,6 +484,109 @@ fn lossless_round_trips_sample_exact() {
     }
 }
 
+/// The cropped natural frames at 96x64.
+fn natural_96x64(n: usize) -> Vec<Frame> {
+    natural(n)
+        .iter()
+        .map(|f| reformat(f, 96, 64, 8, ChromaFormat::Yuv420))
+        .collect()
+}
+
+#[test]
+fn filter_intra_round_trips() {
+    // The recursive filter predictors among the intra candidates: key
+    // frames alone and key then inter frames, at the speeds' searches; the
+    // stream changes (the filters are chosen) and decodes to the
+    // reconstruction.
+    let frames = natural_96x64(4);
+    for (speed, key) in [(4, 1), (6, 240), (8, 1), (8, 240)] {
+        let speed = if cfg!(debug_assertions) { 8 } else { speed };
+        let run = |on: bool| {
+            let mut cfg = Config::new(96, 64);
+            cfg.quantizer = 100;
+            cfg.speed = speed;
+            cfg.tools = av1::Tools::for_speed(speed);
+            cfg.tools.filter_intra = on;
+            cfg.keyframe_interval = key;
+            round_trip(cfg, &frames)
+        };
+        let (dec, sizes) = run(true);
+        let (_, without) = run(false);
+        assert_ne!(
+            sizes, without,
+            "speed {speed}: filter intra changed nothing"
+        );
+        for (a, b) in frames.iter().zip(&dec) {
+            assert!(psnr(a, b, 0) > 33.0);
+        }
+    }
+}
+
+/// Screen content: lines of "text" (glyphs of two colours on a flat
+/// ground, words repeating), scrolling a sample a frame.
+fn screen(w: u32, h: u32, n: u32) -> Vec<Frame> {
+    (0..n)
+        .map(|t| {
+            let mut f = Frame::new(w, h, 8, ChromaFormat::Yuv420);
+            for y in 0..h {
+                for x in 0..w {
+                    let (line, row) = ((y + t) / 10, (y + t) % 10);
+                    let (cell, col) = (x / 6, x % 6);
+                    // A word of three glyphs out of four, from a few words.
+                    let word = (line * 7 + cell / 4).wrapping_mul(2654435761) >> 30;
+                    let glyph = word * 3 + cell % 4;
+                    let on = cell % 4 != 3
+                        && row < 7
+                        && col < 5
+                        && (glyph.wrapping_mul(0x9E37_79B9) >> (row * 5 + col)) & 1 == 1;
+                    f.set_sample(0, x, y, if on { 30 } else { 220 });
+                }
+            }
+            for p in 1..3 {
+                let pl = f.planes[p];
+                for y in 0..pl.height {
+                    for x in 0..pl.width {
+                        f.set_sample(p, x, y, 128 + (p as u16 - 1) * 20);
+                    }
+                }
+            }
+            f
+        })
+        .collect()
+}
+
+#[test]
+fn intra_block_copy_round_trips() {
+    // Key frames of screen content with intra block copy (blocks copied
+    // from earlier in the frame, no in-loop filters), alone and with inter
+    // frames after them, at the speeds' searches (the wavefront search on
+    // two threads at 6 and 8): every frame decodes to the reconstruction,
+    // and the copies are used.
+    let frames = screen(160, 96, 3);
+    for (speed, key, threads) in [(4, 1, 1), (6, 1, 2), (8, 3, 2), (6, 240, 1)] {
+        let speed = if cfg!(debug_assertions) { 8 } else { speed };
+        let run = |on: bool| {
+            let mut cfg = Config::new(160, 96);
+            cfg.quantizer = 80;
+            cfg.speed = speed;
+            cfg.tools = av1::Tools::for_speed(speed);
+            cfg.tools.intrabc = on;
+            cfg.keyframe_interval = key;
+            cfg.threads = threads;
+            round_trip(cfg, &frames)
+        };
+        let (dec, sizes) = run(true);
+        let (_, without) = run(false);
+        assert_ne!(
+            sizes[0], without[0],
+            "speed {speed}: intra block copy changed nothing"
+        );
+        for (a, b) in frames.iter().zip(&dec) {
+            assert!(psnr(a, b, 0) > 30.0);
+        }
+    }
+}
+
 #[test]
 fn every_tool_round_trips() {
     let src = natural(4);

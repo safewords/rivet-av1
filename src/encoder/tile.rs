@@ -59,6 +59,72 @@ pub(crate) struct EncCtx {
     /// Adaptive quantisation: each superblock's quantiser, coded as a
     /// `delta_qindex` (the frame has `delta_q_present`).
     pub(crate) aq: Option<std::sync::Arc<AqMap>>,
+    /// Intra block copy (the frame has `allow_intrabc`): where each 8x8
+    /// of the source's luma lies, by content.
+    pub(crate) ibc: Option<std::sync::Arc<IbcHash>>,
+}
+
+/// The positions of the source's luma 8x8 blocks (every sample position
+/// one fits at), by a hash of their samples: an intra block copy's
+/// candidates are the earlier places a block's content appears.
+#[derive(Debug)]
+pub(crate) struct IbcHash {
+    /// Hash to positions (`y * width + x`), ascending (raster order).
+    map: std::collections::HashMap<u32, Vec<u32>>,
+    width: usize,
+}
+
+impl IbcHash {
+    /// The hash of the 8x8 block of `src` (row stride `stride`) at
+    /// `(x, y)`, from the row hashes `rows` (`rows[y * w + x]`, of the 8
+    /// samples from `(x, y)`).
+    fn combine(rows: &[u32], w: usize, x: usize, y: usize) -> u32 {
+        let mut h = 0u32;
+        for i in 0..8 {
+            h = h
+                .wrapping_mul(0x9E37_79B1)
+                .wrapping_add(rows[(y + i) * w + x]);
+        }
+        h
+    }
+
+    /// The table of a `w` x `h` luma plane `src` (row stride `stride`).
+    pub(crate) fn new(src: &[u16], stride: usize, w: usize, h: usize) -> Self {
+        let mut map: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+        if w >= 8 && h >= 8 {
+            let (cw, ch) = (w - 7, h - 7);
+            let mut rows = vec![0u32; h * cw];
+            for y in 0..h {
+                let row = &src[y * stride..y * stride + w];
+                for x in 0..cw {
+                    let mut r = 0u32;
+                    for &v in &row[x..x + 8] {
+                        r = r.wrapping_mul(0x0100_0193).wrapping_add(v as u32 + 1);
+                    }
+                    rows[y * cw + x] = r;
+                }
+            }
+            for y in 0..ch {
+                for x in 0..cw {
+                    map.entry(Self::combine(&rows, cw, x, y))
+                        .or_default()
+                        .push((y * w + x) as u32);
+                }
+            }
+        }
+        IbcHash { map, width: w }
+    }
+
+    /// The hash of `src`'s 8x8 block at `(x, y)`.
+    fn hash_at(src: &[u16], stride: usize, x: usize, y: usize) -> u32 {
+        let mut rows = [0u32; 8];
+        for (i, r) in rows.iter_mut().enumerate() {
+            for &v in &src[(y + i) * stride + x..(y + i) * stride + x + 8] {
+                *r = r.wrapping_mul(0x0100_0193).wrapping_add(v as u32 + 1);
+            }
+        }
+        Self::combine(&rows, 1, 0, 0)
+    }
 }
 
 /// Each superblock's quantiser index and the Lagrange multipliers that go
@@ -380,13 +446,38 @@ impl TileDecoder<'_, '_> {
         self.b.angle_delta_uv = 0;
         self.b.is_inter = false;
         self.b.ref_frame = [INTRA_FRAME, NONE];
-        let mut ys: Vec<(usize, f64)> = Vec::with_capacity(Y_MODES.len());
+        // Each luma mode (and filter intra mode: `FILTER_INTRA_MODES` past
+        // the plain ones), by SATD and rate.
+        let mut ys: Vec<(usize, Option<u8>, f64)> = Vec::with_capacity(Y_MODES.len() + 5);
         for &(m, _) in Y_MODES.iter() {
             self.b.y_mode = m;
             let cost = self.try_intra(0, m) as f64 + lambda * self.y_mode_bits(m);
-            ys.push((m, cost));
+            ys.push((m, None, cost));
         }
-        ys.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if self.f.seq.enable_filter_intra
+            && block_width(ms).max(block_height(ms)) <= 32
+            && !self.b.lossless
+        {
+            // `use_filter_intra` is coded for every DC_PRED block: its
+            // cost is in the plain DC_PRED's rate too.
+            let dc_bits = self.y_mode_bits(DC_PRED);
+            let off = Coder::cost(&self.cdf.filter_intra[ms], 0) as f64 / 256.0;
+            let on = Coder::cost(&self.cdf.filter_intra[ms], 1) as f64 / 256.0;
+            if let Some(dc) = ys.iter_mut().find(|y| y.0 == DC_PRED) {
+                dc.2 += lambda * off;
+            }
+            self.b.y_mode = DC_PRED;
+            self.b.use_filter_intra = true;
+            for fm in 0..5u8 {
+                self.b.filter_intra_mode = fm as usize;
+                let mode_bits =
+                    Coder::cost(&self.cdf.filter_intra_mode, fm as usize) as f64 / 256.0;
+                let cost = self.try_intra(0, DC_PRED) as f64 + lambda * (dc_bits + on + mode_bits);
+                ys.push((DC_PRED, Some(fm), cost));
+            }
+            self.b.use_filter_intra = false;
+        }
+        ys.sort_by(|a, b| a.2.total_cmp(&b.2));
         let mut best_uv = DC_PRED;
         if self.b.has_chroma {
             self.b.y_mode = ys[0].0;
@@ -401,20 +492,29 @@ impl TileDecoder<'_, '_> {
                 }
             }
         }
+        let luma = |y: &(usize, Option<u8>, f64)| Plan {
+            y_mode: y.0,
+            use_filter_intra: y.1.is_some(),
+            filter_intra_mode: y.1.unwrap_or(0),
+            ref_frame: INTRA_FRAME,
+            ..Default::default()
+        };
         let mut out: Vec<(Plan, f64)> = Vec::new();
-        for &(m, score) in ys.iter().take(tools.intra_candidates.max(1) as usize) {
+        // The best by SATD, filter intra modes among them (measured against
+        // trialling the best filter intra mode as well as the best plain
+        // ones: -0.20 % against -0.10 % BD-rate PSNR-Y at speed 6).
+        for y in ys.iter().take(tools.intra_candidates.max(1) as usize) {
             out.push((
                 Plan {
-                    y_mode: m,
                     uv_mode: best_uv,
-                    ref_frame: INTRA_FRAME,
-                    ..Default::default()
+                    ..luma(y)
                 },
-                score,
+                y.2,
             ));
         }
         // A palette, for blocks of few colours (screen content).
         if self.f.hdr.allow_screen_content_tools
+            && tools.palette
             && (BLOCK_8X8..=BLOCK_64X64).contains(&ms)
             && block_width(ms) <= 64
             && block_height(ms) <= 64
@@ -429,7 +529,7 @@ impl TileDecoder<'_, '_> {
                     palette_colors: colors,
                     ..Default::default()
                 },
-                ys[0].1,
+                ys[0].2,
             ));
         }
         // Chroma from luma, with the best luma mode.
@@ -438,15 +538,17 @@ impl TileDecoder<'_, '_> {
         {
             out.push((
                 Plan {
-                    y_mode: ys[0].0,
                     uv_mode: UV_CFL_PRED,
                     cfl_alpha_u: au,
                     cfl_alpha_v: av,
-                    ref_frame: INTRA_FRAME,
-                    ..Default::default()
+                    ..luma(&ys[0])
                 },
-                ys[0].1,
+                ys[0].2,
             ));
+        }
+        // Intra block copy, where the frame allows it.
+        if self.f.hdr.allow_intrabc {
+            out.extend(self.intrabc_candidates());
         }
         let refs = self.enc().refs.clone();
         if refs.is_empty() || ms < BLOCK_8X8 {
@@ -568,6 +670,152 @@ impl TileDecoder<'_, '_> {
         all.extend(skip_mode);
         all.extend(intra_keep);
         all
+    }
+
+    /// Whether an intra block copy of this block by `dv` (in eighths, whole
+    /// samples) is allowed: `is_mv_valid` (6.10.24) — inside the tile, from
+    /// superblocks decoded at least `INTRABC_DELAY_SB64` 64-wide columns
+    /// before, along the wavefront it allows — and, when the search runs
+    /// in a wavefront of superblock rows two superblocks apart
+    /// (`Tools::wavefront`), only from what that has reconstructed.
+    fn intrabc_valid(&self, dv: Mv) -> bool {
+        if dv[0].abs() >= 1 << 14 || dv[1].abs() >= 1 << 14 || dv[0] & 7 != 0 || dv[1] & 7 != 0 {
+            return false;
+        }
+        let ms = self.b.mi_size;
+        let (bw, bh) = (block_width(ms) as i32, block_height(ms) as i32);
+        let mut top = (self.b.mi_row * MI_SIZE) as i32 + (dv[0] >> 3);
+        let mut left = (self.b.mi_col * MI_SIZE) as i32 + (dv[1] >> 3);
+        let bottom = top + bh;
+        let right = left + bw;
+        if self.b.has_chroma {
+            if bw < 8 && self.f.ssx != 0 {
+                left -= 4;
+            }
+            if bh < 8 && self.f.ssy != 0 {
+                top -= 4;
+            }
+        }
+        let mi = MI_SIZE as i32;
+        if top < self.mi_row_start as i32 * mi
+            || left < self.mi_col_start as i32 * mi
+            || bottom > self.mi_row_end as i32 * mi
+            || right > self.mi_col_end as i32 * mi
+        {
+            return false;
+        }
+        let sb128 = self.f.seq.use_128x128_superblock;
+        let sb_h = if sb128 { 128 } else { 64 };
+        let active_row = (self.b.mi_row * MI_SIZE) as i32 / sb_h;
+        let active_col = (self.b.mi_col * MI_SIZE) as i32 >> 6;
+        let src_row = (bottom - 1) / sb_h;
+        let src_col = (right - 1) >> 6;
+        let per_row = ((self.mi_col_end - self.mi_col_start - 1) >> 4) as i32 + 1;
+        if src_row * per_row + src_col >= active_row * per_row + active_col - INTRABC_DELAY_SB64 {
+            return false;
+        }
+        let gradient = 1 + INTRABC_DELAY_SB64 + sb128 as i32;
+        let wf = gradient * (active_row - src_row);
+        if src_row > active_row || src_col >= active_col - INTRABC_DELAY_SB64 + wf {
+            return false;
+        }
+        // The search's wavefront: a row two superblocks behind the one
+        // above it has the columns before its own plus one reconstructed
+        // there, two more for each row further up.
+        !self.enc().tools.wavefront
+            || src_row == active_row
+            || src_col < active_col + 2 * (active_row - src_row) - 1
+    }
+
+    /// The intra block copy candidates of this block (8x8 or more): the
+    /// vectors the stack predicts, and the earlier places in the frame
+    /// where the block's source appears exactly (found by the hash of its
+    /// first 8x8, the nearest first), each that is allowed scored by SATD
+    /// against the reconstruction there and its vector's rate; the best
+    /// two.
+    fn intrabc_candidates(&mut self) -> Vec<(Plan, f64)> {
+        let ms = self.b.mi_size;
+        let (bw, bh) = (block_width(ms), block_height(ms));
+        if bw < 8 || bh < 8 {
+            return Vec::new();
+        }
+        let saved = (self.b.use_intrabc, self.b.is_inter, self.b.ref_frame);
+        self.b.use_intrabc = true;
+        self.b.is_inter = true;
+        self.b.ref_frame = [INTRA_FRAME, NONE];
+        self.find_mv_stack(false);
+        let pred = self.intrabc_pred_mv();
+        let mut dvs: Vec<Mv> = vec![pred, self.b.ref_stack_mv[0][0], self.b.ref_stack_mv[1][0]];
+        let (x0, y0) = (self.b.mi_col * MI_SIZE, self.b.mi_row * MI_SIZE);
+        if let Some(hash) = self.enc().ibc.clone() {
+            let e = self.enc();
+            let (src, st) = (&e.src[0], e.stride[0]);
+            let key = IbcHash::hash_at(src, st, x0, y0);
+            if let Some(list) = hash.map.get(&key) {
+                // The positions before this one in raster order, nearest
+                // first.
+                let here = (y0 * hash.width + x0) as u32;
+                let end = list.partition_point(|&p| p < here);
+                let mut found = 0;
+                for &p in list[..end].iter().rev().take(64) {
+                    let (px, py) = (p as usize % hash.width, p as usize / hash.width);
+                    let same = (0..bh).all(|i| {
+                        src[(py + i) * st + px..(py + i) * st + px + bw]
+                            == src[(y0 + i) * st + x0..(y0 + i) * st + x0 + bw]
+                    });
+                    let dv = [(py as i32 - y0 as i32) * 8, (px as i32 - x0 as i32) * 8];
+                    if same && self.intrabc_valid(dv) {
+                        dvs.push(dv);
+                        found += 1;
+                        if found == 4 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let lambda = self.enc().lambda;
+        let mut scored: Vec<(Mv, f64)> = Vec::new();
+        for dv in dvs {
+            if scored.iter().any(|s| s.0 == dv) || !self.intrabc_valid(dv) {
+                continue;
+            }
+            let e = self.enc();
+            let cur = &self.f.cur.planes[0];
+            let st = e.stride[0];
+            let sy = (y0 as i32 + (dv[0] >> 3)) as usize;
+            let sx = (x0 as i32 + (dv[1] >> 3)) as usize;
+            let cost = satd(
+                &e.src[0][y0 * st + x0..],
+                st,
+                &cur.data[sy * cur.stride + sx..],
+                cur.stride,
+                bw,
+                bh,
+            ) as f64;
+            let bits = 2.0 + mv_bits((dv[0] - pred[0]) >> 3) + mv_bits((dv[1] - pred[1]) >> 3);
+            scored.push((dv, cost + lambda * bits));
+        }
+        (self.b.use_intrabc, self.b.is_inter, self.b.ref_frame) = saved;
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored
+            .into_iter()
+            .take(2)
+            .map(|(dv, cost)| {
+                (
+                    Plan {
+                        use_intrabc: true,
+                        is_inter: true,
+                        y_mode: DC_PRED,
+                        uv_mode: DC_PRED,
+                        ref_frame: INTRA_FRAME,
+                        mv: [dv, [0, 0]],
+                        ..Default::default()
+                    },
+                    cost,
+                )
+            })
+            .collect()
     }
 
     /// A luma palette for this block: its distinct colours when there are
