@@ -1595,7 +1595,10 @@ fn source_window<'a>(
 
 /// Block inter prediction from a reference of the frame's own size, for
 /// the general path's 32-bit predictions: [`block_inter_prediction16`]'s,
-/// widened.
+/// widened. A prediction with a compound block's rounding (`InterRound1`
+/// of 7: the masked compounds' predictions take this path) does not fit 16
+/// bits above 8 bits a sample, so it is made less the compound bias, which
+/// the widening puts back.
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn block_inter_prediction_unscaled(
@@ -1620,6 +1623,11 @@ fn block_inter_prediction_unscaled(
         if pred16.len() < w * h {
             pred16.resize(w * h, 0);
         }
+        let bias = if rv.round1 == 7 {
+            crate::dsp::mc::Compound::new(rv.bit_depth, 0).bias
+        } else {
+            0
+        };
         block_inter_prediction16(
             refp,
             last_x,
@@ -1630,13 +1638,13 @@ fn block_inter_prediction_unscaled(
             h,
             filters,
             rv,
-            0,
+            bias,
             &mut pred16[..w * h],
             &mut edges[0],
             intermediate,
         );
         for (o, &v) in pred[..w * h].iter_mut().zip(&pred16[..w * h]) {
-            *o = v as i32;
+            *o = v as i32 + bias;
         }
     });
 }
@@ -2123,6 +2131,71 @@ mod tests {
     /// of every size inside it, across each edge and wholly outside, every
     /// filter and phase with the zero phases as often as not, as a single
     /// prediction and as a compound one less its bias.
+    /// The largest predictions there are: for every filter and phase, a
+    /// reference whose samples are the largest value under the filter's
+    /// positive taps and zero under its negative ones, in both directions
+    /// (the horizontal filter's largest rows where the vertical taps are
+    /// positive, its smallest where they are negative), predicted with a
+    /// compound block's rounding at 10 and 12 bits: over 16 bits, which the
+    /// 32-bit path must still give whole.
+    #[test]
+    fn the_largest_compound_predictions_in_32_bits() {
+        for bit_depth in [8u32, 10, 12] {
+            let round0 = if bit_depth == 12 { 5 } else { 3 };
+            let rv = RoundingVars {
+                round0,
+                round1: 7,
+                post_round: 14 - (round0 + 7) as i32,
+                bit_depth,
+            };
+            let max = (1u16 << bit_depth) - 1;
+            for filt in 0..SUBPEL_FILTERS.len() {
+                for phase in 1..16usize {
+                    let positive = |i: usize| SUBPEL_FILTERS[filt][phase][i % 8] > 0;
+                    for invert in [false, true] {
+                        let mut plane = PlaneBuf::new(96, 80, 0);
+                        for (i, v) in plane.data.as_mut_slice().iter_mut().enumerate() {
+                            let (x, y) = (i % 96, i / 96);
+                            *v = if (positive(x) == positive(y)) != invert {
+                                max
+                            } else {
+                                0
+                            };
+                        }
+                        // Columns and rows 0 to 7 under the taps: the
+                        // block's first at 3.
+                        let at = (3i64 << 10) + ((phase as i64) << 6);
+                        let (w, h) = (8, 8);
+                        let filters = [filt, filt];
+                        let mut want = vec![0i32; w * h];
+                        let mut intermediate = vec![0i32; (h + 7) * w];
+                        block_inter_prediction_with(
+                            &plane,
+                            95,
+                            79,
+                            at,
+                            at,
+                            1 << SCALE_SUBPEL_BITS,
+                            1 << SCALE_SUBPEL_BITS,
+                            w,
+                            h,
+                            filters,
+                            h + 7,
+                            rv,
+                            &mut want,
+                            &mut intermediate,
+                        );
+                        let mut got = vec![0i32; w * h];
+                        block_inter_prediction_unscaled(
+                            &plane, 95, 79, at, at, w, h, filters, rv, &mut got,
+                        );
+                        assert_eq!(want, got, "{bit_depth}-bit filter {filt} phase {phase}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn unscaled_prediction_matches_the_general_process() {
         let mut seed = 0x510e_527f_ade6_82d1u64;
@@ -2229,6 +2302,17 @@ mod tests {
                         assert_eq!(
                             want, got,
                             "{bit_depth}-bit compound {compound} {w}x{h} at {x},{y} {filters:?}"
+                        );
+                        // And as the general path's callers take it (the
+                        // masked compounds, with a compound's rounding),
+                        // in 32 bits.
+                        let mut got = vec![0i32; w * h];
+                        block_inter_prediction_unscaled(
+                            &plane, last_x, last_y, x, y, w, h, filters, rv, &mut got,
+                        );
+                        assert_eq!(
+                            want, got,
+                            "32 bits: {bit_depth}-bit compound {compound} {w}x{h} at {x},{y} {filters:?}"
                         );
                     }
                 }
