@@ -14,8 +14,17 @@
 //! Each stream's `ref_cmd` script gives the options the reference output
 //! was made with: the bitstream format (`--annexb`), the operating point
 //! (`--oppoint=N`) and whether every layer's frames are output
-//! (`--all-layers`). Large-scale-tile and error-resilience directories
-//! (no MD5s, or tile list OBUs) are not run.
+//! (`--all-layers`). The error-resilience directories (no reference
+//! output) are not run.
+//!
+//! The large-scale-tile directories (`*_large_scale_tile*`, tile list
+//! OBUs, 7.3) were made with AOMedia's `lightfield_tile_list_decoder
+//! input output N L`: the frames the first `N` temporal units show are the
+//! anchor frames, and each of the next `L` tile lists is decoded; its
+//! output, as that tool writes it, is each decoded tile on its own (as a
+//! picture of one tile's size, in the order of the list's entries), which
+//! is the output frame of 7.3.1 cut at its tiles. `ARGON_FILTER=large`
+//! runs only those.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +34,9 @@ struct Case {
     annexb: bool,
     oppoint: usize,
     all_layers: bool,
+    /// For a large-scale-tile stream: how many temporal units show the
+    /// anchor frames, and how many tile lists are decoded after them.
+    tile_lists: Option<(usize, usize)>,
     name: String,
 }
 
@@ -40,7 +52,7 @@ fn cases(root: &Path) -> Vec<Case> {
     dirs.sort();
     for dir in dirs {
         let dname = dir.file_name().unwrap().to_string_lossy().to_string();
-        if dname.contains("large_scale_tile") || dname.contains("error") {
+        if dname.contains("error") {
             continue;
         }
         let md5_dir = dir.join("md5_ref");
@@ -52,7 +64,10 @@ fn cases(root: &Path) -> Vec<Case> {
             let Ok(cmd) = std::fs::read_to_string(&cmd_path) else {
                 return;
             };
-            let Some(line) = cmd.lines().find(|l| l.contains("aomdec")) else {
+            let Some(line) = cmd
+                .lines()
+                .find(|l| l.contains("aomdec") || l.contains("lightfield_tile_list_decoder"))
+            else {
                 return;
             };
             let Some(input) = line
@@ -67,10 +82,24 @@ fn cases(root: &Path) -> Vec<Case> {
                 .find_map(|w| w.strip_prefix("--oppoint="))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            // lightfield_tile_list_decoder input output N L
+            let tile_lists = if line.contains("lightfield_tile_list_decoder") {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                let n = w.get(3).and_then(|v| v.parse().ok());
+                let l = w.get(4).and_then(|v| v.parse().ok());
+                let (Some(n), Some(l)) = (n, l) else {
+                    return;
+                };
+                Some((n, l))
+            } else {
+                None
+            };
+            let stream = dir.join("streams").join(file);
             out.push(Case {
-                stream: dir.join("streams").join(file),
+                annexb: line.contains("--annexb") || (tile_lists.is_some() && is_annexb(&stream)),
+                tile_lists,
+                stream,
                 md5: md5.split_whitespace().next().unwrap_or("").to_string(),
-                annexb: line.contains("--annexb"),
                 oppoint,
                 all_layers: line.contains("--all-layers"),
                 name: label,
@@ -117,9 +146,129 @@ fn cases(root: &Path) -> Vec<Case> {
     out
 }
 
+/// Whether a stream reads as Annex B (5.2's length-delimited format)
+/// throughout: the reference command of a large-scale-tile stream does not
+/// say, and the suite has them in both formats.
+fn is_annexb(stream: &Path) -> bool {
+    let Ok(data) = std::fs::read(stream) else {
+        return false;
+    };
+    let Ok(tus) = av1::annexb_temporal_units(&data) else {
+        return false;
+    };
+    // Each temporal unit is frame units, each of OBUs, sizes adding up;
+    // a low-overhead stream starts with a temporal delimiter OBU (0x12),
+    // which as a size would rarely add up.
+    tus.iter().all(|tu| {
+        let mut pos = 0;
+        while pos < tu.len() {
+            let Some((fu, n)) = leb128(&tu[pos..]) else {
+                return false;
+            };
+            pos += n;
+            let end = pos + fu;
+            if end > tu.len() {
+                return false;
+            }
+            while pos < end {
+                let Some((obu, n)) = leb128(&tu[pos..end]) else {
+                    return false;
+                };
+                pos += n + obu;
+                if pos > end || obu == 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
+fn leb128(d: &[u8]) -> Option<(usize, usize)> {
+    let mut v = 0usize;
+    for i in 0..8 {
+        let b = *d.get(i)?;
+        v |= ((b & 0x7f) as usize) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some((v, i + 1));
+        }
+    }
+    None
+}
+
+/// Decodes a large-scale-tile case as `lightfield_tile_list_decoder`
+/// does: the last frame each of the first `anchors` temporal units shows
+/// is an anchor frame; after them every frame a temporal unit shows is
+/// the output frame of a tile list, and each of the first `lists` is
+/// hashed tile by tile.
+fn run_tile_lists(c: &Case, units: &[&[u8]], anchors: usize, lists: usize) -> Result<bool, String> {
+    let mut dec = av1::Decoder::new();
+    if let Some(n) = std::env::var("AV1_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        dec.set_threads(n);
+    }
+    let decode = |dec: &mut av1::Decoder, tu: &[u8]| {
+        if c.annexb {
+            dec.decode_annexb(tu)
+        } else {
+            dec.decode_all(tu)
+        }
+        .map_err(|e| e.to_string())
+    };
+    let mut frames = Vec::new();
+    for tu in units.iter().take(anchors) {
+        frames.extend(decode(&mut dec, tu)?.pop());
+    }
+    dec.set_anchor_frames(&frames);
+    let mut out = md5::Context::new();
+    let mut done = 0;
+    for tu in &units[anchors.min(units.len())..] {
+        if done == lists {
+            break;
+        }
+        for f in decode(&mut dec, tu)? {
+            if done == lists {
+                break;
+            }
+            let l = dec
+                .tile_list_layout()
+                .ok_or("a frame that is not a tile list's")?;
+            let across = (f.width / l.tile_width) as usize;
+            for t in 0..l.tiles {
+                let x = l.tile_width as usize * (t % across);
+                let y = l.tile_height as usize * (t / across);
+                for p in 0..f.planes.len() {
+                    let (sx, sy) = if p == 0 { (0, 0) } else { f.chroma.shifts() };
+                    let bps = f.bytes_per_sample();
+                    let pw = f.planes[p].width as usize;
+                    let (x0, y0) = (x >> sx, y >> sy);
+                    let w = l.tile_width as usize >> sx;
+                    let h = l.tile_height as usize >> sy;
+                    let plane = f.plane(p);
+                    for row in y0..y0 + h {
+                        out.consume(&plane[(row * pw + x0) * bps..(row * pw + x0 + w) * bps]);
+                    }
+                }
+            }
+            done += 1;
+        }
+    }
+    Ok(format!("{:x}", out.compute()) == c.md5)
+}
+
 /// Decodes a case: `Ok(true)` when the output MD5 matches.
 fn run(c: &Case) -> Result<bool, String> {
     let data = std::fs::read(&c.stream).map_err(|e| e.to_string())?;
+    if let Some((anchors, lists)) = c.tile_lists {
+        let units = if c.annexb {
+            av1::annexb_temporal_units(&data).map_err(|e| e.to_string())?
+        } else {
+            split_at_delimiters(&data)
+        };
+        return run_tile_lists(c, &units, anchors, lists);
+    }
     let mut dec = av1::Decoder::new();
     // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
     if let Some(n) = std::env::var("AV1_DECODE_THREADS")
@@ -223,7 +372,11 @@ fn argon() {
     };
     let mut cs = cases(Path::new(&root));
     if let Ok(f) = std::env::var("ARGON_FILTER") {
-        cs.retain(|c| c.name.contains(&f));
+        if f == "large" {
+            cs.retain(|c| c.tile_lists.is_some());
+        } else {
+            cs.retain(|c| c.name.contains(&f));
+        }
     }
     let n = std::thread::available_parallelism().map_or(4, |n| n.get());
     let next = std::sync::atomic::AtomicUsize::new(0);

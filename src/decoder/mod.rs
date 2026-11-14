@@ -9,6 +9,7 @@
 
 mod flight;
 pub(crate) mod grain;
+pub(crate) mod lst;
 pub(crate) mod mvpred;
 pub(crate) mod pipeline;
 pub(crate) mod postfilter;
@@ -32,6 +33,8 @@ use crate::{Error, Result};
 use shared::Shared;
 use state::{FrameBuf, Mi, Mv, PlaneBuf, RefData};
 use tile::TileDecoder;
+
+pub use lst::TileListLayout;
 
 /// Loop restoration parameters of one plane (`LrType`, `LrWiener`,
 /// `LrSgrSet`, `LrSgrXqd`).
@@ -333,6 +336,8 @@ pub struct Decoder {
     /// a frame that is not a job or finds no thread to fly on.
     grounded: usize,
     ground_for: usize,
+    /// The anchor frames of large scale tile decoding (`lst.rs`).
+    anchors: lst::Anchors,
 }
 
 impl Default for Decoder {
@@ -367,6 +372,7 @@ impl Decoder {
             flying: None,
             grounded: 0,
             ground_for: 0,
+            anchors: Default::default(),
         }
     }
 
@@ -625,11 +631,7 @@ impl Decoder {
                 Some(Metadata::MasteringDisplay(m)) => self.hdr.mastering_display = Some(m),
                 None => {}
             },
-            OBU_TILE_LIST => {
-                return Err(Error::unsupported(
-                    "large scale tile decoding (tile list OBUs)",
-                ));
-            }
+            OBU_TILE_LIST => self.tile_list(payload)?,
             _ => {}
         }
         Ok(())

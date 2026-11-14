@@ -74,7 +74,7 @@ pub(crate) mod symbol;
 pub(crate) mod tables;
 pub mod y4m;
 
-pub use decoder::{Decoder, annexb_temporal_units};
+pub use decoder::{Decoder, TileListLayout, annexb_temporal_units};
 pub use encoder::{Config, Encoder, Tools};
 pub use frame::{
     ChromaFormat, ColorInfo, ContentLightLevel, Frame, HdrMetadata, MasteringDisplay, Plane,
