@@ -869,7 +869,7 @@ impl TileDecoder<'_, '_> {
         eob
     }
 
-    fn all_zero_ctx(
+    pub(crate) fn all_zero_ctx(
         &self,
         plane: usize,
         tx_sz: usize,
@@ -1014,7 +1014,14 @@ impl TileDecoder<'_, '_> {
         }
     }
 
-    fn dc_sign_ctx(&self, plane: usize, x4: usize, y4: usize, w4: usize, h4: usize) -> usize {
+    pub(crate) fn dc_sign_ctx(
+        &self,
+        plane: usize,
+        x4: usize,
+        y4: usize,
+        w4: usize,
+        h4: usize,
+    ) -> usize {
         let mut max_x4 = self.f.mi_cols;
         let mut max_y4 = self.f.mi_rows;
         if plane > 0 {
@@ -1452,7 +1459,13 @@ pub(crate) fn get_tx_class(tx_type: usize) -> usize {
 /// `Min( Abs( Quant ), 3 )` (the decode-only reader's form of
 /// `TileDecoder::coeff_base_ctx`).
 #[inline(always)]
-fn coeff_base_ctx_of(tx_sz: usize, tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
+pub(crate) fn coeff_base_ctx_of(
+    tx_sz: usize,
+    tx_class: usize,
+    row: usize,
+    col: usize,
+    mag: u32,
+) -> usize {
     let ctx = mag.div_ceil(2).min(4) as usize;
     if tx_class == TX_CLASS_2D {
         if row == 0 && col == 0 {
@@ -1468,7 +1481,7 @@ fn coeff_base_ctx_of(tx_sz: usize, tx_class: usize, row: usize, col: usize, mag:
 /// neighbours of `Min( Quant, COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 )` (the
 /// decode-only reader's form of `TileDecoder::coeff_br_ctx`).
 #[inline(always)]
-fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
+pub(crate) fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32) -> usize {
     let mag = mag.div_ceil(2).min(6) as usize;
     if row == 0 && col == 0 {
         mag
@@ -1713,7 +1726,7 @@ fn level_golomb(d: &mut crate::symbol::SymbolDecoder, level: u32) -> u32 {
 }
 
 /// `get_coeff_base_ctx()` with `isEob` set, rebased for `coeff_base_eob`.
-fn coeff_base_eob_ctx(c: usize, bwl: usize, height: usize) -> usize {
+pub(crate) fn coeff_base_eob_ctx(c: usize, bwl: usize, height: usize) -> usize {
     if c == 0 {
         return 0;
     }

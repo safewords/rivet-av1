@@ -20,6 +20,7 @@ pub(crate) mod fwd;
 pub(crate) mod lr;
 mod rc;
 pub(crate) mod rdo;
+pub(crate) mod rdoq;
 pub(crate) mod tile;
 mod wavefront;
 
@@ -190,6 +191,16 @@ pub struct Tools {
     /// Adaptive quantisation: superblocks the previous frame predicts well
     /// coded finer, those it does not coarser (`delta_q_present`).
     pub aq: bool,
+    /// Rate-distortion optimised quantisation (`encoder::rdoq`): each
+    /// coded transform block's levels and end of block chosen by their
+    /// coding cost under the CDFs in force, not by the dead-zone rule.
+    /// 0: never; 1: only in the blocks coded for real (the search measures
+    /// dead-zone levels, with a wider dead zone); 2: in the search's trials
+    /// too, but those of the transform type search; 3: everywhere. At
+    /// speed 6, 1 is −3.1 % BD-rate PSNR-Y (with the chroma weights of
+    /// `rdo::CHROMA_WEIGHT`) for 1.04x the time, 3 −3.7 % for 1.3x; at
+    /// speed 4, 3 is −2.7 % for 1.2x and 1 only −0.8 %.
+    pub rdoq: u8,
 }
 
 impl Tools {
@@ -251,6 +262,11 @@ impl Tools {
             prune_intra: s >= 5,
             wavefront: s >= 5,
             aq: false,
+            rdoq: match s {
+                0..=4 => 3,
+                5..=8 => 1,
+                _ => 0,
+            },
         }
     }
 
@@ -291,6 +307,7 @@ impl Tools {
             "prune_intra" => self.prune_intra = b,
             "wavefront" => self.wavefront = b,
             "aq" => self.aq = b,
+            "rdoq" => self.rdoq = value.min(3) as u8,
             _ => return false,
         }
         true

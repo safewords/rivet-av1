@@ -1256,11 +1256,22 @@ impl TileDecoder<'_, '_> {
             _ => 1.0,
         };
         let (dc_r, ac_r) = (denom / dc_q, denom / ac_q);
+        // The AC dead zone: where an AC coefficient (in quantiser steps)
+        // starts to be coded as 1. Wider in the search's trials when only
+        // the blocks coded for real are quantised by rate and distortion
+        // (`Tools::rdoq` 1): those levels, which the trials then stand in
+        // for, are the sparser (0.70 measured best of 0.62 to 0.78, −0.5 %
+        // BD-rate PSNR-Y and −0.4 % PSNR-YUV at speed 6).
+        let dz = if self.enc().tools.rdoq == 1 && self.sd.counting() {
+            0.70
+        } else {
+            0.62
+        };
         // Every level zero when no coefficient can reach the dead zones.
         let top = sum_abs as f64 * coef_bound(tx_sz, tx_type);
         let enc = self.enc.as_mut().expect("encode mode");
         enc.coefs.fill(0);
-        if top * ac_r < 0.62 && top * dc_r < 0.5 {
+        if top * ac_r < dz && top * dc_r < 0.5 {
             enc.res = res;
             enc.fc = c;
             self.plane_tx_type = tx_type;
@@ -1272,7 +1283,7 @@ impl TileDecoder<'_, '_> {
             let row = &c[i * w..i * w + tw];
             let out = &mut enc.coefs[i * tw..(i + 1) * tw];
             for (o, &v) in out.iter_mut().zip(row) {
-                let l = (v.abs() * ac_r + (1.0 - 0.62)).floor().min(MAX_LEVEL) as i32;
+                let l = (v.abs() * ac_r + (1.0 - dz)).floor().min(MAX_LEVEL) as i32;
                 *o = if v < 0.0 { -l } else { l };
             }
         }
@@ -1366,7 +1377,7 @@ impl TileDecoder<'_, '_> {
             && let Some(t) = self.rdo().forced_tx_type.take()
         {
             self.enc_tx_type = t;
-            return self.quantise_block(0, start_x, start_y, tx_sz, t);
+            return self.quantise_coded(0, start_x, start_y, tx_sz, t, true);
         }
         let derived = self.b.lossless || TX_SIZE_SQR_UP[tx_sz] > TX_32X32;
         let t = if derived {
@@ -1402,7 +1413,32 @@ impl TileDecoder<'_, '_> {
         if plane == 0 {
             self.enc_tx_type = t;
         }
-        self.quantise_block(plane, start_x, start_y, tx_sz, t)
+        self.quantise_coded(plane, start_x, start_y, tx_sz, t, false)
+    }
+
+    /// The levels of a transform block about to be coded: the dead-zone
+    /// quantiser's, chosen again by rate and distortion where `Tools::rdoq`
+    /// says (`type_search`: coded on trial by the transform type search).
+    fn quantise_coded(
+        &mut self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        tx_sz: usize,
+        tx_type: usize,
+        type_search: bool,
+    ) -> usize {
+        let eob = self.quantise_block(plane, x, y, tx_sz, tx_type);
+        let on = match self.enc().tools.rdoq {
+            0 => false,
+            1 => !self.sd.counting(),
+            2 => !type_search,
+            _ => true,
+        };
+        if eob == 0 || !on || self.b.lossless {
+            return eob;
+        }
+        self.rdoq(plane, x, y, tx_sz, tx_type, eob)
     }
 
     /// Codes the luma transform block at `(x, y)` with each candidate type

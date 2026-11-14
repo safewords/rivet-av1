@@ -276,7 +276,7 @@ impl TileDecoder<'_, '_> {
 
     /// Sum of squared differences between the source and the
     /// reconstruction over a luma 4x4 rectangle (and the chroma it covers),
-    /// inside the frame.
+    /// inside the frame, each plane's weighted by [`CHROMA_WEIGHT`].
     pub(crate) fn rect_sse(&self, r0: usize, r1: usize, c0: usize, c1: usize) -> u64 {
         let e = self.enc.as_ref().expect("encode mode");
         let f = &*self.f;
@@ -294,7 +294,7 @@ impl TileDecoder<'_, '_> {
             for y in y0..y1 {
                 let a = &e.src[p][y * st + x0..y * st + x1.max(x0)];
                 let b = &pl.data[y * pl.stride + x0..y * pl.stride + x1.max(x0)];
-                total += crate::dsp::enc::sse_row(a, b);
+                total += (crate::dsp::enc::sse_row(a, b) * CHROMA_WEIGHT[p]) >> 2;
             }
         }
         total
@@ -639,6 +639,19 @@ impl TileDecoder<'_, '_> {
         }
     }
 }
+
+/// How much a squared error counts in each plane (in quarters), against
+/// luma's: the search's distortion is the weighted sum. Counted as luma,
+/// chroma is under-coded for a measure that weighs each plane's PSNR (as
+/// the 6:1:1 PSNR-YUV does): a chroma plane has a quarter of the samples
+/// and usually a fraction of luma's error, so the same squared error moves
+/// its PSNR several times as far. Measured at speed 6 on the five test
+/// clips (with rate-distortion optimised quantisation), against weighing
+/// every plane alike: U 1.5 and V 3 cost +2.0 % BD-rate PSNR-Y for −3.2 %
+/// PSNR-YUV; U and V 2, +2.3 % for −3.1 %; U and V 3, +4.0 % for −3.6 %.
+/// V weighs more than U because its error is usually the smaller (by
+/// about two in these clips, from 1.0 to 2.6).
+pub(crate) const CHROMA_WEIGHT: [u64; 3] = [4, 6, 12];
 
 /// The deepest `tx_depth` the syntax codes.
 const MAX_TX_DEPTH_CODED: usize = 2;

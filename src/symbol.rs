@@ -727,6 +727,11 @@ impl<'a> Coder<'a> {
         matches!(self, Coder::Enc(_))
     }
 
+    /// Whether this is trial coding (see `SymbolEncoder::counting`).
+    pub(crate) fn counting(&self) -> bool {
+        matches!(self, Coder::Enc(e) if e.counting)
+    }
+
     /// Switches trial coding (see `SymbolEncoder::counting`) on or off;
     /// returns the previous setting.
     pub(crate) fn set_counting(&mut self, on: bool) -> bool {
