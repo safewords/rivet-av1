@@ -312,7 +312,7 @@ pub struct Tools {
     pub inter_tool_threshold: u16,
     /// Every chroma intra mode (the thirteen but chroma from luma) ranked
     /// for the block by its SATD, each plane's weighted by the square root
-    /// of its `rdo::CHROMA_WEIGHT`, plus its rate under the CDFs in force;
+    /// of its weight (`chroma_weight`), plus its rate under the CDFs in force;
     /// else DC, V, H, smooth and Paeth with a fixed rate. Off: with the
     /// inter tools in, +0.2 % BD-rate PSNR-Y and +0.1 % PSNR-YUV at speed 6
     /// against the five modes (it was −0.5 % and −0.4 % before them).
@@ -351,6 +351,24 @@ pub struct Tools {
     /// Testing: an inter tool taken wherever it can be coded, whatever it
     /// costs (`FORCE_*`; 0: none), so that every tool is exercised.
     pub force_inter_tool: u8,
+    /// How much a squared error counts in U and in V against luma's, in
+    /// quarters, in the search's distortion (`rdo::CHROMA_WEIGHT`; U 2,
+    /// not 1.5, at speeds 4 to 8).
+    pub chroma_weight: [u8; 2],
+    /// The CDEF search measures every strength on a quarter of the
+    /// 64x64 blocks, and on the rest only the strengths those chose most
+    /// often (ten for luma, six for chroma): ±0 to +0.16 % BD-rate at
+    /// speeds 4 to 8 for 0.97x the time.
+    pub cdef_fast: bool,
+    /// The loop restoration search tries the self-guided filters (else
+    /// the Wiener filter alone: at speeds 4 and 6 as much gain, −0.75 %
+    /// and −0.7 % BD-rate PSNR-YUV, for about half the time).
+    pub restoration_sgr: bool,
+    /// Loop restoration in the frames of a group's top layer too (without:
+    /// three quarters of the gain for half the time).
+    pub restoration_top: bool,
+    /// `rect_max` in the frames of a group's top layer.
+    pub rect_max_top: u8,
 }
 
 /// `Tools::force_inter_tool`: the sharp filter (smooth across with
@@ -409,7 +427,10 @@ impl Tools {
             lf_search: s <= 9,
             multi_ref: s <= 3,
             cfl: s <= 8,
-            restoration: s <= 3,
+            // At speeds 4 to 6 the Wiener filter alone (`restoration_sgr`):
+            // as much gain as with the self-guided filters, for half the
+            // time.
+            restoration: s <= 6,
             restoration_thorough: s <= 2,
             compound: s <= 5,
             palette: s <= 8,
@@ -486,8 +507,10 @@ impl Tools {
             uv_trials_inter: false,
             // In inter frames too at speeds 5 to 7: −0.2 % PSNR-YUV at speed
             // 6; ±0 at speed 8, for 1.02x the time.
+            // (With loop restoration at speeds 5 and 6 the inter frames'
+            // trials gain nothing from it: 1 there.)
             rdoq_uv: match s {
-                5..=7 => 2,
+                7 => 2,
                 0..=8 => 1,
                 _ => 0,
             },
@@ -497,6 +520,29 @@ impl Tools {
             // One trial from speed 4: as much gain for less time.
             inter_tool_trials: if s >= 4 { 1 } else { 2 },
             force_inter_tool: 0,
+            // U weighed 2, not 1.5, at speeds 4 to 8: −0.3 % BD-rate
+            // PSNR-YUV for +0.6 % PSNR-Y (U 2.5, or V other than 3, less).
+            chroma_weight: [
+                if (4..=8).contains(&s) {
+                    8
+                } else {
+                    rdo::CHROMA_WEIGHT[1] as u8
+                },
+                rdo::CHROMA_WEIGHT[2] as u8,
+            ],
+            cdef_fast: s >= 4,
+            restoration_sgr: s <= 3,
+            restoration_top: true,
+            rect_max_top: if s >= 4 { 16 } else { 128 },
+        }
+    }
+
+    /// How much a squared error in `plane` counts against luma's, in
+    /// quarters.
+    pub(crate) fn plane_weight(&self, plane: usize) -> u64 {
+        match plane {
+            0 => 4,
+            p => self.chroma_weight[p - 1] as u64,
         }
     }
 
@@ -575,6 +621,12 @@ impl Tools {
             "intra_early" => self.intra_early = value.min(1000) as u16,
             "inter_tool_trials" => self.inter_tool_trials = value.min(255) as u8,
             "force_inter_tool" => self.force_inter_tool = value.min(255) as u8,
+            "chroma_weight_u" => self.chroma_weight[0] = value.min(255) as u8,
+            "chroma_weight_v" => self.chroma_weight[1] = value.min(255) as u8,
+            "cdef_fast" => self.cdef_fast = b,
+            "restoration_sgr" => self.restoration_sgr = b,
+            "restoration_top" => self.restoration_top = b,
+            "rect_max_top" => self.rect_max_top = value.min(128) as u8,
             _ => return false,
         }
         true
@@ -790,6 +842,13 @@ impl FrameParams {
     /// 5.9.19, 5.9.20).
     fn filters(&self) -> bool {
         self.qidx > 0 && !self.intrabc
+    }
+
+    /// Whether the frame's loop restoration is searched (some plane's
+    /// units may be restored).
+    fn restores(&self) -> bool {
+        self.lr
+            .is_some_and(|t| t.iter().any(|&x| x != RESTORE_NONE))
     }
 }
 
@@ -1580,9 +1639,7 @@ impl Encoder {
         }
         let mut coded = self.code_frame(&p, &src, &stride, None)?;
         let filters = p.filters();
-        if (filters && (tools.lf_search || tools.cdef || tools.restoration))
-            || coded.tiles.is_empty()
-        {
+        if (filters && (tools.lf_search || tools.cdef || p.restores())) || coded.tiles.is_empty() {
             // The in-loop filters' parameters, chosen on the first pass's
             // reconstruction; then the frame again with them, replaying the
             // first pass's decisions.
@@ -1603,6 +1660,7 @@ impl Encoder {
                     &stride,
                     lambda,
                     tools.cdef_thorough,
+                    tools.cdef_fast,
                     self.cfg.threads.max(1),
                 );
                 // The chosen CDEF, as the decoder will apply it.
@@ -1621,7 +1679,7 @@ impl Encoder {
                 cdef_table = Some(table);
             }
             let mut lr_plan = None;
-            if filters && tools.restoration {
+            if filters && p.restores() {
                 let cdef_frame = crate::decoder::postfilter::cdef(&f, self.cfg.threads.max(1));
                 let plan = lr::search(
                     &f,
@@ -1637,6 +1695,7 @@ impl Encoder {
                     } else {
                         lr::Effort::Normal
                     },
+                    tools.restoration_sgr,
                     self.cfg.threads.max(1),
                 );
                 p.lr = Some(plan.frame_type);
@@ -1804,8 +1863,16 @@ impl Encoder {
             },
             // Switchable in every plane on the first pass, every unit off:
             // the units exist for the search.
+            // (A frame of a group's top layer without restoration, where
+            // `Tools::restoration_top` is off, still codes its lr_params.)
             lr: if tools.restoration && filters {
-                Some([RESTORE_SWITCHABLE; 3])
+                Some(
+                    if tools.restoration_top || !matches!(role, Role::Group { top: true, .. }) {
+                        [RESTORE_SWITCHABLE; 3]
+                    } else {
+                        [RESTORE_NONE; 3]
+                    },
+                )
             } else {
                 None
             },
@@ -2010,6 +2077,11 @@ impl Encoder {
                     self.cfg.tools.split_threshold_small_top
                 } else {
                     self.cfg.tools.split_threshold_small
+                },
+                rect_max: if p.top {
+                    self.cfg.tools.rect_max.min(self.cfg.tools.rect_max_top)
+                } else {
+                    self.cfg.tools.rect_max
                 },
                 ..self.cfg.tools
             },

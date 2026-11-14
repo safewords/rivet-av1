@@ -69,10 +69,12 @@ pub(crate) fn search(
     stride: &[usize],
     lambda: f64,
     effort: Effort,
+    sgr: bool,
     threads: usize,
 ) -> LrPlan {
     let mut plan = LrPlan::default();
     let sets: Vec<usize> = match effort {
+        _ if !sgr => Vec::new(),
         Effort::Thorough => (0..16).collect(),
         Effort::Normal => SGR_SETS_NORMAL.to_vec(),
         Effort::Fast => SGR_SETS_FAST.to_vec(),

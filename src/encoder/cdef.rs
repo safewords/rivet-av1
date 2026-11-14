@@ -40,6 +40,11 @@ impl CdefParams {
     }
 }
 
+/// With `Tools::cdef_fast`, the luma and chroma strengths measured on
+/// every block (off among them).
+const FAST_Y: usize = 10;
+const FAST_UV: usize = 6;
+
 /// Coded secondary strength to the strength (6.10.14: 3 is 4).
 fn sec(coded: u32) -> i32 {
     if coded == 3 { 4 } else { coded as i32 }
@@ -55,6 +60,7 @@ pub(crate) fn search(
     stride: &[usize],
     lambda: f64,
     thorough: bool,
+    fast: bool,
     threads: usize,
 ) -> (CdefParams, Vec<i8>) {
     let y_pri: &[u32] = if thorough {
@@ -95,101 +101,75 @@ pub(crate) fn search(
     if blocks.is_empty() {
         return (CdefParams::off(), table);
     }
-    let ny = ycands.len();
-    let nuv = uvcands.len();
-    let cols = f.ms;
     // Each block's error for each luma and chroma strength, the blocks on
     // `threads` threads.
-    let per_block = crate::decoder::parallel_map(blocks.len(), threads.max(1), |bi| {
-        let (fr, fc) = blocks[bi];
-        let mut ysse = vec![0u64; ny];
-        let mut uvsse = vec![0u64; nuv];
-        let mut res = [0u16; 64];
-        for r in (fr * 16..(fr * 16 + 16).min(f.mi_rows)).step_by(2) {
-            for c in (fc * 16..(fc * 16 + 16).min(f.mi_cols)).step_by(2) {
-                let sk = |rr: usize, cc: usize| f.mi[rr * cols + cc].skip;
-                if sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1) {
-                    continue;
-                }
-                let (y_dir, var) = cdef_direction(f, r, c);
-                // Luma.
-                let p0 = &f.cur.planes[0];
-                let (x0, y0) = (c * MI_SIZE, r * MI_SIZE);
-                let xlim = f.mi_cols * MI_SIZE;
-                let ylim = f.mi_rows * MI_SIZE;
-                for (k, &(pri, s)) in ycands.iter().enumerate() {
-                    let mut pri_str = (pri as i32) << coeff_shift;
-                    let sec_str = sec(s) << coeff_shift;
-                    let dir = if pri_str == 0 { 0 } else { y_dir };
-                    let var_str = if (var >> 6) != 0 {
-                        (crate::bits::floor_log2((var >> 6) as u32) as i32).min(12)
-                    } else {
-                        0
-                    };
-                    pri_str = if var != 0 {
-                        (pri_str * (4 + var_str) + 8) >> 4
-                    } else {
-                        0
-                    };
-                    let d = damping + coeff_shift as i32;
-                    cdef_filter_block(
-                        p0,
-                        x0,
-                        y0,
-                        8,
-                        8,
-                        xlim,
-                        ylim,
-                        pri_str,
-                        sec_str,
-                        d,
-                        dir,
-                        coeff_shift,
-                        &mut res,
-                    );
-                    ysse[k] += block_sse(&res, 8, 8, &src[0], stride[0], x0, y0, f, 0);
-                }
-                // Chroma.
-                if f.num_planes > 1 {
-                    let (w, h) = (8 >> f.ssx, 8 >> f.ssy);
-                    let (cx0, cy0) = (x0 >> f.ssx, y0 >> f.ssy);
-                    let cxlim = xlim >> f.ssx;
-                    let cylim = ylim >> f.ssy;
-                    for (k, &(pri, s)) in uvcands.iter().enumerate() {
-                        let pri_str = (pri as i32) << coeff_shift;
-                        let sec_str = sec(s) << coeff_shift;
-                        let dir = if pri_str == 0 {
-                            0
-                        } else {
-                            CDEF_UV_DIR[f.ssx][f.ssy][y_dir]
-                        };
-                        let d = damping + coeff_shift as i32 - 1;
-                        let mut total = 0;
-                        for p in 1..3 {
-                            cdef_filter_block(
-                                &f.cur.planes[p],
-                                cx0,
-                                cy0,
-                                w,
-                                h,
-                                cxlim,
-                                cylim,
-                                pri_str,
-                                sec_str,
-                                d,
-                                dir,
-                                coeff_shift,
-                                &mut res,
-                            );
-                            total += block_sse(&res, w, h, &src[p], stride[p], cx0, cy0, f, p);
-                        }
-                        uvsse[k] += total;
-                    }
+    let measure = |bis: &[usize], yc: &[(u32, u32)], uvc: &[(u32, u32)]| {
+        crate::decoder::parallel_map(bis.len(), threads.max(1), |i| {
+            measure_block(
+                f,
+                src,
+                stride,
+                blocks[bis[i]],
+                yc,
+                uvc,
+                damping,
+                coeff_shift,
+            )
+        })
+    };
+    let all: Vec<usize> = (0..blocks.len()).collect();
+    let (ycands, uvcands, per_block) = if fast && blocks.len() >= 8 {
+        // Two stages: every strength on a quarter of the blocks, then the
+        // strengths those chose most often (and off) on the rest.
+        let sample: Vec<usize> = all.iter().copied().filter(|b| b % 4 == 0).collect();
+        let first = measure(&sample, &ycands, &uvcands);
+        let keep = |n: usize, k: usize, rows: Vec<&[u64]>| -> Vec<usize> {
+            let mut wins = vec![(0u32, 0u64); n];
+            for v in rows {
+                let best = (0..n).min_by_key(|&c| v[c]).unwrap_or(0);
+                wins[best].0 += 1;
+                for (c, w) in wins.iter_mut().enumerate() {
+                    w.1 += v[c];
                 }
             }
+            let mut order: Vec<usize> = (1..n).collect();
+            order.sort_by(|&a, &b| wins[b].0.cmp(&wins[a].0).then(wins[a].1.cmp(&wins[b].1)));
+            let mut out = vec![0];
+            out.extend(order.into_iter().take(k - 1));
+            out.sort_unstable();
+            out
+        };
+        let yk = keep(
+            ycands.len(),
+            FAST_Y,
+            first.iter().map(|b| &b.0[..]).collect(),
+        );
+        let uvk = keep(
+            uvcands.len(),
+            FAST_UV,
+            first.iter().map(|b| &b.1[..]).collect(),
+        );
+        let yc: Vec<(u32, u32)> = yk.iter().map(|&k| ycands[k]).collect();
+        let uvc: Vec<(u32, u32)> = uvk.iter().map(|&k| uvcands[k]).collect();
+        let rest: Vec<usize> = all.iter().copied().filter(|b| b % 4 != 0).collect();
+        let second = measure(&rest, &yc, &uvc);
+        let mut per_block = vec![(Vec::new(), Vec::new()); blocks.len()];
+        for (i, &b) in sample.iter().enumerate() {
+            per_block[b] = (
+                yk.iter().map(|&k| first[i].0[k]).collect(),
+                uvk.iter().map(|&k| first[i].1[k]).collect(),
+            );
         }
-        (ysse, uvsse)
-    });
+        for (i, &b) in rest.iter().enumerate() {
+            per_block[b] = second[i].clone();
+        }
+        (yc, uvc, per_block)
+    } else {
+        let per_block = measure(&all, &ycands, &uvcands);
+        (ycands, uvcands, per_block)
+    };
+    let ny = ycands.len();
+    let nuv = uvcands.len();
     let ysse: Vec<u64> = per_block.iter().flat_map(|b| b.0.iter().copied()).collect();
     let uvsse: Vec<u64> = per_block.iter().flat_map(|b| b.1.iter().copied()).collect();
     // Greedy choice of up to 2^bits (luma, chroma) pairs, for each bits.
@@ -250,6 +230,110 @@ pub(crate) fn search(
         },
         table,
     )
+}
+
+/// One 64x64 block's (`(fr, fc)`) error for each luma and each chroma
+/// strength in `ycands` and `uvcands`.
+#[allow(clippy::too_many_arguments)]
+fn measure_block(
+    f: &FrameCtx,
+    src: &[Vec<u16>],
+    stride: &[usize],
+    (fr, fc): (usize, usize),
+    ycands: &[(u32, u32)],
+    uvcands: &[(u32, u32)],
+    damping: i32,
+    coeff_shift: u32,
+) -> (Vec<u64>, Vec<u64>) {
+    let (ny, nuv) = (ycands.len(), uvcands.len());
+    let cols = f.ms;
+    let mut ysse = vec![0u64; ny];
+    let mut uvsse = vec![0u64; nuv];
+    let mut res = [0u16; 64];
+    for r in (fr * 16..(fr * 16 + 16).min(f.mi_rows)).step_by(2) {
+        for c in (fc * 16..(fc * 16 + 16).min(f.mi_cols)).step_by(2) {
+            let sk = |rr: usize, cc: usize| f.mi[rr * cols + cc].skip;
+            if sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1) {
+                continue;
+            }
+            let (y_dir, var) = cdef_direction(f, r, c);
+            // Luma.
+            let p0 = &f.cur.planes[0];
+            let (x0, y0) = (c * MI_SIZE, r * MI_SIZE);
+            let xlim = f.mi_cols * MI_SIZE;
+            let ylim = f.mi_rows * MI_SIZE;
+            for (k, &(pri, s)) in ycands.iter().enumerate() {
+                let mut pri_str = (pri as i32) << coeff_shift;
+                let sec_str = sec(s) << coeff_shift;
+                let dir = if pri_str == 0 { 0 } else { y_dir };
+                let var_str = if (var >> 6) != 0 {
+                    (crate::bits::floor_log2((var >> 6) as u32) as i32).min(12)
+                } else {
+                    0
+                };
+                pri_str = if var != 0 {
+                    (pri_str * (4 + var_str) + 8) >> 4
+                } else {
+                    0
+                };
+                let d = damping + coeff_shift as i32;
+                cdef_filter_block(
+                    p0,
+                    x0,
+                    y0,
+                    8,
+                    8,
+                    xlim,
+                    ylim,
+                    pri_str,
+                    sec_str,
+                    d,
+                    dir,
+                    coeff_shift,
+                    &mut res,
+                );
+                ysse[k] += block_sse(&res, 8, 8, &src[0], stride[0], x0, y0, f, 0);
+            }
+            // Chroma.
+            if f.num_planes > 1 {
+                let (w, h) = (8 >> f.ssx, 8 >> f.ssy);
+                let (cx0, cy0) = (x0 >> f.ssx, y0 >> f.ssy);
+                let cxlim = xlim >> f.ssx;
+                let cylim = ylim >> f.ssy;
+                for (k, &(pri, s)) in uvcands.iter().enumerate() {
+                    let pri_str = (pri as i32) << coeff_shift;
+                    let sec_str = sec(s) << coeff_shift;
+                    let dir = if pri_str == 0 {
+                        0
+                    } else {
+                        CDEF_UV_DIR[f.ssx][f.ssy][y_dir]
+                    };
+                    let d = damping + coeff_shift as i32 - 1;
+                    let mut total = 0;
+                    for p in 1..3 {
+                        cdef_filter_block(
+                            &f.cur.planes[p],
+                            cx0,
+                            cy0,
+                            w,
+                            h,
+                            cxlim,
+                            cylim,
+                            pri_str,
+                            sec_str,
+                            d,
+                            dir,
+                            coeff_shift,
+                            &mut res,
+                        );
+                        total += block_sse(&res, w, h, &src[p], stride[p], cx0, cy0, f, p);
+                    }
+                    uvsse[k] += total;
+                }
+            }
+        }
+    }
+    (ysse, uvsse)
 }
 
 /// The damping a quantiser gets: stronger filtering at coarser ones.

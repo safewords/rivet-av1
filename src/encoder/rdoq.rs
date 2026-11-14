@@ -147,8 +147,8 @@ impl TileDecoder<'_, '_> {
         let dc_sign_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
         let e = self.enc.as_ref().expect("encode mode");
         // Squared error per 1/256 bit, a chroma plane's error weighing
-        // more (`rdo::CHROMA_WEIGHT`, in quarters).
-        let lambda = e.rd_lambda / 64.0 / crate::encoder::rdo::CHROMA_WEIGHT[plane] as f64;
+        // more (`Tools::chroma_weight`, in quarters).
+        let lambda = e.rd_lambda / 64.0 / e.tools.plane_weight(plane) as f64;
         let gain = energy(tx_sz, tx_type);
         let cdf = &self.cdf;
         let base_cdfs = &cdf.coeff_base[tx_sz_ctx][ptype];

@@ -72,11 +72,6 @@ frame is; `Decoder::tile_list_layout` says where each tile is.
 
 Not there yet:
 
-- **Speed 4 at rav1e's speed**: 4.4x its time on one thread (speed 6
-  1.09x, speed 8 0.71x; above). What is left there is the search itself —
-  four references searched exhaustively, every sub-sample candidate
-  predicted with the normative filters — which only a search that tries
-  less would change.
 - **Tile lists in flight**: a tile list is decoded in place, not by a
   decoder with frames in flight (`queue`).
 - **A frame-buffer pool for `CurrFrame`.** The copies the post-filters
@@ -294,11 +289,13 @@ them:
   is then coded again, replaying the first pass's decisions): the **loop
   filter** levels (per plane), **CDEF** (each candidate strength applied
   with the decoder's own filter, eight (luma, chroma) pairs chosen greedily
-  against the cost of signalling them, each 64x64 block taking its best)
-  and **loop restoration** (speeds 0 to 3; per unit: a Wiener filter
-  fitted to the source by least squares, or a self-guided filter with
-  fitted projection weights, or none; measured with the decoder's own
-  restoration).
+  against the cost of signalling them, each 64x64 block taking its best;
+  from speed 4 every strength is measured on a quarter of the blocks, and
+  on the rest only the ten luma and six chroma strengths those chose most
+  often) and **loop restoration** (speeds 0 to 6; per unit: a Wiener
+  filter fitted to the source by least squares, or, to speed 3, a
+  self-guided filter with fitted projection weights, or none; measured
+  with the decoder's own restoration).
 - **Quantiser**: fixed (`Config::quantizer`, the `base_q_idx` 1–255 of
   plain inter frames, and in a group the middle of its pyramid, each frame
   offset from it by its role as above), or **average-bitrate rate
@@ -966,6 +963,70 @@ trials in inter frames (`uv_trials_inter`), −0.05 % PSNR-YUV; the
 quarters of a split 16x16 block searching only the block whole's
 references (as the halves do), +0.3 % for no time saved.
 
+**What splitting is worth, and the filters.** The search was first made
+to try every split (no thresholds, flat blocks too) and to log, for each
+block of 16x16 to 64x64 in the inter frames, what its whole coding chose
+and what the split gained and cost (speed 6, the five clips at
+quantisers 96 and 160, 630 000 decisions). The thresholds as they were
+keep 95 % to 98 % of the gain at every size outside the top layers for
+55 % to 79 % of the split trials' time; the blocks whose whole coding
+skipped the residual hold 4 % of the 16x16 blocks' gain and 37 % of
+their split time; splitting everything is worth −0.94 % (−0.66 %) for
+1.22x the time. A cheaper split decision has little left to find in
+this search: under 1 %. The other way round, the 64x64 blocks' whole
+trial is a fifth of the search's time, and when it chose split
+transforms the split won 99.7 % of the time; but deciding without it
+lost: trying the split first and the whole only when the quarters stayed
+whole +1.0 % (+1.0 %), the whole with one inter candidate and no inter
+tools or transform depths +1.0 % (+0.9 %), each for about 0.8x the
+time. The halves of 16x16 blocks (speed 4) tried only when the whole
+chose split transforms or intra: +1.3 % (+1.3 %), for 0.88x — the halves
+win as often in blocks of one transform.
+
+So the time came from the filter searches instead, and was spent on loop
+restoration (which earlier tiers had left out at speeds 4 to 8 for its
+time). Each change against the encoder before it, BD-rate PSNR-Y
+(PSNR-YUV), the five clips, 30 frames, quantisers 64 to 192; times one
+encode at a time, interleaved, at quantisers 96 and 160:
+
+| change | where | BD-rate | time |
+|---|---|---|---|
+| the CDEF search in two stages: every strength on every fourth 64x64 block, then on the rest the ten luma and six chroma strengths those chose most often (`Tools::cdef_fast`) | speeds 4; 6; 8 | −0.04 % (−0.05 %); +0.07 % (+0.07 %); +0.16 % (+0.14 %) | 0.97x |
+| U weighed 2, not 1.5 (`Tools::chroma_weight`; U 2.5: +1.2 % (−0.2 %); U 3 and V 4: +2.1 % (−0.2 %); V 4: +0.6 % (+0.1 %); V 2.5: ±0 (+0.4 %)) | speeds 4; 6; 8 | +0.6 %, +0.6 %, +0.4 % (−0.3 %, −0.3 %, −0.4 %) | ±0 |
+| loop restoration, the Wiener filter alone (`Tools::restoration_sgr` off; with the self-guided filters' two sets, −0.87 % (−0.73 %) at speed 4 for twice the time) | speeds 4; 6 | −0.89 % (−0.75 %); −0.83 % (−0.71 %) | 1.02x; 1.03x |
+| … at speed 6 the chroma levels of the inter frames' trials by the dead zone again (`rdoq_uv` 1, not 2) | speed 6 | +0.01 % (+0.00 %) | 0.975x |
+
+Against rav1e 0.8.1 (BD-rate PSNR-Y (PSNR-YUV); CPU time of the five
+clips at all five quantisers, one encode at a time, rav1e, develop at
+0cff2e2 and this interleaved, the best of two rounds):
+
+| speed | develop | this | develop's time / rav1e | this time / rav1e |
+|---|---|---|---|---|
+| 4 | −3.88 % (+1.46 %) | **−4.22 %** (+0.27 %) | 0.986x | **0.983x** |
+| 6 | −5.22 % (+0.09 %) | **−5.38 %** (**−0.86 %**) | 1.016x | **0.982x** |
+| 8 | −5.12 % (−0.02 %) | **−4.67 %** (**−0.37 %**) | 1.016x | **0.973x** |
+
+Per clip, PSNR-Y (PSNR-YUV) at speeds 4 / 6 / 8: foreman +5.4 % (+7.6 %)
+/ +3.5 % (+6.3 %) / +3.0 % (+5.9 %), mobile −13.2 % (−6.5 %) / −13.1 %
+(−6.9 %) / −9.0 % (−4.3 %), akiyo +1.2 % (+3.5 %) / −0.5 % (+1.6 %) /
+−2.2 % (−0.1 %), ducks_take_off −9.8 % (−3.0 %) / −11.2 % (−4.0 %) /
+−9.5 % (−2.2 %), park_joy −4.7 % (−0.3 %) / −5.7 % (−1.3 %) / −5.6 %
+(−1.3 %).
+
+At speeds 6 and 8 that is parity on both measures under rav1e's time.
+Speed 4 is 0.3 % behind in PSNR-YUV. Measured there and left out: the
+32x32 blocks halved as well, −1.4 % (−1.4 %) against the encoder before
+restoration, and halved only outside the top layers (`rect_max_top`),
+with restoration only outside them too and four transform types, −5.4 %
+(−1.0 %) against rav1e, but for 1.19x rav1e's time; restoration outside
+the top layers alone (three quarters of the gain for half its time),
++0.2 % (+0.1 %); four transform types, +0.1 % (+0.1 %); two chroma
+trials, +0.2 % (±0); the small blocks' split threshold at 0.5, +0.1 %
+(+0.1 %); two inter candidates, +1.8 % (+1.8 %); no transform type
+search, +1.4 % (+1.3 %). At speed 8 restoration outside the top layers
+would gain −0.6 % (−0.4 %) for about 1.02x, which its 0.973x does not
+quite leave room for at a margin worth having.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -1034,6 +1095,35 @@ frame of its first group coded again). With constant quantisers nothing
 changes (`av1_rdcurve` on the five clips at
 speeds 4, 6 and 8: the same bytes and PSNR at every point).
 
+**The groups nothing repays.** A group that overspends is repaid by the
+groups after it, but the clip's last group has none after it, and the
+first group of a short clip or a segment has few. `tests/encode.rs`
+codes 24 frames (a key frame, a group of 16, one of 7) of natural video
+and of the same under fresh noise, and its noisy clip at 8000 bits a
+frame came out at 1.00x to 1.09x of its rate by the search settings
+alone (speeds 4 to 8, the small blocks' split threshold from 0.25 to 2.0
+lambda): in the last group the plan fell after the alt-ref frame came in
+under its prediction, and the layer-1 frame, planned finer than the two
+frames it is predicted from, coded their noise again, 31.7 kbit for a
+predicted 6.2 kbit. The rule that codes such a frame again, coarser,
+asked for four frames' shares, and it cost 3.96. Planning no frame of a
+group finer than the frames it refers to does not help (a frame at its
+references' quantiser codes the noise as well, and the plan, its frames
+held up, falls further: noisy first groups at up to 1.13x). Now in the clip's
+last group and in the group planned with a key frame, a frame that
+costs twice its prediction and leaves less than a tenth of what the
+group had left is coded again from one share up. Over 19 search
+settings at speeds 4 to 8, four cases each, every first group lands at
+0.998x to 1.010x and every clip at 0.981x to 1.013x (speed 3: 0.96x to
+1.02x), and the test now runs at speeds 4, 6 and 8 and at speed 4 with
+the threshold at 0.5 and 1.0. Coding such a frame again from one share
+with half of what was left (not a tenth) undershot short 720p clips by
+up to 7.7 %: the model's slope, which picks the coarser quantiser,
+overshoots where a frame's cost falls off a cliff. On the short clips
+of the table above every first group is as it was, and seven clips
+move, all within 5 % (foreman at 1000 kb/s in 24 frames from +3.7 % to
+−1.6 %, ducks_take_off at 1000 kb/s from +1.7 % and +1.0 % to −4.2 %).
+
 Not there yet:
 
 - **Groups that follow the content**: a group is 16 frames whatever the
@@ -1042,14 +1132,14 @@ Not there yet:
   it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
   clips: above). No temporal filtering of the alt-ref frames (built,
   measured at ±0, left out: above).
-- **PSNR-YUV at rav1e's time**: at parity at speeds 6 and 8 (+0.1 % and
-  −0.0 %, at 1.015x its time), 1.5 % behind at speed 4 (PSNR-Y 4 % to
-  5 % ahead). foreman trails at every tier (+2.6 % to +6.0 % PSNR-Y,
-  +6.7 % to +9.6 % PSNR-YUV, mostly V), and akiyo in PSNR-YUV: rav1e's
-  inter frames code smaller blocks, each with one transform, where
-  rivet-av1 splits transforms (above); its split thresholds are what
-  hold the time, and a cheaper way to decide when to split would be
-  worth more than they are.
+- **PSNR-YUV at rav1e's time at speed 4**: 0.3 % behind (PSNR-Y 4.2 %
+  ahead; speeds 6 and 8 at parity on both, under rav1e's time: above).
+  The 32x32 blocks' halves would close it, for 1.19x rav1e's time.
+  foreman trails at every tier (+3.0 % to +5.4 % PSNR-Y, +5.9 % to
+  +7.6 % PSNR-YUV, mostly V), and akiyo in PSNR-YUV at speed 4. rav1e's
+  inter frames code smaller blocks, each with one transform, but in this
+  search splitting every block is worth under 1 % (above): what is left
+  of foreman's gap is not in the split decision.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock), −0.2 % to +0.2 % on the

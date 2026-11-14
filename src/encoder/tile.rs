@@ -492,7 +492,7 @@ impl TileDecoder<'_, '_> {
 
     /// The chroma intra modes but chroma from luma, best first, for a block
     /// whose luma mode is `y_mode`: by the SATD of each plane's prediction,
-    /// weighted by the square root of the plane's `rdo::CHROMA_WEIGHT` (a
+    /// weighted by the square root of the plane's `Tools::chroma_weight` (a
     /// weight on squared error is its square root on the error), plus the
     /// mode's rate under the CDFs in force. With `Tools::angle_delta_uv`,
     /// the best two directional modes are ranked at their other angles too.
@@ -501,7 +501,8 @@ impl TileDecoder<'_, '_> {
         let lambda = self.enc().lambda;
         let ms = self.b.mi_size;
         let cfl_allowed = !self.b.lossless && block_width(ms).max(block_height(ms)) <= 32;
-        let w = crate::encoder::rdo::CHROMA_WEIGHT.map(|q| (q as f64 / 4.0).sqrt());
+        let tools = self.enc().tools;
+        let w = [0, 1, 2].map(|p| (tools.plane_weight(p) as f64 / 4.0).sqrt());
         let deltas = self.enc().tools.angle_delta_uv && ms >= BLOCK_8X8 && !self.b.lossless;
         let cost_of = |t: &mut Self, m: usize, d: i32| -> f64 {
             t.b.uv_mode = m;

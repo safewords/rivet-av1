@@ -281,7 +281,7 @@ impl TileDecoder<'_, '_> {
 
     /// Sum of squared differences between the source and the
     /// reconstruction over a luma 4x4 rectangle (and the chroma it covers),
-    /// inside the frame, each plane's weighted by [`CHROMA_WEIGHT`].
+    /// inside the frame, each plane's weighted by `Tools::chroma_weight`.
     pub(crate) fn rect_sse(&self, r0: usize, r1: usize, c0: usize, c1: usize) -> u64 {
         let e = self.enc.as_ref().expect("encode mode");
         let f = &*self.f;
@@ -299,7 +299,7 @@ impl TileDecoder<'_, '_> {
             for y in y0..y1 {
                 let a = &e.src[p][y * st + x0..y * st + x1.max(x0)];
                 let b = &pl.data[y * pl.stride + x0..y * pl.stride + x1.max(x0)];
-                total += (crate::dsp::enc::sse_row(a, b) * CHROMA_WEIGHT[p]) >> 2;
+                total += (crate::dsp::enc::sse_row(a, b) * e.tools.plane_weight(p)) >> 2;
             }
         }
         total
@@ -755,7 +755,9 @@ impl TileDecoder<'_, '_> {
 /// every plane alike: U 1.5 and V 3 cost +2.0 % BD-rate PSNR-Y for −3.2 %
 /// PSNR-YUV; U and V 2, +2.3 % for −3.1 %; U and V 3, +4.0 % for −3.6 %.
 /// V weighs more than U because its error is usually the smaller (by
-/// about two in these clips, from 1.0 to 2.6).
+/// about two in these clips, from 1.0 to 2.6). The default of
+/// `Tools::chroma_weight`; at speeds 4 to 8, U 2 (8): −0.3 % PSNR-YUV for
+/// +0.6 % PSNR-Y (U 2.5, −0.2 %; V 2.5 or 4, worse).
 pub(crate) const CHROMA_WEIGHT: [u64; 3] = [4, 6, 12];
 
 /// The deepest `tx_depth` the syntax codes.
