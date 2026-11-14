@@ -772,9 +772,9 @@ at speeds 0 to 8, with distance-weighted compound and inter-intra to speed
 than they do. Against the encoder before them (same clips, BD-rate
 PSNR-Y / PSNR-YUV; time interleaved, every clip, all five quantisers):
 
-| speed | BD-rate | time | against rav1e, before | against rav1e, after | time against rav1e |
+| speed | BD-rate | time | against rav1e, before | against rav1e, after | time against rav1e (from the table above times this one's) |
 |---|---|---|---|---|---|
-| 4 | @S4BD@ | @S4T@ | −9.3 % / −3.7 % | @S4R@ | @S4RT@ |
+| 4 | −3.03 % / −2.93 % | 1.11x | −9.3 % / −3.7 % | −12.1 % / −6.6 % | 4.9x |
 | 6 | −2.12 % / −2.09 % | 1.05x | −0.1 % / +6.5 % | −2.3 % / +4.2 % | 1.14x |
 | 8 | −3.58 % / −3.22 % | 1.13x | +14.0 % / +17.9 % | +9.5 % / +13.6 % | 0.80x |
 
