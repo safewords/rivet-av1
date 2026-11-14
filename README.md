@@ -141,11 +141,17 @@ Frames are still decoded one after another; no frame-parallel decoding.
 
 ## What it encodes
 
-Profile 0 (8- or 10-bit 4:2:0, or monochrome with `Config::monochrome` —
-as an AVIF alpha plane is coded), one temporal unit per frame shown (in
-alt-ref groups frames are coded out of display order, some hidden and shown
-later), any size from 1x1 up (frames wider than 4096 are coded in the tile
-columns they need):
+Profiles 0, 1 and 2 — 4:2:0, 4:2:2, 4:4:4 and monochrome
+(`Config::chroma`; `Config::monochrome` as an AVIF alpha plane is coded),
+8, 10 and 12 bits, the profile following from the two (4:2:0 and
+monochrome at 8 and 10 bits profile 0, 4:4:4 profile 1, 4:2:2 and anything
+at 12 bits profile 2; RGB, the identity matrix, with 4:4:4) — one temporal
+unit per frame shown (in alt-ref groups frames are coded out of display
+order, some hidden and shown later), any size from 1x1 up (frames wider
+than 4096 are coded in the tile columns they need). [`av1::y4m`](src/y4m.rs)
+reads and writes Y4M in each of these formats (`C420`, `C422`, `C444`,
+`Cmono`, with `p10` / `p12`, `mono10` / `mono12`), and the examples take
+them:
 
 - **Rate-distortion search** (`encoder::rdo`). Every decision — the
   partition of each block (none, horizontal, vertical, split; 4x4 at the
@@ -173,8 +179,17 @@ columns they need):
   and the types searched only at the best depth.
 - **Intra**: all the directional and smooth modes, Paeth; **chroma from
   luma** (alphas fitted to the source); **palettes** (up to eight colours,
-  their indices coded in the normative wavefront order) on frames that look
-  like screen content.
+  their indices coded in the normative wavefront order) and **intra block
+  copy** (`Tools::intrabc`, speeds 0 to 8) on frames that look like screen
+  content; **filter intra** (`Tools::filter_intra`, off: below). Intra
+  block copy, in key frames: a block of 8x8 or more copied from earlier in
+  the frame, from where the stack's vectors point or where its source
+  appears again exactly (a hash of the source's 8x8 blocks at every
+  position, the nearest matches first), each vector held to the
+  specification's `is_mv_valid` (and, in the wavefront search, to what the
+  wavefront has reconstructed); such a frame codes no in-loop filters.
+  Filter intra: the five recursive filters of `DC_PRED` blocks of 32x32 or
+  less ranked with the other modes by SATD and rate.
 - **Alt-ref groups** (`Config::altref`, 16 frames by default; speeds 0 to
   8, `encoder::gop`): the frames are coded in a pyramid. The last frame of
   a group first, hidden (`show_frame` = 0), then the frame half way to it,
@@ -257,6 +272,37 @@ columns they need):
 - **Key frames on demand**: `Encoder::force_keyframe()` makes the next frame
   a key frame (with its sequence header, so a decoder can start there)
   without resetting the encoder; the interval restarts from it.
+- **Lossless**: `Config::quantizer` 0 (without rate control) codes every
+  frame at quantiser index 0 — every residual through the Walsh-Hadamard
+  transform, the frame header without loop filter, CDEF, restoration or
+  transform mode — and every frame decodes to the source, sample for
+  sample, in every format above. The forward Walsh-Hadamard transform is
+  the exact inverse of the specification's inverse (a chain of lifting
+  steps, undone in reverse), held to it at 8, 10 and 12 bits; the search
+  then minimises bits alone. foreman (352x288, 4 frames, speed 6) codes in
+  37 % of its raw size.
+- **Film grain** (`Config::film_grain`, off by default; `encoder::grain`):
+  each frame is denoised before it is coded and the grain taken out is
+  signalled (`film_grain_params`) for the decoder's synthesis to put back.
+  The noise is measured per plane on 16x16 blocks, about each block's own
+  plane fit or, where that is clearly less, in its difference from the
+  frame before (grain is fresh every frame, so where the picture holds
+  still that difference is noise and texture cancels): its strength by
+  intensity (the flat blocks' in each bin) becomes the scaling points, its
+  correlation, fitted by least squares, the lag-3 auto-regressive filter,
+  and the scaling is set so that the synthesis's grain for those
+  coefficients (measured by running the same filter on white noise) has the
+  measured strength. An adaptive local Wiener filter (5x5, by the noise
+  at each intensity) denoises. The reconstruction, and what a decoder
+  outputs, carries the synthesised grain. On akiyo and foreman with
+  synthetic grain added (correlated Gaussian noise of strength 3.2, fresh
+  every frame, stronger in the mid-tones; 30 frames, speed 6): 30 % and
+  24 % fewer bytes at quantiser 80, 6.5 % and 9.7 % at 140; the synthesised
+  grain's strength 2.6 and 3.8 (luma standard deviation, libdav1d's output
+  with grain against without); the picture under the grain 1.1 dB (akiyo)
+  and 0.0 dB closer to the clean clip than the same frames coded with their
+  grain at 80. PSNR against the grainy source falls, as it must: the grain
+  synthesised is not the source's.
 - The arithmetic encoder is the exact inverse of the decoder's symbol
   decoder (derived from 8.2.6).
 
@@ -519,6 +565,25 @@ chroma delta-q growing with each frame's quantiser (U and V together, −8 %
 or −16 % of the frame's quantiser index) trades as it does without
 groups: +1.0 % PSNR-Y for −0.6 % PSNR-YUV, +2.1 % for −0.9 %.
 
+**Filter intra and intra block copy**, each against the encoder without
+it (BD-rate PSNR-Y / PSNR-YUV; times one encode at a time, interleaved,
+best of two or three, quantiser 128):
+
+| tool | speed 4 | speed 6 | speed 8 |
+|---|---|---|---|
+| filter intra, the five clips | −0.13 % / −0.09 %, 1.13x to 1.21x the time | −0.20 % / −0.23 %, 1.05x to 1.18x | −0.24 % / −0.12 %, 1.03x to 1.09x |
+| … in key frames only | | −0.07 % / −0.09 % | +0.02 % / +0.12 % |
+| intra block copy, the five clips | ±0 (the same streams: no frame looks like screen content) | ±0 | ±0 |
+| intra block copy, a screen-content clip (key frame, 29 inter frames) | −6.7 % / −6.6 % | −4.6 % / −4.6 % | −4.0 % / −4.2 % |
+| … all key frames (10) | −11.9 % / −13.0 % | −3.4 % / −6.4 % | −3.2 % / −5.9 % |
+| … time on that clip | 0.89x | 0.92x | 1.01x |
+
+The screen-content clip is synthetic (640x360, 30 frames: a code editor
+of coloured text in a made-up bitmap font scrolling, a panel of buttons, a
+gradient image, a moving pointer). Intra block copy is on at every speed
+that searches; filter intra, which gains a fifth of a percent for 5 % to
+20 % more time — less than a slower speed gains for it — is off.
+
 Rate control, `examples/av1_ratetest.rs`: 10-second clips (300 frames,
 640x360, a key frame every 240) of a still frame, a fast pan, a clip with
 fresh noise in every frame and a different scene every second, at 100,
@@ -555,11 +620,16 @@ Not there yet:
   zero. Finer chroma alone trades PSNR-Y for PSNR-YUV (above); it may pay
   together with a quantiser hierarchy, which changes what each frame's
   chroma is worth to the frames after it.
-- Filter intra, intra block copy, OBMC and warped motion, wedge /
-  difference-weighted compound, inter-intra, switchable interpolation
-  filters, film grain parameters.
-- **Profiles 1 and 2**, 12-bit, monochrome; lossless (quantiser 0 needs the
-  forward Walsh-Hadamard transform).
+- OBMC and warped motion, wedge / difference-weighted compound,
+  inter-intra, switchable interpolation filters.
+- **Film grain from a temporal denoiser**: the denoiser is spatial (it
+  leaves part of a coarse grain in the picture coded), the strength of the
+  grain is measured to within about 20 % (above), and every frame codes its
+  parameters afresh (`update_grain` 1) where an unchanged set could be
+  taken from a reference frame for a few bits.
+- **Intra block copy for blocks under 8x8**, and copies that are not exact
+  (the search finds where a block's source appears again exactly, and the
+  stack's vectors).
 - **Lookahead**: rate control plans from the frames already coded and,
   in groups, the group's sources (a still scene undershoots high rates: it
   cannot use the bits).
@@ -614,9 +684,15 @@ Not there yet:
   with the padding check on, equals the encoder's reconstruction exactly —
   key frames at several quantisers, inter frames, 10-bit, sizes from 1x1,
   several tile columns coded in parallel (the same stream as in turn), HDR
-  signalling, forced key frames; PSNR falls and size falls as the quantiser rises;
-  inter frames cost less than the key frame; rate control lands near its
-  target.
+  signalling, forced key frames, 4:4:4, 4:2:2, 12-bit and monochrome,
+  lossless (every frame the source, sample for sample), filter intra,
+  intra block copy, film grain (the synthesised grain about as strong as
+  the grain the source had); PSNR falls and size falls as the quantiser
+  rises; inter frames cost less than the key frame; rate control lands
+  near its target. The formats and tools were also decoded by libdav1d
+  (through FFmpeg, as a black box) to the same output as this crate's
+  decoder, sample for sample, at speeds 4, 6 and 8 (not part of the
+  tests).
 - **Malformed input** (`tests/fuzz.rs`, proptest): arbitrary bytes, and the
   committed vectors with bits flipped, bytes cut and garbage spliced in,
   decoded in debug builds (overflow checks on) — errors, never a panic.

@@ -186,13 +186,21 @@ pub struct Tools {
     pub palette: bool,
     /// Filter intra (`enable_filter_intra`): the five recursive filter
     /// predictors of `DC_PRED` luma blocks of 32x32 or less ranked with the
-    /// other intra modes by SATD, the best trialled with them.
+    /// other intra modes by SATD, the best trialled with them. Off at every
+    /// speed: on the five test clips −0.13 %, −0.20 % and −0.24 % BD-rate
+    /// PSNR-Y at speeds 4, 6 and 8 for about 5 % to 15 % more time (the
+    /// five filtered predictions of every small block); in key frames only,
+    /// ±0.
     pub filter_intra: bool,
     /// Intra block copy (`allow_intrabc`) in key frames that look like
     /// screen content (as palettes are offered): blocks of 8x8 or more
     /// copied from earlier in the frame, where their source appears again
     /// (found by hashing the source's 8x8 blocks) or where the stack's
-    /// vectors point. Such a frame codes no in-loop filters.
+    /// vectors point. Such a frame codes no in-loop filters. On where the
+    /// search runs (speeds 0 to 8): on a synthetic screen-content clip
+    /// −4.0 % to −6.7 % BD-rate at speeds 4 to 8 (−3 % to −12 % all key
+    /// frames) for no more time; natural content is not screen content,
+    /// and its streams are unchanged.
     pub intrabc: bool,
     /// Motion search by descending square steps from the best of the
     /// predicted, neighbouring and zero vectors (else an exhaustive window
@@ -284,7 +292,7 @@ impl Tools {
             compound: s <= 5,
             palette: s <= 8,
             filter_intra: false,
-            intrabc: false,
+            intrabc: s <= 8,
             fast_me: s >= 5,
             fast_tx_refine: s >= 5,
             restoration_fast: s >= 5,
