@@ -499,6 +499,10 @@ struct Pipe {
     threads: usize,
 }
 
+/// Work that is not a frame's (a tile list's, `lst.rs`): one task, once
+/// the frames it needs are parsed.
+pub(crate) type Work = Box<dyn FnOnce() -> crate::Result<()> + Send>;
+
 /// A frame in flight.
 pub(crate) struct Job {
     id: u64,
@@ -516,6 +520,9 @@ pub(crate) struct Job {
     samples: u64,
     input: Mutex<Option<Input>>,
     pipe: OnceLock<Pipe>,
+    /// For a job that is not a frame: its work, run as its parsing task.
+    work: Mutex<Option<Work>>,
+    is_work: bool,
 }
 
 impl Job {
@@ -551,6 +558,41 @@ impl Job {
             out,
             input: Mutex::new(Some(input)),
             pipe: OnceLock::new(),
+            work: Mutex::new(None),
+            is_work: false,
+        }
+    }
+
+    /// A job of `work` (of about `samples` luma samples), started once the
+    /// frames `needs` are parsed; complete when it has run.
+    pub(crate) fn work(needs: Vec<Arc<RefData>>, samples: u64, work: Work) -> Self {
+        Job {
+            id: 0,
+            refs: Default::default(),
+            parse_needs: needs,
+            predict_needs: Vec::new(),
+            out: Arc::new(RefData {
+                frame_type: 0,
+                upscaled_width: 0,
+                frame_height: 0,
+                render_width: 0,
+                render_height: 0,
+                mi_rows: 0,
+                mi_cols: 0,
+                bit_depth: 8,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                order_hint: 0,
+                saved_order_hints: [0; 8],
+                syntax: OnceLock::new(),
+                frame: OnceLock::new(),
+                pool: None,
+            }),
+            samples,
+            input: Mutex::new(None),
+            pipe: OnceLock::new(),
+            work: Mutex::new(Some(work)),
+            is_work: true,
         }
     }
 
@@ -1130,6 +1172,10 @@ impl Inner {
                 id: job.id,
             };
             let outcome = match task {
+                Task::Parse if job.is_work => {
+                    let work = job.work.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    work.expect("a job's work runs once")()
+                }
                 Task::Parse => self.parse(&job),
                 Task::Reconstruct(r) => {
                     let i = local.frame(&job);
@@ -1162,6 +1208,10 @@ impl Inner {
             let failed = outcome.is_err();
             if !failed && let Some(rows) = &mut e.rows {
                 rows.finish(task);
+            }
+            if job.is_work && !failed && !e.abort {
+                // Work done is a job complete.
+                e.done = true;
             }
             let complete =
                 !failed && !e.abort && !e.finishing && e.rows.as_ref().is_some_and(Rows::complete);
@@ -1624,6 +1674,7 @@ impl FrameCtx {
             mask: Box::new([0; 128 * 128]),
             tile_num: 0,
             tiles_ok: true,
+            sbs_done: Vec::new(),
             filtered: None,
             pool: self.pool.clone(),
         }

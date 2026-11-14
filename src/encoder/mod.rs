@@ -129,6 +129,13 @@ pub struct Config {
     /// synthesised grain; it is not the source's grain, so PSNR against
     /// the source falls while the bitrate does.
     pub film_grain: bool,
+    /// Frame ids (`frame_id_numbers_present_flag`): each frame header
+    /// carries the frame's id and the id of each frame it refers to, which
+    /// lets a decoder notice that a reference frame was lost (a unit a
+    /// transport dropped) rather than predict from whatever its slot
+    /// holds. Off by default; about 17 bits a frame header, 15 more for
+    /// each reference of an inter frame.
+    pub frame_ids: bool,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -668,6 +675,7 @@ impl Config {
             monochrome: false,
             chroma: ChromaFormat::Yuv420,
             film_grain: false,
+            frame_ids: false,
         }
     }
 
@@ -921,14 +929,24 @@ impl Encoder {
             operating_points_cnt_minus_1: 0,
             operating_point_idc: vec![0],
             seq_level_idx: vec![31],
+            seq_tier: vec![0],
             decoder_model_present_for_this_op: vec![false],
+            num_units_in_display_tick: 0,
+            time_scale: 0,
+            num_ticks_per_picture: 0,
+            op: 0,
             op_idc: 0,
             frame_width_bits: w_bits,
             frame_height_bits: h_bits,
             max_frame_width: cfg.width,
             max_frame_height: cfg.height,
-            frame_id_numbers_present: false,
-            delta_frame_id_length_minus_2: 0,
+            // Frame ids of 15 bits, references up to 2^14 frames back.
+            frame_id_numbers_present: cfg.frame_ids,
+            delta_frame_id_length_minus_2: if cfg.frame_ids {
+                FRAME_ID_DELTA_BITS - 2
+            } else {
+                0
+            },
             additional_frame_id_length_minus_1: 0,
             use_128x128_superblock: false,
             enable_filter_intra: cfg.tools.filter_intra,
@@ -1403,6 +1421,9 @@ impl Encoder {
         let mut w = BitWriter::new();
         w.flag(true); // show_existing_frame
         w.f(3, slot as u32); // frame_to_show_map_idx
+        if self.seq.frame_id_numbers_present {
+            w.f(FRAME_ID_BITS, self.slot_frame_id(slot)); // display_frame_id
+        }
         // A frame header OBU ends in trailing_bits() (5.3.1), like every
         // OBU but a frame or tile group.
         w.trailing_bits();
@@ -1546,7 +1567,7 @@ impl Encoder {
             (p, f, obus) = self.code_tu(role, &src, &stride, Some(pl.qidx))?;
         }
         self.dec.shown.clear();
-        self.dec.finish_frame(f)?;
+        self.dec.finish_frame(f);
         let mut recon = self.dec.shown.pop();
         if let Some(r) = recon.as_mut() {
             // What a decoder reports after this temporal unit's metadata.
@@ -2131,6 +2152,10 @@ impl Encoder {
                 w.flag(false); // force_integer_mv
             }
         }
+        let frame_id = self.next_frame_id();
+        if seq.frame_id_numbers_present {
+            w.f(FRAME_ID_BITS, frame_id); // current_frame_id
+        }
         w.flag(false); // frame_size_override_flag
         w.f(
             seq.order_hint_bits,
@@ -2142,6 +2167,14 @@ impl Encoder {
             w.flag(false); // frame_refs_short_signaling
             for &s in &p.ref_slots {
                 w.f(3, s as u32); // ref_frame_idx
+                if seq.frame_id_numbers_present {
+                    // delta_frame_id_minus_1: how far back the frame in
+                    // the slot is.
+                    let ids = 1 << FRAME_ID_BITS;
+                    let delta = (frame_id + ids - self.slot_frame_id(s)) % ids;
+                    debug_assert!((1..=1 << FRAME_ID_DELTA_BITS).contains(&delta));
+                    w.f(FRAME_ID_DELTA_BITS, delta - 1);
+                }
             }
             // frame_size_with_refs() is not used (no override): frame_size()
             // has nothing to write, then render_size().
@@ -2304,7 +2337,31 @@ impl Encoder {
     }
 }
 
+/// The bits of a frame id (`idLen`) and of a reference's distance from
+/// the frame (`delta_frame_id_length_minus_2 + 2`), when the encoder
+/// writes frame ids.
+const FRAME_ID_BITS: u32 = 15;
+const FRAME_ID_DELTA_BITS: u32 = 14;
+
 impl Encoder {
+    /// The id of the next frame coded (`current_frame_id`): one more than
+    /// the last frame's, as the encoder's decoder has it.
+    fn next_frame_id(&self) -> u32 {
+        let st = &self.dec.ref_state;
+        if st.frame_id_seen {
+            (st.current_frame_id + 1) % (1 << FRAME_ID_BITS)
+        } else {
+            0
+        }
+    }
+
+    /// `RefFrameId` of slot `s`.
+    fn slot_frame_id(&self, s: usize) -> u32 {
+        self.dec.ref_state.slots[s]
+            .as_ref()
+            .map_or(0, |h| h.frame_id)
+    }
+
     /// The references of the group frame of display index `hint`, and the
     /// slot it replaces: `refresh_frame_flags`, `ref_frame_idx` and the
     /// references searched.

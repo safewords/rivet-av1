@@ -20,20 +20,32 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::frame::{Frame, HdrMetadata};
-use crate::header::{FilmGrainParams, RefState};
+use crate::header::{FilmGrainParams, FrameHeader, RefState};
 use crate::obu::SequenceHeader;
 use crate::{Decoder, Result};
 
+use super::conformance::Rates;
+use super::lst::TileListLayout;
+use super::recovery::Recovery;
 use super::state::RefData;
 
 /// A frame a flown unit shows: what the output process (7.18) needs once
-/// the frame is complete.
-pub(super) struct Shown {
-    pub(super) seq: Arc<SequenceHeader>,
-    pub(super) data: Arc<RefData>,
-    pub(super) grain: FilmGrainParams,
-    pub(super) hdr: HdrMetadata,
+/// the frame is complete (and whether it is shown by a concealing decoder
+/// from damaged references); or the output frame of a tile list (`lst.rs`)
+/// once its job has made it, and the list's layout.
+pub(super) enum Shown {
+    Frame {
+        seq: Arc<SequenceHeader>,
+        data: Arc<RefData>,
+        grain: Box<FilmGrainParams>,
+        hdr: HdrMetadata,
+        concealed: bool,
+    },
+    List(ListOut, TileListLayout),
 }
+
+/// Where a tile list's job leaves its output frame.
+pub(super) type ListOut = Arc<std::sync::Mutex<Option<Frame>>>;
 
 /// What a unit being flown has put in flight and will show.
 #[derive(Default)]
@@ -50,6 +62,13 @@ struct Before {
     refs: [Option<Arc<RefData>>; 8],
     seen_frame_header: bool,
     hdr: HdrMetadata,
+    /// A frame header in force without tile groups (a large scale tile
+    /// stream's camera frame header, which tile lists decode with).
+    pending: Option<(Arc<SequenceHeader>, FrameHeader)>,
+    recovery: Recovery,
+    discard: bool,
+    header: (Vec<u8>, usize),
+    rates: Rates,
 }
 
 enum State {
@@ -67,6 +86,11 @@ pub(super) struct Unit {
     /// (or in it) it is decoded again from them.
     data: Vec<u8>,
     state: State,
+    /// Data was lost before it (`Decoder::signal_loss`).
+    loss: bool,
+    /// Decoded in place: the layout of the last tile list it decoded, for
+    /// `Decoder::tile_list_layout` once its result is taken.
+    layout: Option<TileListLayout>,
 }
 
 /// How many units are decoded in place without trying to fly them, after
@@ -128,9 +152,12 @@ impl Decoder {
     /// in flight as there may be.
     pub fn queue(&mut self, unit: &[u8]) {
         let _entered = self.pool.enter();
+        let loss = std::mem::take(&mut self.loss_pending);
         self.units.queue.push_back(Unit {
             data: unit.to_vec(),
             state: State::Queued,
+            loss,
+            layout: None,
         });
         self.look_at_queued();
     }
@@ -176,6 +203,11 @@ impl Decoder {
         self.shown.clear();
         self.hdr = HdrMetadata::default();
         self.grounded = 0;
+        self.recovery = Default::default();
+        self.discard = false;
+        self.loss_pending = false;
+        self.unit_error = None;
+        self.rates = Default::default();
     }
 
     /// Whether the next unit is flown: several frames may be in flight on
@@ -196,6 +228,11 @@ impl Decoder {
             refs: self.refs.clone(),
             seen_frame_header: self.seen_frame_header,
             hdr: self.hdr,
+            pending: self.pending.clone(),
+            recovery: self.recovery,
+            discard: self.discard,
+            header: (self.header_bytes.clone(), self.header_bits),
+            rates: self.rates.clone(),
         }
     }
 
@@ -206,7 +243,11 @@ impl Decoder {
         self.seen_frame_header = b.seen_frame_header;
         self.hdr = b.hdr;
         self.frame = None;
-        self.pending = None;
+        self.pending = b.pending;
+        self.recovery = b.recovery;
+        self.discard = b.discard;
+        (self.header_bytes, self.header_bits) = b.header;
+        self.rates = b.rates;
     }
 
     /// Flies (or decodes) every unit not looked at yet, in order.
@@ -214,14 +255,27 @@ impl Decoder {
         while self.units.looked_at < self.units.queue.len() {
             let i = self.units.looked_at;
             // A unit that starts inside a frame, or a decoder that does not
-            // fly: decoded in place, after everything before it.
-            if self.frame.is_some() || self.pending.is_some() || !self.flies() {
+            // fly: decoded in place, after everything before it. A frame
+            // header in force whose tile groups have not begun (a camera
+            // frame header, 7.3, which tile lists decode with) is not
+            // inside a frame: a unit after it flies with the header alone.
+            let camera = matches!(&self.frame,
+                Some(f) if f.tile_num == 0 && f.hdr.refresh_frame_flags == 0);
+            if (self.frame.is_some() && !camera) || !self.flies() {
                 self.decode_in_place(i);
                 continue;
+            }
+            if camera {
+                let f = self.frame.take().expect("the frame header in force");
+                self.pending = Some((f.seq.clone(), f.hdr.clone()));
+                f.pool.give_back(f.cur);
             }
             let before = Box::new(self.before());
             let data = std::mem::take(&mut self.units.queue[i].data);
             self.flying = Some(Flight::default());
+            if self.units.queue[i].loss {
+                self.lose();
+            }
             let flown = self.decode_obus(&data);
             let flight = self.flying.take().expect("the unit's flight");
             self.shown.clear();
@@ -250,7 +304,7 @@ impl Decoder {
                 self.engine.wait_for(id);
             }
             match self.engine.settled(id)? {
-                Some(padding_ok) if padding_ok || !self.strict => {}
+                Some(true) => {}
                 _ => return Some(false),
             }
         }
@@ -279,8 +333,14 @@ impl Decoder {
         }
         // Decoding in place has the threads to itself.
         self.engine.end_session();
+        if self.units.queue[i].loss {
+            self.lose();
+        }
         let data = std::mem::take(&mut self.units.queue[i].data);
+        let layout = self.anchors.layout.take();
         let result = self.decode_unit(&data);
+        self.units.queue[i].layout = self.anchors.layout;
+        self.anchors.layout = layout;
         self.units.queue[i].data = data;
         self.units.queue[i].state = State::Done(result);
         self.units.looked_at = i + 1;
@@ -315,17 +375,41 @@ impl Decoder {
         let unit = self.units.queue.pop_front().expect("the oldest unit");
         self.units.looked_at -= 1;
         Some(match unit.state {
-            State::Done(result) => result,
+            State::Done(result) => {
+                if unit.layout.is_some() {
+                    self.anchors.layout = unit.layout;
+                }
+                result
+            }
             State::Flown { flight, .. } => {
                 for &id in &flight.jobs {
                     // Asked and answered: the outcome is not kept.
                     let _ = self.engine.outcome(id);
                 }
-                Ok(flight
-                    .shown
-                    .iter()
-                    .map(|s| self.output_with(&s.seq, &s.data, &s.grain, s.hdr))
-                    .collect())
+                let mut frames = Vec::with_capacity(flight.shown.len());
+                for s in flight.shown {
+                    frames.push(match s {
+                        Shown::Frame {
+                            seq,
+                            data,
+                            grain,
+                            hdr,
+                            concealed,
+                        } => {
+                            let mut f = self.output_with(&seq, &data, &grain, hdr);
+                            f.concealed = concealed;
+                            f
+                        }
+                        Shown::List(out, layout) => {
+                            self.anchors.layout = Some(layout);
+                            out.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .expect("a tile list's output, once its job is done")
+                        }
+                    });
+                }
+                Ok(frames)
             }
             State::Queued => unreachable!("a unit that was looked at"),
         })

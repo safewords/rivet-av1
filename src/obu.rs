@@ -15,13 +15,26 @@ pub(crate) struct Obu<'a> {
     pub(crate) payload: &'a [u8],
 }
 
-/// Splits `data` (the low-overhead bitstream format: every OBU carries
-/// `obu_size`, except possibly the last) into OBUs.
-pub(crate) fn split_obus(data: &[u8]) -> Result<Vec<Obu<'_>>> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let mut r = BitReader::new(&data[pos..]);
+/// Why [`read_obu`] found no whole OBU.
+pub(crate) enum ObuError<'a> {
+    /// The OBU's header is there, but `obu_size` says more bytes than
+    /// follow: the OBU with the bytes there are (the data was cut short,
+    /// or `obu_size` itself is wrong).
+    Truncated(Obu<'a>),
+    /// Not even the OBU's header reads.
+    Malformed(Error),
+}
+
+/// The error of a [`ObuError::Truncated`] OBU.
+pub(crate) fn truncated() -> Error {
+    Error::bitstream("obu_size runs past the end of the data")
+}
+
+/// The OBU at the start of `data` (`open_bitstream_unit()`, 5.3.1), and
+/// the number of bytes it takes.
+pub(crate) fn read_obu(data: &[u8]) -> std::result::Result<(Obu<'_>, usize), ObuError<'_>> {
+    let mut r = BitReader::new(data);
+    let header = (|| {
         let forbidden = r.f(1)?;
         if forbidden != 0 {
             return Err(Error::bitstream("obu_forbidden_bit set"));
@@ -37,25 +50,27 @@ pub(crate) fn split_obus(data: &[u8]) -> Result<Vec<Obu<'_>>> {
             r.f(3)?;
         }
         let size = if has_size {
-            r.leb128()? as usize
+            Some(r.leb128()? as usize)
         } else {
-            data.len() - pos - 1 - ext as usize
+            None
         };
-        let start = pos + r.position() / 8;
-        let end = start
-            .checked_add(size)
-            .filter(|&e| e <= data.len())
-            .ok_or_else(|| Error::bitstream("obu_size runs past the end of the data"))?;
-        out.push(Obu {
-            obu_type,
-            temporal_id,
-            spatial_id,
-            has_extension: ext,
-            payload: &data[start..end],
-        });
-        pos = end;
+        Ok((obu_type, ext, temporal_id, spatial_id, size))
+    })();
+    let (obu_type, ext, temporal_id, spatial_id, size) = header.map_err(ObuError::Malformed)?;
+    let start = r.position() / 8;
+    let size = size.unwrap_or(data.len() - start);
+    let end = start.checked_add(size).filter(|&e| e <= data.len());
+    let obu = Obu {
+        obu_type,
+        temporal_id,
+        spatial_id,
+        has_extension: ext,
+        payload: &data[start..end.unwrap_or(data.len())],
+    };
+    match end {
+        Some(end) => Ok((obu, end)),
+        None => Err(ObuError::Truncated(obu)),
     }
-    Ok(out)
 }
 
 /// Writes an OBU with `obu_has_size_field` set and no extension.
@@ -96,7 +111,17 @@ pub(crate) struct SequenceHeader {
     pub(crate) operating_points_cnt_minus_1: usize,
     pub(crate) operating_point_idc: Vec<u32>,
     pub(crate) seq_level_idx: Vec<u32>,
+    pub(crate) seq_tier: Vec<u32>,
     pub(crate) decoder_model_present_for_this_op: Vec<bool>,
+    /// `timing_info()`: `num_units_in_display_tick`, `time_scale` and,
+    /// with `equal_picture_interval`, `num_ticks_per_picture_minus_1 + 1`
+    /// (0 without timing information). The level limits on rates (A.3)
+    /// are measured with them.
+    pub(crate) num_units_in_display_tick: u32,
+    pub(crate) time_scale: u32,
+    pub(crate) num_ticks_per_picture: u64,
+    /// The operating point chosen (`choose_operating_point()`).
+    pub(crate) op: usize,
     /// `OperatingPointIdc` of the chosen operating point (0).
     pub(crate) op_idc: u32,
     pub(crate) frame_width_bits: u32,
@@ -145,6 +170,8 @@ impl SequenceHeader {
         let mut frame_presentation_time_length_minus_1 = 0;
         let mut operating_point_idc = vec![0];
         let mut seq_level_idx = vec![0];
+        let mut seq_tier = vec![0];
+        let (mut num_units_in_display_tick, mut time_scale, mut num_ticks_per_picture) = (0, 0, 0);
         let mut decoder_model_present_for_this_op = vec![false];
         let mut operating_points_cnt_minus_1 = 0;
         if reduced {
@@ -152,11 +179,11 @@ impl SequenceHeader {
         } else {
             timing_info_present = r.flag()?;
             if timing_info_present {
-                r.f(32)?; // num_units_in_display_tick
-                r.f(32)?; // time_scale
+                num_units_in_display_tick = r.f(32)?;
+                time_scale = r.f(32)?;
                 equal_picture_interval = r.flag()?;
                 if equal_picture_interval {
-                    r.uvlc()?;
+                    num_ticks_per_picture = r.uvlc()? as u64 + 1;
                 }
                 decoder_model_info_present = r.flag()?;
                 if decoder_model_info_present {
@@ -170,14 +197,13 @@ impl SequenceHeader {
             operating_points_cnt_minus_1 = r.f(5)? as usize;
             operating_point_idc = Vec::new();
             seq_level_idx = Vec::new();
+            seq_tier = Vec::new();
             decoder_model_present_for_this_op = Vec::new();
             for _ in 0..=operating_points_cnt_minus_1 {
                 operating_point_idc.push(r.f(12)?);
                 let lvl = r.f(5)?;
                 seq_level_idx.push(lvl);
-                if lvl > 7 {
-                    r.f(1)?; // seq_tier
-                }
+                seq_tier.push(if lvl > 7 { r.f(1)? } else { 0 });
                 let mut present = false;
                 if decoder_model_info_present {
                     present = r.flag()?;
@@ -195,7 +221,8 @@ impl SequenceHeader {
             }
         }
         // choose_operating_point()
-        let op_idc = operating_point_idc[op.min(operating_points_cnt_minus_1)];
+        let op = op.min(operating_points_cnt_minus_1);
+        let op_idc = operating_point_idc[op];
         let frame_width_bits = r.f(4)? + 1;
         let frame_height_bits = r.f(4)? + 1;
         let max_frame_width = r.f(frame_width_bits)? + 1;
@@ -221,7 +248,12 @@ impl SequenceHeader {
             operating_points_cnt_minus_1,
             operating_point_idc,
             seq_level_idx,
+            seq_tier,
             decoder_model_present_for_this_op,
+            num_units_in_display_tick,
+            time_scale,
+            num_ticks_per_picture,
+            op,
             op_idc,
             frame_width_bits,
             frame_height_bits,
@@ -325,6 +357,10 @@ impl SequenceHeader {
         w.f(self.frame_height_bits, self.max_frame_height - 1);
         if !self.reduced_still_picture_header {
             w.flag(self.frame_id_numbers_present);
+            if self.frame_id_numbers_present {
+                w.f(4, self.delta_frame_id_length_minus_2);
+                w.f(3, self.additional_frame_id_length_minus_1);
+            }
         }
         w.flag(self.use_128x128_superblock);
         w.flag(self.enable_filter_intra);

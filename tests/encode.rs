@@ -538,7 +538,7 @@ fn screen(w: u32, h: u32, n: u32) -> Vec<Frame> {
                     let on = cell % 4 != 3
                         && row < 7
                         && col < 5
-                        && (glyph.wrapping_mul(0x9E37_79B9) >> (row * 5 + col)) & 1 == 1;
+                        && (glyph.wrapping_mul(0x9E37_79B9)).wrapping_shr(row * 5 + col) & 1 == 1;
                     f.set_sample(0, x, y, if on { 30 } else { 220 });
                 }
             }

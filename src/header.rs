@@ -69,6 +69,10 @@ pub(crate) struct RefState {
     pub(crate) slots: [Option<Arc<RefHeaderState>>; 8],
     /// `current_frame_id` of the previous frame (PrevFrameID).
     pub(crate) current_frame_id: u32,
+    /// Whether a frame has set `current_frame_id` since the decoder began:
+    /// Annex C (C.5) has the first frame's not compared with an
+    /// uninitialised PrevFrameID.
+    pub(crate) frame_id_seen: bool,
 }
 
 /// `tile_info()` (5.9.15).
@@ -100,6 +104,20 @@ pub(crate) struct FrameHeader {
     pub(crate) allow_screen_content_tools: bool,
     pub(crate) force_integer_mv: bool,
     pub(crate) current_frame_id: u32,
+    /// PrevFrameID when `current_frame_id` was read, if a frame had set it
+    /// before (for the conformance checks of `current_frame_id`).
+    pub(crate) prev_frame_id: Option<u32>,
+    /// `display_frame_id` of a `show_existing_frame` header, and
+    /// `expectedFrameId[ i ]` of an inter frame's references, when the
+    /// sequence has frame ids.
+    pub(crate) display_frame_id: u32,
+    pub(crate) expected_frame_id: [u32; 7],
+    /// `frame_refs_short_signaling`: `ref_frame_idx` derived from every
+    /// slot's `RefOrderHint` (7.8), not only from the slots it names.
+    pub(crate) frame_refs_short_signaling: bool,
+    /// `film_grain_params_ref_idx`, when the grain parameters were loaded
+    /// from a slot (`update_grain` equal to 0).
+    pub(crate) film_grain_params_ref_idx: Option<usize>,
     pub(crate) frame_size_override_flag: bool,
     pub(crate) order_hint: u32,
     pub(crate) primary_ref_frame: usize,
@@ -240,9 +258,11 @@ impl FrameHeader {
 
 impl Parser<'_, '_> {
     fn slot(&self, i: usize) -> Result<&Arc<RefHeaderState>> {
-        self.st.slots[i]
-            .as_ref()
-            .ok_or_else(|| Error::bitstream(format!("reference slot {i} is empty")))
+        self.st.slots[i].as_ref().ok_or_else(|| {
+            Error::bitstream(format!(
+                "reference slot {i} is empty (RefValid[ ref_frame_idx ] is 0, 6.8.2)"
+            ))
+        })
     }
 
     fn uncompressed_header(&mut self) -> Result<()> {
@@ -269,12 +289,15 @@ impl Parser<'_, '_> {
                 }
                 h.refresh_frame_flags = 0;
                 if seq.frame_id_numbers_present {
-                    self.r.f(id_len)?; // display_frame_id
+                    h.display_frame_id = self.r.f(id_len)?;
                 }
                 let idx = h.frame_to_show_map_idx;
-                let slot = self.st.slots[idx]
-                    .clone()
-                    .ok_or_else(|| Error::bitstream("show_existing_frame of an empty slot"))?;
+                let slot = self.st.slots[idx].clone().ok_or_else(|| {
+                    Error::bitstream(
+                        "show_existing_frame of an empty slot (RefValid[ frame_to_show_map_idx ] \
+                             is 0, 6.8.2)",
+                    )
+                })?;
                 let h = &mut self.h;
                 h.frame_type = slot.frame_type;
                 if h.frame_type == KEY_FRAME {
@@ -337,7 +360,9 @@ impl Parser<'_, '_> {
             h.force_integer_mv = true;
         }
         if seq.frame_id_numbers_present {
-            self.st.current_frame_id = self.h.current_frame_id;
+            // PrevFrameID = current_frame_id, the previous frame's (which
+            // the reference update keeps in `st`).
+            self.h.prev_frame_id = self.st.frame_id_seen.then_some(self.st.current_frame_id);
             self.h.current_frame_id = self.r.f(id_len)?;
             // mark_ref_frames( idLen )
             let diff_len = seq.delta_frame_id_length_minus_2 + 2;
@@ -421,6 +446,7 @@ impl Parser<'_, '_> {
             let mut frame_refs_short_signaling = false;
             if seq.enable_order_hint {
                 frame_refs_short_signaling = self.r.flag()?;
+                self.h.frame_refs_short_signaling = frame_refs_short_signaling;
                 if frame_refs_short_signaling {
                     let last = self.r.f(3)? as usize;
                     let gold = self.r.f(3)? as usize;
@@ -432,7 +458,11 @@ impl Parser<'_, '_> {
                     self.h.ref_frame_idx[i] = self.r.f(3)? as usize;
                 }
                 if seq.frame_id_numbers_present {
-                    self.r.f(seq.delta_frame_id_length_minus_2 + 2)?; // delta_frame_id_minus_1
+                    let delta_frame_id = self.r.f(seq.delta_frame_id_length_minus_2 + 2)? + 1;
+                    let ids = 1u64 << id_len;
+                    self.h.expected_frame_id[i] = ((self.h.current_frame_id as u64 + ids
+                        - delta_frame_id as u64)
+                        % ids) as u32;
                 }
             }
             for i in 0..REFS_PER_FRAME {
@@ -1234,6 +1264,7 @@ impl Parser<'_, '_> {
         };
         if !g.update_grain {
             let film_grain_params_ref_idx = self.r.f(3)? as usize;
+            self.h.film_grain_params_ref_idx = Some(film_grain_params_ref_idx);
             let temp_seed = g.grain_seed;
             let slot = self.slot(film_grain_params_ref_idx)?;
             g = slot.film_grain.clone();

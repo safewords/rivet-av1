@@ -22,7 +22,9 @@ use super::tile::TileDecoder;
 use super::{Decoder, FrameCtx};
 use crate::bits::BitReader;
 use crate::consts::*;
-use crate::frame::{ChromaFormat, Frame};
+use crate::frame::{ChromaFormat, Frame, HdrMetadata};
+use crate::header::FrameHeader;
+use crate::obu::SequenceHeader;
 use crate::{Error, Result};
 
 /// The anchor frames of large scale tile decoding (`AnchorFrames`), as
@@ -32,7 +34,7 @@ use crate::{Error, Result};
 pub(crate) struct Anchors {
     frames: Vec<AnchorFrame>,
     /// The layout of the last tile list decoded.
-    layout: Option<TileListLayout>,
+    pub(crate) layout: Option<TileListLayout>,
 }
 
 struct AnchorFrame {
@@ -83,29 +85,38 @@ impl Anchors {
             .collect();
     }
 
-    /// Anchor `idx` as the reference frame `last` of frame `f` (the steps
-    /// of 7.3.1 before the decode camera tile process): its samples, with
-    /// `RefUpscaledWidth`, `RefFrameHeight`, `RefMiCols`, `RefMiRows`,
-    /// `RefSubsampling` and `RefBitDepth` those of the frame itself. An
-    /// anchor smaller than the frame is extended by repeating its last
-    /// column and row, which is what a prediction reaching past its edge
-    /// would read; a larger one is cut.
-    fn reference(&mut self, idx: usize, f: &FrameCtx) -> Result<Arc<RefData>> {
+    /// Anchor `idx` as the reference frame `last` of the frame of header
+    /// `hdr` (the steps of 7.3.1 before the decode camera tile process):
+    /// its samples, with `RefUpscaledWidth`, `RefFrameHeight`, `RefMiCols`,
+    /// `RefMiRows`, `RefSubsampling` and `RefBitDepth` those of the frame
+    /// itself. An anchor smaller than the frame is extended by repeating
+    /// its last column and row, which is what a prediction reaching past
+    /// its edge would read; a larger one is cut. `slot` is what the frame's
+    /// `ref_frame_idx[ 0 ]` names (its frame type and order hints stay).
+    fn reference(
+        &mut self,
+        idx: usize,
+        seq: &SequenceHeader,
+        hdr: &FrameHeader,
+        slot: Option<&RefData>,
+    ) -> Result<Arc<RefData>> {
         let a = self.frames.get_mut(idx).ok_or_else(|| {
             Error::bitstream(format!("anchor_frame_idx {idx}: no such anchor frame"))
         })?;
-        let chroma = if f.num_planes == 1 {
+        let c = &seq.color;
+        let (ssx, ssy) = (c.subsampling_x as usize, c.subsampling_y as usize);
+        let chroma = if c.num_planes == 1 {
             ChromaFormat::Mono
         } else {
-            ChromaFormat::from_shifts(f.ssx as u32, f.ssy as u32)
+            ChromaFormat::from_shifts(ssx as u32, ssy as u32)
         };
-        if a.bit_depth != f.bit_depth || a.chroma != chroma {
+        if a.bit_depth != c.bit_depth || a.chroma != chroma {
             return Err(Error::bitstream(
                 "anchor frame format differs from the frame's",
             ));
         }
-        let w = f.hdr.upscaled_width as usize;
-        let h = f.hdr.frame_height as usize;
+        let w = hdr.upscaled_width as usize;
+        let h = hdr.frame_height as usize;
         if let Some((size, r)) = &a.as_ref
             && *size == (w, h)
         {
@@ -117,7 +128,7 @@ impl Anchors {
             .iter()
             .enumerate()
             .map(|(p, src)| {
-                let (sx, sy) = if p == 0 { (0, 0) } else { (f.ssx, f.ssy) };
+                let (sx, sy) = if p == 0 { (0, 0) } else { (ssx, ssy) };
                 let (pw, ph) = ((w + sx) >> sx, (h + sy) >> sy);
                 if (src.w, src.h) == (pw, ph) {
                     return src.clone();
@@ -132,19 +143,17 @@ impl Anchors {
                 out
             })
             .collect();
-        let last = f.hdr.ref_frame_idx[0];
-        let slot = f.refs[last].as_deref();
         let r = Arc::new(RefData {
             frame_type: slot.map_or(INTER_FRAME, |s| s.frame_type),
             upscaled_width: w,
             frame_height: h,
             render_width: w as u32,
             render_height: h as u32,
-            mi_rows: f.mi_rows,
-            mi_cols: f.mi_cols,
-            bit_depth: f.bit_depth,
-            subsampling_x: f.ssx as u32,
-            subsampling_y: f.ssy as u32,
+            mi_rows: hdr.mi_rows,
+            mi_cols: hdr.mi_cols,
+            bit_depth: c.bit_depth,
+            subsampling_x: ssx as u32,
+            subsampling_y: ssy as u32,
             order_hint: slot.map_or(0, |s| s.order_hint),
             saved_order_hints: slot.map_or([0; 8], |s| s.saved_order_hints),
             syntax: OnceLock::new(),
@@ -153,6 +162,66 @@ impl Anchors {
         });
         a.as_ref = Some(((w, h), r.clone()));
         Ok(r)
+    }
+}
+
+/// A tile list OBU read (`tile_list_obu()`, 5.12), its anchors made
+/// references (7.3.1): what decoding it needs besides the frame header in
+/// force. Reading stops at the first entry that is wrong; the entries
+/// before it are decoded all the same, and then its error is the list's.
+pub(crate) struct ListPlan {
+    /// By entry: the anchor as `LAST_FRAME`, the tile's row and column, and
+    /// the range of its data in the OBU.
+    entries: Vec<(Arc<RefData>, usize, usize, std::ops::Range<usize>)>,
+    error: Option<Error>,
+    out_w_tiles: usize,
+    out_w: usize,
+    out_h: usize,
+    pub(crate) layout: TileListLayout,
+}
+
+/// Decodes the tiles of `plan` (a tile list of the frame header `f` was
+/// set up from, with `payload` its OBU's payload) into its output frame.
+/// What a tile writes in `f` it clears first, so `f` serves list after
+/// list.
+pub(crate) fn decode_plan(
+    f: &mut FrameCtx,
+    plan: ListPlan,
+    payload: &[u8],
+    coeff_reader: super::CoefficientReader,
+    hdr: HdrMetadata,
+) -> Result<Frame> {
+    let chroma = if f.num_planes == 1 {
+        ChromaFormat::Mono
+    } else {
+        ChromaFormat::from_shifts(f.ssx as u32, f.ssy as u32)
+    };
+    let mut out = Frame::new(plan.out_w as u32, plan.out_h as u32, f.bit_depth, chroma);
+    out.color = super::color_info(&f.seq.color);
+    out.hdr = hdr;
+    let last = f.hdr.ref_frame_idx[0];
+    let slot = f.refs[last].clone();
+    let mut result = Ok(());
+    for (tile, (anchor, row, col, data)) in plan.entries.iter().enumerate() {
+        f.refs[last] = Some(anchor.clone());
+        if let Err(e) = camera_tile(f, &payload[data.clone()], *row, *col, coeff_reader) {
+            result = Err(e);
+            break;
+        }
+        write_tile(
+            f,
+            &mut out,
+            *row,
+            *col,
+            tile % plan.out_w_tiles,
+            tile / plan.out_w_tiles,
+        );
+    }
+    f.refs[last] = slot;
+    result?;
+    match plan.error {
+        Some(e) => Err(e),
+        None => Ok(out),
     }
 }
 
@@ -184,18 +253,31 @@ impl Decoder {
     /// a shown frame is): its tiles in raster order, each predicted from
     /// its anchor, with the frame header in force (the camera frame
     /// header, a frame header OBU that has no tile groups).
+    ///
+    /// With frames in flight ([`Decoder::queue`]) a tile list takes the
+    /// anchors in force when it is queued; set them with no unit queued
+    /// (a unit decoded again in place after an error would take the
+    /// anchors in force then).
     pub fn set_anchor_frames(&mut self, frames: &[Frame]) {
         self.anchors.set(frames);
     }
 
-    /// The layout of the output frame of the last tile list OBU decoded.
+    /// The layout of the output frame of the last tile list OBU decoded
+    /// (with frames in flight: of the last whose result was taken).
     pub fn tile_list_layout(&self) -> Option<TileListLayout> {
         self.anchors.layout
     }
 
     /// `tile_list_obu()` (5.12) and the large scale tile decoding process
-    /// (7.3).
+    /// (7.3). In flight, the tile list is a job of its own: the tiles of a
+    /// list depend on nothing but the frame header in force and the
+    /// anchors (no frame is decoded from a tile list, and none refers to
+    /// one), so several lists are decoded at once, each into a frame state
+    /// of its own.
     pub(crate) fn tile_list(&mut self, payload: &[u8]) -> Result<()> {
+        if self.flying.is_some() {
+            return self.tile_list_in_flight(payload);
+        }
         if let Some((seq, hdr)) = self.pending.take() {
             // A camera frame header that would have been decoded as tasks
             // had it brought a tile group.
@@ -204,95 +286,146 @@ impl Decoder {
         let Some(mut f) = self.frame.take() else {
             return Err(Error::bitstream("tile list without a frame header"));
         };
-        let r = self.tile_list_with(&mut f, payload);
+        let r = self
+            .plan(&f.seq.clone(), &f.hdr.clone(), payload)
+            .and_then(|plan| {
+                self.anchors.layout = Some(plan.layout);
+                decode_plan(&mut f, plan, payload, self.coeff_reader, self.hdr)
+            });
         // The frame header stays in force for the tile lists after this
         // one.
         self.frame = Some(f);
-        let out = r?;
-        match &mut self.flying {
-            // Not decoded as a job: the unit goes no further in flight.
-            Some(_) => Err(Error::unsupported("a tile list in flight")),
-            None => {
-                self.shown.push(out);
-                Ok(())
-            }
-        }
+        self.shown.push(r?);
+        Ok(())
     }
 
-    fn tile_list_with(&mut self, f: &mut FrameCtx, payload: &[u8]) -> Result<Frame> {
+    /// Reads tile list `payload` for the frame header `hdr`.
+    fn plan(
+        &mut self,
+        seq: &SequenceHeader,
+        hdr: &FrameHeader,
+        payload: &[u8],
+    ) -> Result<ListPlan> {
         let mut r = BitReader::new(payload);
         let out_w_tiles = r.f(8)? as usize + 1;
         let out_h_tiles = r.f(8)? as usize + 1;
         let tile_count = r.f(16)? as usize + 1;
-        let ti = f.hdr.tile_info.clone();
+        let ti = &hdr.tile_info;
         let tile_w = (ti.mi_col_starts[1] - ti.mi_col_starts[0]) * MI_SIZE;
         let tile_h = (ti.mi_row_starts[1] - ti.mi_row_starts[0]) * MI_SIZE;
+        let layout = TileListLayout {
+            tile_width: tile_w as u32,
+            tile_height: tile_h as u32,
+            tiles: tile_count,
+        };
         if tile_count > out_w_tiles * out_h_tiles {
+            self.anchors.layout = Some(layout);
             return Err(Error::bitstream("more tiles than the output frame holds"));
         }
         let (out_w, out_h) = (out_w_tiles * tile_w, out_h_tiles * tile_h);
         if out_w as u64 * out_h as u64 > self.max_pixels {
+            self.anchors.layout = Some(layout);
             return Err(Error::bitstream(
                 "output frame larger than the decoder's pixel limit",
             ));
         }
-        let chroma = if f.num_planes == 1 {
-            ChromaFormat::Mono
-        } else {
-            ChromaFormat::from_shifts(f.ssx as u32, f.ssy as u32)
-        };
-        let mut out = Frame::new(out_w as u32, out_h as u32, f.bit_depth, chroma);
-        out.color = super::color_info(&f.seq.color);
-        out.hdr = self.hdr;
-        let last = f.hdr.ref_frame_idx[0];
-        let slot = f.refs[last].clone();
+        let slot = self.refs[hdr.ref_frame_idx[0]].clone();
+        let mut entries = Vec::with_capacity(tile_count);
+        let mut error = None;
         let mut pos = 4;
-        let mut result = Ok(());
-        for tile in 0..tile_count {
+        for _ in 0..tile_count {
             let Some(e) = payload.get(pos..pos + 5) else {
-                result = Err(Error::bitstream("tile list entry runs past the OBU"));
+                error = Some(Error::bitstream("tile list entry runs past the OBU"));
                 break;
             };
             let anchor = e[0] as usize;
             let (row, col) = (e[1] as usize, e[2] as usize);
             let size = ((e[3] as usize) << 8 | e[4] as usize) + 1;
             pos += 5;
-            let Some(data) = payload.get(pos..pos + size) else {
-                result = Err(Error::bitstream("coded tile data runs past the OBU"));
-                break;
-            };
-            pos += size;
-            if row >= ti.rows || col >= ti.cols {
-                result = Err(Error::bitstream("anchor tile outside the frame's tiles"));
+            if payload.get(pos..pos + size).is_none() {
+                error = Some(Error::bitstream("coded tile data runs past the OBU"));
                 break;
             }
-            match self.anchors.reference(anchor, f) {
-                Ok(a) => f.refs[last] = Some(a),
+            let data = pos..pos + size;
+            pos += size;
+            if row >= ti.rows || col >= ti.cols {
+                error = Some(Error::bitstream("anchor tile outside the frame's tiles"));
+                break;
+            }
+            match self.anchors.reference(anchor, seq, hdr, slot.as_deref()) {
+                Ok(a) => entries.push((a, row, col, data)),
                 Err(e) => {
-                    result = Err(e);
+                    error = Some(e);
                     break;
                 }
             }
-            if let Err(e) = camera_tile(f, data, row, col, self.coeff_reader, self.strict) {
-                result = Err(e);
-                break;
-            }
-            write_tile(
-                f,
-                &mut out,
-                row,
-                col,
-                tile % out_w_tiles,
-                tile / out_w_tiles,
-            );
         }
-        f.refs[last] = slot;
-        self.anchors.layout = Some(TileListLayout {
-            tile_width: tile_w as u32,
-            tile_height: tile_h as u32,
-            tiles: tile_count,
+        Ok(ListPlan {
+            entries,
+            error,
+            out_w_tiles,
+            out_w,
+            out_h,
+            layout,
+        })
+    }
+
+    /// A tile list in flight (`Decoder::tile_list`): read, its anchors
+    /// made, and its tiles decoded by a job, each list in a frame state of
+    /// its own set up from the frame header in force (whose primary
+    /// reference's CDFs the job waits for). A list whose reading fails, or
+    /// that comes without a frame header waiting, is decoded in place.
+    fn tile_list_in_flight(&mut self, payload: &[u8]) -> Result<()> {
+        let Some((seq, hdr)) = self.pending.clone() else {
+            return Err(Error::unsupported(
+                "a tile list without a frame header in flight",
+            ));
+        };
+        let plan = self.plan(&seq, &hdr, payload)?;
+        if plan.error.is_some() {
+            return Err(Error::unsupported(
+                "a tile list that does not read, in flight",
+            ));
+        }
+        if !self.engine.session(self.threads) {
+            self.ground_for = super::flight::WITHOUT_THREADS;
+            return Err(Error::unsupported("no threads for frames in flight"));
+        }
+        let samples = plan.out_w as u64 * plan.out_h as u64;
+        self.engine
+            .wait_for_room(self.frames_in_flight, self.samples_in_flight, samples);
+        let needs: Vec<Arc<RefData>> = if hdr.primary_ref_frame == PRIMARY_REF_NONE {
+            Vec::new()
+        } else {
+            self.refs[hdr.ref_frame_idx[hdr.primary_ref_frame]]
+                .clone()
+                .into_iter()
+                .collect()
+        };
+        let out: super::flight::ListOut = Default::default();
+        let layout = plan.layout;
+        let (refs, pool, coeff_reader, meta) = (
+            self.refs.clone(),
+            self.planes.clone(),
+            self.coeff_reader,
+            self.hdr,
+        );
+        let (payload, sink) = (payload.to_vec(), out.clone());
+        let work: super::pipeline::Work = Box::new(move || {
+            let mut f = super::build_frame(&refs, seq, hdr, &pool);
+            let frame = decode_plan(&mut f, plan, &payload, coeff_reader, meta);
+            pool.give_back(std::mem::take(&mut f.cur));
+            let frame = frame?;
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+            Ok(())
         });
-        result.map(|()| out)
+        let id = self
+            .engine
+            .submit(super::pipeline::Job::work(needs, samples, work));
+        let flight = self.flying.as_mut().expect("a unit in flight");
+        flight.jobs.push(id);
+        flight.shown.push(super::flight::Shown::List(out, layout));
+        Ok(())
     }
 }
 
@@ -304,7 +437,6 @@ fn camera_tile(
     row: usize,
     col: usize,
     coeff_reader: super::CoefficientReader,
-    strict: bool,
 ) -> Result<()> {
     // What an earlier tile list left at this tile's place: nothing of it
     // may be seen (the mode info a later block of a tile reads is gated
@@ -313,7 +445,9 @@ fn camera_tile(
     let mut td = TileDecoder::new(f, data, row, col);
     td.coeff_reader = coeff_reader;
     td.decode_tile()?;
-    if strict && !td.sd.trailing_ok() {
+    // As in a frame's tile (`Decoder::tile_group`): a tile that does not
+    // end as 8.2.4 requires was not decoded as it was coded.
+    if !td.sd.trailing_ok() {
         return Err(Error::bitstream("tile does not end with its padding"));
     }
     Ok(())

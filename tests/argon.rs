@@ -8,14 +8,17 @@
 //! directory. `ARGON_FILTER=substr` restricts the run to matching paths;
 //! `ARGON_REPORT=file` writes one line per stream; `ARGON_LAYERS=1` adds
 //! the per-operating-point (`layers/N`) variants; `ARGON_VERBOSE=1` prints
-//! each result as it comes. Without `ARGON_DIR`
+//! each result as it comes; `AV1_STRICT=1` decodes strictly (every
+//! stream conforms, so none may fail a check). Without `ARGON_DIR`
 //! the test reports that it skipped.
 //!
 //! Each stream's `ref_cmd` script gives the options the reference output
 //! was made with: the bitstream format (`--annexb`), the operating point
 //! (`--oppoint=N`) and whether every layer's frames are output
-//! (`--all-layers`). The error-resilience directories (no reference
-//! output) are not run.
+//! (`--all-layers`). The error directories (streams that each break a
+//! requirement of conformance, no reference output) are not run for
+//! output; `argon_error_streams` decodes those whose requirement a strict
+//! decoder checks and that decoding does not need (frame ids, levels).
 //!
 //! The large-scale-tile directories (`*_large_scale_tile*`, tile list
 //! OBUs, 7.3) were made with AOMedia's `lightfield_tile_list_decoder
@@ -203,6 +206,7 @@ fn leb128(d: &[u8]) -> Option<(usize, usize)> {
 /// hashed tile by tile.
 fn run_tile_lists(c: &Case, units: &[&[u8]], anchors: usize, lists: usize) -> Result<bool, String> {
     let mut dec = av1::Decoder::new();
+    dec.set_strict(strict());
     if let Some(n) = std::env::var("AV1_DECODE_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -224,7 +228,41 @@ fn run_tile_lists(c: &Case, units: &[&[u8]], anchors: usize, lists: usize) -> Re
     dec.set_anchor_frames(&frames);
     let mut out = md5::Context::new();
     let mut done = 0;
-    for tu in &units[anchors.min(units.len())..] {
+    let rest = &units[anchors.min(units.len())..];
+    // AV1_FRAMES_IN_FLIGHT: the tile lists are queued, with that many in
+    // flight (Annex B units given as section 5 units, which is what
+    // `queue` takes).
+    let flight: usize = std::env::var("AV1_FRAMES_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if flight > 1 {
+        dec.set_frames_in_flight(flight);
+        let mut take = |dec: &mut av1::Decoder, r: av1::Result<Vec<av1::Frame>>| {
+            for f in r.map_err(|e| e.to_string())? {
+                if done < lists {
+                    let l = dec
+                        .tile_list_layout()
+                        .ok_or("a frame that is not a tile list's")?;
+                    hash_tiles(&mut out, &f, l);
+                    done += 1;
+                }
+            }
+            Ok::<(), String>(())
+        };
+        for tu in rest {
+            let tu = if c.annexb { section5(tu) } else { tu.to_vec() };
+            dec.queue(&tu);
+            while let Some(r) = dec.poll() {
+                take(&mut dec, r)?;
+            }
+        }
+        while let Some(r) = dec.wait() {
+            take(&mut dec, r)?;
+        }
+        return Ok(format!("{:x}", out.compute()) == c.md5);
+    }
+    for tu in rest {
         if done == lists {
             break;
         }
@@ -235,27 +273,79 @@ fn run_tile_lists(c: &Case, units: &[&[u8]], anchors: usize, lists: usize) -> Re
             let l = dec
                 .tile_list_layout()
                 .ok_or("a frame that is not a tile list's")?;
-            let across = (f.width / l.tile_width) as usize;
-            for t in 0..l.tiles {
-                let x = l.tile_width as usize * (t % across);
-                let y = l.tile_height as usize * (t / across);
-                for p in 0..f.planes.len() {
-                    let (sx, sy) = if p == 0 { (0, 0) } else { f.chroma.shifts() };
-                    let bps = f.bytes_per_sample();
-                    let pw = f.planes[p].width as usize;
-                    let (x0, y0) = (x >> sx, y >> sy);
-                    let w = l.tile_width as usize >> sx;
-                    let h = l.tile_height as usize >> sy;
-                    let plane = f.plane(p);
-                    for row in y0..y0 + h {
-                        out.consume(&plane[(row * pw + x0) * bps..(row * pw + x0 + w) * bps]);
-                    }
-                }
-            }
+            hash_tiles(&mut out, &f, l);
             done += 1;
         }
     }
     Ok(format!("{:x}", out.compute()) == c.md5)
+}
+
+/// Hashes a tile list's output frame tile by tile, as
+/// `lightfield_tile_list_decoder` writes it.
+fn hash_tiles(out: &mut md5::Context, f: &av1::Frame, l: av1::TileListLayout) {
+    let across = (f.width / l.tile_width) as usize;
+    for t in 0..l.tiles {
+        let x = l.tile_width as usize * (t % across);
+        let y = l.tile_height as usize * (t / across);
+        for p in 0..f.planes.len() {
+            let (sx, sy) = if p == 0 { (0, 0) } else { f.chroma.shifts() };
+            let bps = f.bytes_per_sample();
+            let pw = f.planes[p].width as usize;
+            let (x0, y0) = (x >> sx, y >> sy);
+            let w = l.tile_width as usize >> sx;
+            let h = l.tile_height as usize >> sy;
+            let plane = f.plane(p);
+            for row in y0..y0 + h {
+                out.consume(&plane[(row * pw + x0) * bps..(row * pw + x0 + w) * bps]);
+            }
+        }
+    }
+}
+
+/// An Annex B temporal unit as a section 5 one: each OBU with its size
+/// field.
+fn section5(tu: &[u8]) -> Vec<u8> {
+    let leb = |d: &[u8], p: &mut usize| {
+        let mut v = 0usize;
+        for i in 0..8 {
+            let b = d[*p];
+            *p += 1;
+            v |= ((b & 0x7f) as usize) << (7 * i);
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        v
+    };
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < tu.len() {
+        let end = leb(tu, &mut p) + p;
+        while p < end {
+            let len = leb(tu, &mut p);
+            let obu = &tu[p..p + len];
+            p += len;
+            let h = obu[0];
+            let ext = ((h >> 2) & 1) as usize;
+            let mut q = 1 + ext;
+            if h & 2 != 0 {
+                leb(obu, &mut q);
+            }
+            out.push(h | 2);
+            out.extend_from_slice(&obu[1..1 + ext]);
+            let mut size = obu.len() - q;
+            loop {
+                let b = (size & 0x7f) as u8;
+                size >>= 7;
+                out.push(if size > 0 { b | 0x80 } else { b });
+                if size == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(&obu[q..]);
+        }
+    }
+    out
 }
 
 /// Decodes a case: `Ok(true)` when the output MD5 matches.
@@ -270,6 +360,7 @@ fn run(c: &Case) -> Result<bool, String> {
         return run_tile_lists(c, &units, anchors, lists);
     }
     let mut dec = av1::Decoder::new();
+    dec.set_strict(strict());
     // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
     if let Some(n) = std::env::var("AV1_DECODE_THREADS")
         .ok()
@@ -321,6 +412,11 @@ fn run(c: &Case) -> Result<bool, String> {
     let a = format!("{:x}", out.compute());
     let b = format!("{:x}", out_mono.compute());
     Ok(a == c.md5 || b == c.md5)
+}
+
+/// `AV1_STRICT`: decode strictly.
+fn strict() -> bool {
+    std::env::var("AV1_STRICT").is_ok_and(|v| v != "0")
 }
 
 /// Splits a low-overhead OBU stream into temporal units at its temporal
@@ -442,4 +538,146 @@ fn argon() {
     if let Ok(f) = std::env::var("ARGON_REPORT") {
         std::fs::write(f, report).unwrap();
     }
+}
+
+/// The error streams that break a requirement of conformance decoding
+/// does not need, each with the requirement (as the suite's stream
+/// documentation names it) and words of the error a strict decoder must
+/// give for it. A decoder that is not strict decodes them without that
+/// error (but where the stream refers to a slot never filled, which
+/// nothing can decode).
+const ERROR_STREAMS: &[(&str, &str, &str)] = &[
+    ("profile0_error", "test101", "MaxTiles"),
+    ("profile0_error", "test106", "TileWidth"),
+    ("profile0_error", "test110", "FrameHeight"),
+    ("profile0_error", "test111", "CroppedTileWidth"),
+    ("profile0_error", "test144", "expectedFrameId"),
+    (
+        "profile0_error",
+        "test17",
+        "RefValid[ frame_to_show_map_idx ]",
+    ),
+    ("profile0_error", "test208", "MaxPicSize"),
+    ("profile0_error", "test21", "PrevFrameID"),
+    ("profile0_error", "test216", "MaxTileCols"),
+    ("profile0_error", "test218", "MAX_TILE_WIDTH"),
+    ("profile0_error", "test22", "DiffFrameID"),
+    ("profile0_error", "test223", "FrameWidth"),
+    ("profile0_error", "test226", "CroppedTileHeight"),
+    ("profile0_error", "test24", "RefValid[ ref_frame_idx"),
+    ("profile0_error", "test244", "display_frame_id"),
+    ("profile0_error", "test246", "idLen"),
+    ("profile0_error", "test44", "film_grain_params_ref_idx"),
+    ("profile0_error", "test95", "MaxHSize"),
+    ("profile0_error", "test96", "MaxVSize"),
+    ("profile1_error", "test101", "MaxTiles"),
+    ("profile1_error", "test132", "idLen"),
+    ("profile1_error", "test136", "DiffFrameID"),
+    ("profile1_error", "test144", "expectedFrameId"),
+    ("profile1_error", "test223", "FrameWidth"),
+    ("profile1_error", "test224", "FrameHeight"),
+    ("profile1_error", "test225", "CroppedTileWidth"),
+    ("profile1_error", "test226", "CroppedTileHeight"),
+    ("profile1_error", "test24", "RefValid[ ref_frame_idx"),
+    ("profile1_error", "test244", "display_frame_id"),
+    ("profile1_error", "test249", "PrevFrameID"),
+    ("profile1_error", "test272", "film_grain_params_ref_idx"),
+    ("profile1_error", "test330", "MaxTileCols"),
+    ("profile1_error", "test332", "MAX_TILE_WIDTH"),
+    ("profile1_error", "test334", "TileWidth"),
+    (
+        "profile1_error",
+        "test359",
+        "RefValid[ frame_to_show_map_idx ]",
+    ),
+    ("profile1_error", "test41", "4096 * 2304"),
+    ("profile1_error", "test94", "MaxPicSize"),
+    ("profile1_error", "test95", "MaxHSize"),
+    ("profile1_error", "test96", "MaxVSize"),
+    ("profile2_error", "test101", "MaxTiles"),
+    ("profile2_error", "test106", "TileWidth"),
+    ("profile2_error", "test110", "FrameHeight"),
+    ("profile2_error", "test112", "CroppedTileHeight"),
+    ("profile2_error", "test136", "DiffFrameID"),
+    (
+        "profile2_error",
+        "test17",
+        "RefValid[ frame_to_show_map_idx ]",
+    ),
+    ("profile2_error", "test208", "MaxPicSize"),
+    ("profile2_error", "test209", "MaxHSize"),
+    ("profile2_error", "test216", "MaxTileCols"),
+    ("profile2_error", "test218", "MAX_TILE_WIDTH"),
+    ("profile2_error", "test223", "FrameWidth"),
+    ("profile2_error", "test225", "CroppedTileWidth"),
+    ("profile2_error", "test24", "RefValid[ ref_frame_idx"),
+    ("profile2_error", "test244", "display_frame_id"),
+    ("profile2_error", "test246", "idLen"),
+    ("profile2_error", "test249", "PrevFrameID"),
+    ("profile2_error", "test258", "expectedFrameId"),
+    ("profile2_error", "test41", "4096 * 2304"),
+    ("profile2_error", "test44", "film_grain_params_ref_idx"),
+    ("profile2_error", "test96", "MaxVSize"),
+];
+
+/// Decodes an error stream (Annex B or section 5, which the stream says):
+/// the errors, in order.
+fn errors_of(path: &Path, data: &[u8], strict: bool) -> Vec<String> {
+    let mut dec = av1::Decoder::new();
+    dec.set_strict(strict);
+    if is_annexb(path) {
+        return av1::annexb_temporal_units(data)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tu| dec.decode_annexb(tu).err().map(|e| e.to_string()))
+            .collect();
+    }
+    split_at_delimiters(data)
+        .into_iter()
+        .filter_map(|tu| dec.decode_all(tu).err().map(|e| e.to_string()))
+        .collect()
+}
+
+#[test]
+fn argon_error_streams() {
+    let Ok(root) = std::env::var("ARGON_DIR") else {
+        eprintln!("ARGON_DIR not set; Argon error streams skipped");
+        return;
+    };
+    let mut failed = Vec::new();
+    for &(dir, stream, words) in ERROR_STREAMS {
+        let path = Path::new(&root)
+            .join(dir)
+            .join("streams")
+            .join(format!("{stream}.obu"));
+        let Ok(data) = std::fs::read(&path) else {
+            failed.push(format!("{dir}/{stream}: missing"));
+            continue;
+        };
+        let strict = errors_of(&path, &data, true);
+        if !strict.iter().any(|e| e.contains(words)) {
+            failed.push(format!(
+                "{dir}/{stream}: strict, no error naming {words:?}: {strict:?}"
+            ));
+        }
+        // A reference to a slot no frame was ever put in is not decodable,
+        // strict or not (the streams for RefValid do that); the other rules
+        // decoding does not need.
+        let needed = strict
+            .iter()
+            .any(|e| e.contains(words) && e.contains("empty"));
+        let lax = errors_of(&path, &data, false);
+        if !needed && lax.iter().any(|e| e.contains(words)) {
+            failed.push(format!("{dir}/{stream}: not strict, yet {lax:?}"));
+        }
+    }
+    for f in &failed {
+        eprintln!("FAIL {f}");
+    }
+    eprintln!(
+        "Argon error streams: {}/{} as expected",
+        ERROR_STREAMS.len() - failed.len(),
+        ERROR_STREAMS.len()
+    );
+    assert!(failed.is_empty());
 }

@@ -7,6 +7,7 @@
 //! then the loop filter, CDEF, super-resolution, loop restoration, the
 //! reference update and, on output, film grain synthesis.
 
+mod conformance;
 mod flight;
 pub(crate) mod grain;
 pub(crate) mod lst;
@@ -15,6 +16,7 @@ pub(crate) mod pipeline;
 pub(crate) mod postfilter;
 pub(crate) mod predict;
 pub(crate) mod record;
+mod recovery;
 pub(crate) mod residual;
 pub(crate) mod shared;
 pub(crate) mod state;
@@ -27,7 +29,7 @@ use crate::cdf::CdfContext;
 use crate::consts::*;
 use crate::frame::{ChromaFormat, ColorInfo, Frame, HdrMetadata};
 use crate::header::{FrameHeader, RefHeaderState, RefState, get_relative_dist};
-use crate::obu::{Metadata, SequenceHeader, split_obus};
+use crate::obu::{Metadata, SequenceHeader};
 use crate::tables::*;
 use crate::{Error, Result};
 use shared::Shared;
@@ -85,6 +87,9 @@ pub(crate) struct FrameCtx {
     pub(crate) tile_num: usize,
     /// Every tile's padding checked out (see `SymbolDecoder::trailing_ok`).
     pub(crate) tiles_ok: bool,
+    /// By tile, the superblocks decoded (`usize::MAX`: all of them), for
+    /// concealment (`recovery.rs`).
+    pub(crate) sbs_done: Vec<usize>,
     /// `LrFrame`, when the post-filters ran with the tile's rows
     /// (`pipeline.rs`) and are not left to the decode frame wrapup.
     pub(crate) filtered: Option<FrameBuf>,
@@ -136,6 +141,7 @@ impl FrameCtx {
             mask: Box::new([0; 128 * 128]),
             tile_num: self.tile_num,
             tiles_ok: true,
+            sbs_done: Vec::new(),
             filtered: None,
             pool: self.pool.clone(),
         }
@@ -343,6 +349,24 @@ pub struct Decoder {
     anchors: lst::Anchors,
     /// Sample planes no frame needs any more, for the frames to come.
     pub(crate) planes: Arc<Pool>,
+    /// What is known to be lost of the stream (`recovery.rs`); whether
+    /// frames damaged by it are shown, concealed; whether the frame in
+    /// progress is damaged; whether tile groups are being passed over (a
+    /// frame that failed has more); whether data was lost before the next
+    /// unit.
+    recovery: recovery::Recovery,
+    conceal: bool,
+    cur_damaged: bool,
+    discard: bool,
+    loss_pending: bool,
+    /// The first error of the unit being decoded.
+    unit_error: Option<Error>,
+    /// The frame header in force, as far as its header goes, to tell a
+    /// copy of it from a new one (`Decoder::is_header_copy`).
+    header_bytes: Vec<u8>,
+    header_bits: usize,
+    /// The rate limits of the level (A.3), for a strict decoder.
+    rates: conformance::Rates,
 }
 
 impl Default for Decoder {
@@ -379,6 +403,15 @@ impl Decoder {
             ground_for: 0,
             anchors: Default::default(),
             planes: Default::default(),
+            recovery: Default::default(),
+            conceal: false,
+            cur_damaged: false,
+            discard: false,
+            loss_pending: false,
+            unit_error: None,
+            header_bytes: Vec::new(),
+            header_bits: 0,
+            rates: Default::default(),
         }
     }
 
@@ -419,9 +452,25 @@ impl Decoder {
         self.apply_grain = apply;
     }
 
-    /// Makes the decoder report a tile whose arithmetic-coded data does not
-    /// end with the padding `exit_symbol()` requires as a bitstream error.
-    /// A conformance check; off by default.
+    /// Makes the decoder report the requirements of bitstream conformance
+    /// that decoding does not need, as `Error::Bitstream` naming the rule
+    /// broken and where the specification states it: the frame id rules
+    /// (6.8.2: `current_frame_id` against the previous frame's, each
+    /// reference's expected id, `display_frame_id`, the validity of the
+    /// slots referred to, ids of at most 16 bits; and 6.8.20's
+    /// `film_grain_params_ref_idx` naming a reference), and the limits of
+    /// the level the stream declares for the operating point decoded (A.3:
+    /// picture size and dimensions, the number, columns and sizes of
+    /// tiles, and, where the sequence header gives a frame rate, the
+    /// display, decode, header and tile rates). Off by default, when none
+    /// of them is reported and the output does not depend on them; except
+    /// that a reference whose frame id is not the one expected, or a slot
+    /// no longer valid, means a frame was lost, and the frames that depend
+    /// on it are treated as damaged either way (`set_concealment`).
+    ///
+    /// (A tile whose data does not end with the padding `exit_symbol()`
+    /// requires is an error strict or not: it is the surest sign of
+    /// damaged data.)
     pub fn set_strict(&mut self, strict: bool) {
         self.strict = strict;
     }
@@ -449,41 +498,81 @@ impl Decoder {
     /// Decodes a temporal unit in the length-delimited format of Annex B
     /// (without its leading `temporal_unit_size`; see
     /// [`annexb_temporal_units`]) and returns every frame it shows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Decoder::decode_all`].
     pub fn decode_annexb(&mut self, tu: &[u8]) -> Result<Vec<Frame>> {
         self.nothing_queued()?;
+        if std::mem::take(&mut self.loss_pending) {
+            self.lose();
+        }
         self.shown.clear();
+        let mut first = None;
         let mut pos = 0;
-        while pos < tu.len() {
-            let (fu_size, n) = read_leb128(&tu[pos..])?;
+        'unit: while pos < tu.len() {
+            let (fu_size, n) = match read_leb128(&tu[pos..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.lose_the_rest(e, &mut first);
+                    break;
+                }
+            };
             pos += n;
-            let end = pos
-                .checked_add(fu_size)
-                .filter(|&e| e <= tu.len())
-                .ok_or_else(|| Error::bitstream("frame_unit_size runs past the temporal unit"))?;
+            let Some(end) = pos.checked_add(fu_size).filter(|&e| e <= tu.len()) else {
+                let e = Error::bitstream("frame_unit_size runs past the temporal unit");
+                self.lose_the_rest(e, &mut first);
+                break;
+            };
             while pos < end {
-                let (obu_len, n) = read_leb128(&tu[pos..end])?;
-                pos += n;
-                let obu_end = pos
-                    .checked_add(obu_len)
-                    .filter(|&e| e <= end)
-                    .ok_or_else(|| Error::bitstream("obu_length runs past the frame unit"))?;
-                for obu in split_obus(&tu[pos..obu_end])? {
-                    self.decode_obu(
-                        obu.obu_type,
-                        obu.temporal_id,
-                        obu.spatial_id,
-                        obu.has_extension,
-                        obu.payload,
-                    )?;
+                let obu = read_leb128(&tu[pos..end]).and_then(|(len, n)| {
+                    pos += n;
+                    pos.checked_add(len)
+                        .filter(|&e| e <= end)
+                        .ok_or_else(|| Error::bitstream("obu_length runs past the frame unit"))
+                });
+                let obu_end = match obu {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.lose_the_rest(e, &mut first);
+                        break 'unit;
+                    }
+                };
+                let mut rest = &tu[pos..obu_end];
+                while !rest.is_empty() {
+                    match self.next_obu(rest) {
+                        Ok(len) => rest = &rest[len..],
+                        Err(e) => {
+                            first.get_or_insert(e);
+                            break 'unit;
+                        }
+                    }
                 }
                 pos = obu_end;
             }
         }
-        Ok(std::mem::take(&mut self.shown))
+        // The temporal unit is whole: a frame in it that has not had its
+        // last tile has lost it.
+        if let Err(e) = self.end_frame_in_progress() {
+            first.get_or_insert(e);
+        }
+        let shown = std::mem::take(&mut self.shown);
+        match first.or_else(|| self.unit_error.take()) {
+            Some(_) if self.conceal && !shown.is_empty() => Ok(shown),
+            Some(e) => {
+                self.unit_error = None;
+                Err(e)
+            }
+            None => Ok(shown),
+        }
     }
 
     /// Decodes one temporal unit (or any sequence of whole OBUs) and
     /// returns the last frame it shows, if any.
+    ///
+    /// # Errors
+    ///
+    /// As [`Decoder::decode_all`].
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<Frame>> {
         Ok(self.decode_all(data)?.pop())
     }
@@ -493,10 +582,21 @@ impl Decoder {
     ///
     /// # Errors
     ///
-    /// Besides the unit's own: `Error::InvalidInput` while units given to
-    /// [`Decoder::queue`] are waiting for their results to be taken.
+    /// The first error the unit meets: `Error::Bitstream` for data that
+    /// does not decode (or, decoding strictly, breaks a requirement of
+    /// conformance), `Error::Unsupported`. The decoder carries on past it
+    /// within the unit and after it (`recovery.rs`): the frames shown by a
+    /// unit with an error are not returned, and frames that depend on
+    /// what was lost are not output (or, with
+    /// [`Decoder::set_concealment`], are output flagged) until a frame
+    /// that does not depend on it, a key frame at the latest.
+    /// `Error::InvalidInput` while units given to [`Decoder::queue`] are
+    /// waiting for their results to be taken.
     pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<Frame>> {
         self.nothing_queued()?;
+        if std::mem::take(&mut self.loss_pending) {
+            self.lose();
+        }
         self.decode_unit(data)
     }
 
@@ -513,24 +613,140 @@ impl Decoder {
     }
 
     /// Decodes one temporal unit before it returns: every frame it shows.
+    /// With concealment, a unit with an error that still shows frames
+    /// returns them (flagged as far as they are not the stream's).
     fn decode_unit(&mut self, data: &[u8]) -> Result<Vec<Frame>> {
         self.shown.clear();
-        self.decode_obus(data)?;
-        Ok(std::mem::take(&mut self.shown))
+        let r = self.decode_obus(data);
+        let shown = std::mem::take(&mut self.shown);
+        match r {
+            Err(_) if self.conceal && !shown.is_empty() => Ok(shown),
+            r => r.map(|()| shown),
+        }
     }
 
-    /// The OBUs of a temporal unit, in order.
+    /// The OBUs of a temporal unit, in order, carrying on past an error
+    /// (in place; in flight the first error ends the unit's flight): the
+    /// first error, if any.
     fn decode_obus(&mut self, data: &[u8]) -> Result<()> {
-        for obu in split_obus(data)? {
-            self.decode_obu(
-                obu.obu_type,
-                obu.temporal_id,
-                obu.spatial_id,
-                obu.has_extension,
-                obu.payload,
-            )?;
+        self.unit_error = None;
+        let mut first = None;
+        let mut rest = data;
+        let mut whole_unit = false;
+        let mut at_start = true;
+        while !rest.is_empty() {
+            if at_start {
+                whole_unit = (rest[0] >> 3) & 15 == OBU_TEMPORAL_DELIMITER as u8;
+            }
+            match self.next_obu(rest) {
+                Ok(len) => rest = &rest[len..],
+                Err(e) => {
+                    first = Some(e);
+                    break;
+                }
+            }
+            at_start = false;
+            if self.flying.is_some()
+                && let Some(e) = self.unit_error.take()
+            {
+                return Err(e);
+            }
         }
-        Ok(())
+        // A temporal unit holds every OBU of its frames: one still in
+        // progress at its end has lost its last tile groups.
+        if whole_unit
+            && first.is_none()
+            && let Err(e) = self.end_frame_in_progress()
+        {
+            first = Some(e);
+        }
+        match first.or_else(|| self.unit_error.take()) {
+            Some(e) => {
+                self.unit_error = None;
+                Err(e)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Decodes the OBU at the start of `data` and returns its length. An
+    /// error of the OBU is kept as the unit's (`unit_error`, the first
+    /// one) and decoding goes on, but in flight, where it ends the unit's
+    /// flight; one that leaves the rest of the data unreadable is
+    /// returned.
+    fn next_obu(&mut self, data: &[u8]) -> Result<usize> {
+        let (obu, len, cut) = match crate::obu::read_obu(data) {
+            Ok((obu, len)) => (obu, len, false),
+            Err(crate::obu::ObuError::Truncated(obu)) => (obu, data.len(), true),
+            Err(crate::obu::ObuError::Malformed(e)) => {
+                let mut first = None;
+                self.lose_the_rest(e, &mut first);
+                return Err(first.expect("the error"));
+            }
+        };
+        if cut {
+            if self.flying.is_some() {
+                return Err(crate::obu::truncated());
+            }
+            // What there is of a frame or a tile group is decoded (the
+            // tile it cuts runs out of data, and is concealed from there);
+            // anything else cut short is passed over. Then the data after
+            // is unknown: whether `obu_size` was cut or is wrong, frames
+            // may have been lost with it.
+            if matches!(obu.obu_type, OBU_FRAME | OBU_TILE_GROUP) {
+                let r = self.decode_obu(
+                    obu.obu_type,
+                    obu.temporal_id,
+                    obu.spatial_id,
+                    obu.has_extension,
+                    obu.payload,
+                );
+                self.keep_error(r);
+            }
+            let mut first = None;
+            self.lose_the_rest(crate::obu::truncated(), &mut first);
+            return Err(self
+                .unit_error
+                .take()
+                .unwrap_or_else(|| first.expect("the error")));
+        }
+        let r = self.decode_obu(
+            obu.obu_type,
+            obu.temporal_id,
+            obu.spatial_id,
+            obu.has_extension,
+            obu.payload,
+        );
+        self.keep_error(r);
+        Ok(len)
+    }
+
+    /// Keeps `r`'s error as the unit's, if it is the first.
+    fn keep_error(&mut self, r: Result<()>) {
+        if let Err(e) = r
+            && self.unit_error.is_none()
+        {
+            self.unit_error = Some(e);
+        }
+    }
+
+    /// The rest of a unit cannot be read (an OBU header that does not
+    /// parse, a size past the end): the frame in progress fails, and
+    /// whatever frames the rest held are lost with every slot they may
+    /// have refreshed. `first` takes `e` if it holds no error yet.
+    fn lose_the_rest(&mut self, e: Error, first: &mut Option<Error>) {
+        if self.flying.is_none() {
+            if let Err(f) = self.fail_in_progress(Error::bitstream(
+                "a frame's tile groups end before its last tile",
+            )) {
+                self.keep_error(Err(f));
+            }
+            self.recovery.lose_all();
+            self.seen_frame_header = false;
+            self.discard = true;
+        }
+        let e = self.unit_error.take().unwrap_or(e);
+        first.get_or_insert(e);
     }
 
     fn decode_obu(
@@ -569,56 +785,107 @@ impl Decoder {
             }
         }
         match obu_type {
-            OBU_SEQUENCE_HEADER => {
-                let s = SequenceHeader::parse(payload, self.operating_point)?;
-                if self.seq.as_deref() != Some(&s) {
-                    // A new sequence: metadata of the old one no longer
-                    // applies.
-                    self.hdr = HdrMetadata::default();
+            OBU_SEQUENCE_HEADER => match SequenceHeader::parse(payload, self.operating_point) {
+                Ok(s) => {
+                    if self.seq.as_deref() != Some(&s) {
+                        // A new sequence: metadata of the old one no
+                        // longer applies.
+                        self.hdr = HdrMetadata::default();
+                    }
+                    self.seq = Some(Arc::new(s));
+                    self.recovery.seq_lost = false;
                 }
-                self.seq = Some(Arc::new(s));
-            }
+                Err(e) => {
+                    // The frames after it may be of a sequence not known.
+                    self.recovery.seq_lost = true;
+                    return Err(e);
+                }
+            },
             OBU_TEMPORAL_DELIMITER => {
                 self.seen_frame_header = false;
+                self.discard = false;
+                self.rates.begin_unit(self.seq.as_deref());
+                self.end_frame_in_progress()?;
             }
             OBU_FRAME_HEADER | OBU_REDUNDANT_FRAME_HEADER | OBU_FRAME => {
-                if self.seen_frame_header {
-                    if obu_type == OBU_FRAME {
-                        return Err(Error::bitstream("OBU_FRAME while a frame is in progress"));
+                // frame_header_copy(): identical to the header in force. One
+                // that is not starts a frame: the one in progress has lost
+                // the rest of its tile groups.
+                if self.seen_frame_header && obu_type != OBU_FRAME && self.is_header_copy(payload) {
+                    return Ok(());
+                }
+                if self.frame.is_some() || self.pending.is_some() {
+                    // A frame whose tile groups did not all come (or a
+                    // camera frame header, which a new one replaces).
+                    let lost = if self.seen_frame_header {
+                        self.fail_in_progress(Error::bitstream(
+                            "a frame's tile groups end before its last tile",
+                        ))
+                    } else {
+                        self.end_frame_in_progress()
+                    };
+                    self.keep_error(lost);
+                    if self.flying.is_some()
+                        && let Some(e) = self.unit_error.take()
+                    {
+                        return Err(e);
                     }
-                    // frame_header_copy(): identical to the header in force.
-                    return Ok(());
                 }
-                let seq = self
-                    .seq
-                    .clone()
-                    .ok_or_else(|| Error::bitstream("frame header before any sequence header"))?;
+                self.frame = None;
+                self.pending = None;
+                self.discard = false;
+                let Some(seq) = self.seq.clone() else {
+                    self.recovery.lose_all();
+                    self.discard = true;
+                    return Err(Error::bitstream("frame header before any sequence header"));
+                };
+                let before = self.ref_state.clone();
                 let mut r = BitReader::new(payload);
-                let hdr =
-                    FrameHeader::parse(&mut r, &seq, &mut self.ref_state, temporal_id, spatial_id)?;
+                let hdr = match FrameHeader::parse(
+                    &mut r,
+                    &seq,
+                    &mut self.ref_state,
+                    temporal_id,
+                    spatial_id,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        // Which slots it would have refreshed is not known.
+                        self.ref_state = before;
+                        self.recovery.lose_all();
+                        self.discard = true;
+                        return Err(e);
+                    }
+                };
                 if hdr.show_existing_frame {
-                    self.show_existing(seq, hdr)?;
                     self.seen_frame_header = false;
-                    return Ok(());
+                    return self.show_existing(seq, hdr);
                 }
+                self.keep_header(payload, r.position());
                 self.seen_frame_header = true;
-                if self.threads > 1 && pipeline::applies(&hdr) {
-                    // A frame of one tile on several threads: its state is
-                    // set up by the task that parses it.
-                    self.check_frame(&seq, &hdr)?;
-                    self.frame = None;
+                let damaged = match self.assess(&seq, &hdr) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.fail_before_state(&hdr);
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = self.check_frame(&seq, &hdr) {
+                    self.fail_before_state(&hdr);
+                    // A damaged frame's references may well not fit it:
+                    // no news (see `Decoder::fail_in_progress`).
+                    return if damaged { Ok(()) } else { Err(e) };
+                }
+                self.cur_damaged = damaged;
+                if (self.threads > 1 && pipeline::applies(&hdr)) || self.flying.is_some() {
+                    // A frame of one tile on several threads (or any frame
+                    // in flight): its state is set up by the task that
+                    // parses it (or once its tile group says how it is
+                    // decoded).
                     self.pending = Some((seq, hdr));
                 } else {
-                    if self.flying.is_some() {
-                        // Not a frame that flies: the unit is decoded in
-                        // place (`flight.rs`), and this error goes no
-                        // further.
-                        self.ground_for = flight::AFTER_A_FRAME_THAT_IS_NOT_A_JOB;
-                        return Err(Error::unsupported("a frame that is decoded in place"));
-                    }
-                    let f = self.setup_frame(seq, hdr)?;
-                    self.pending = None;
-                    self.frame = Some(f);
+                    // (Checked above.)
+                    self.frame = Some(build_frame(&self.refs, seq, hdr, &self.planes));
                 }
                 if obu_type == OBU_FRAME {
                     r.byte_align()?;
@@ -627,6 +894,10 @@ impl Decoder {
                 }
             }
             OBU_TILE_GROUP => {
+                if self.discard {
+                    // A tile group of a frame that failed.
+                    return Ok(());
+                }
                 if !self.seen_frame_header || (self.frame.is_none() && self.pending.is_none()) {
                     return Err(Error::bitstream("tile group without a frame header"));
                 }
@@ -736,19 +1007,21 @@ impl Decoder {
                 .expect("a unit in flight")
                 .jobs
                 .push(id);
-            self.reference_update(&seq, &hdr, out);
+            let damaged = self.cur_damaged;
+            self.reference_update(&seq, &hdr, out, damaged);
             self.seen_frame_header = false;
             return Ok(());
         }
         match self.engine.decode(job, self.threads) {
-            Some(padding_ok) if padding_ok || !self.strict => {
-                self.reference_update(&seq, &hdr, out);
+            Some(true) => {
+                let damaged = self.cur_damaged;
+                self.reference_update(&seq, &hdr, out, damaged);
                 self.seen_frame_header = false;
                 Ok(())
             }
-            // A tile that does not parse (or, for a strict decoder, does
-            // not end as it should): decoded again as one thread decodes
-            // it, for the same error and the same state after it.
+            // A tile that does not parse or does not end with its padding:
+            // decoded again as one thread decodes it, for the same error,
+            // the same concealment and the same state after it.
             _ => {
                 self.frame = Some(build_frame(&self.refs, seq, hdr, &self.planes));
                 self.tile_group(data)
@@ -759,8 +1032,35 @@ impl Decoder {
     /// `tile_group_obu( sz )` (5.11.1).
     fn tile_group(&mut self, data: &[u8]) -> Result<()> {
         if let Some((seq, hdr)) = self.pending.take() {
-            return self.tile_group_tasks(seq, hdr, data);
+            if self.threads > 1 && pipeline::applies(&hdr) {
+                return self.tile_group_tasks(seq, hdr, data);
+            }
+            if self.flying.is_some() {
+                // Not a frame that flies: the unit is decoded in place
+                // (`flight.rs`), and this error goes no further.
+                self.ground_for = flight::AFTER_A_FRAME_THAT_IS_NOT_A_JOB;
+                return Err(Error::unsupported("a frame that is decoded in place"));
+            }
+            self.frame = Some(build_frame(&self.refs, seq, hdr, &self.planes));
         }
+        match self.tile_group_in_place(data) {
+            Ok(true) => {
+                let f = self.frame.take().expect("frame in progress");
+                self.finish_frame(f);
+                self.seen_frame_header = false;
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => self.fail_in_progress(e),
+        }
+    }
+
+    /// The tiles of a tile group, into the frame in progress: whether that
+    /// was its last tile group. Every tile there is data for is decoded,
+    /// whatever another does (they are independent); the first error is
+    /// the group's, and the frame in progress then holds how far each tile
+    /// got (`sbs_done`).
+    fn tile_group_in_place(&mut self, data: &[u8]) -> Result<bool> {
         let f = self.frame.as_mut().expect("checked by the caller");
         let ti = f.hdr.tile_info.clone();
         let num_tiles = ti.cols * ti.rows;
@@ -781,6 +1081,9 @@ impl Decoder {
         r.byte_align()?;
         let mut pos = r.position() / 8;
         let mut tile_data = Vec::with_capacity(tg_end + 1 - tg_start);
+        // An error in the sizes ends the group: the tiles before it are
+        // decoded all the same.
+        let mut first = None;
         for tile_num in tg_start..=tg_end {
             let last = tile_num == tg_end;
             let tile_size = if last {
@@ -788,7 +1091,8 @@ impl Decoder {
             } else {
                 let n = ti.tile_size_bytes as usize;
                 if pos + n > data.len() {
-                    return Err(Error::bitstream("tile size runs past the tile group"));
+                    first = Some(Error::bitstream("tile size runs past the tile group"));
+                    break;
                 }
                 let mut v = 0usize;
                 for i in 0..n {
@@ -798,20 +1102,23 @@ impl Decoder {
                 v + 1
             };
             if pos + tile_size > data.len() {
-                return Err(Error::bitstream("tile data runs past the tile group"));
+                first = Some(Error::bitstream("tile data runs past the tile group"));
+                break;
             }
             tile_data.push((tile_num, &data[pos..pos + tile_size]));
             pos += tile_size;
         }
         let threads = self.threads.min(tile_data.len());
         // Each tile: whether its padding checked out, and its CDFs when it is
-        // the one whose CDFs the frame keeps.
-        type TileResult = Result<(bool, Option<Box<CdfContext>>)>;
+        // the one whose CDFs the frame keeps; and the superblocks it decoded.
+        type TileResult = (Result<(bool, Option<Box<CdfContext>>)>, usize);
         let coeff_reader = self.coeff_reader;
         let decode_one = |f: &mut FrameCtx, tile_num: usize, d: &[u8]| -> TileResult {
             let mut td = TileDecoder::new(f, d, tile_num / ti.cols, tile_num % ti.cols);
             td.coeff_reader = coeff_reader;
-            td.decode_tile()?;
+            if let Err(e) = td.decode_tile() {
+                return (Err(e), td.sbs_done);
+            }
             let ok = td.sd.trailing_ok();
             let saved = if !td.f.hdr.disable_frame_end_update_cdf
                 && tile_num == ti.context_update_tile_id
@@ -820,7 +1127,7 @@ impl Decoder {
             } else {
                 None
             };
-            Ok((ok, saved))
+            (Ok((ok, saved)), usize::MAX)
         };
         let results: Vec<(usize, TileResult)> = if threads > 1 {
             let nums: Vec<usize> = tile_data.iter().map(|t| t.0).collect();
@@ -829,43 +1136,54 @@ impl Decoder {
                 (tile_num, decode_one(shard, tile_num, d))
             })
         } else {
-            let mut out = Vec::new();
-            for &(tile_num, d) in &tile_data {
-                let r = decode_one(f, tile_num, d);
-                let stop = r.is_err();
-                out.push((tile_num, r));
-                if stop {
-                    break;
-                }
-            }
-            out
+            tile_data
+                .iter()
+                .map(|&(tile_num, d)| (tile_num, decode_one(f, tile_num, d)))
+                .collect()
         };
-        for (tile_num, r) in results {
-            let (ok, saved) = r?;
-            if !ok {
-                f.tiles_ok = false;
-                if self.strict {
-                    return Err(Error::bitstream(format!(
-                        "tile {tile_num} does not end with its padding"
-                    )));
+        let mut failed = None;
+        for (tile_num, (r, done)) in results {
+            f.sbs_done[tile_num] = done;
+            match r {
+                Ok((ok, saved)) => {
+                    if !ok {
+                        // Decoded, but not as the data was coded: a tile
+                        // that does not end as 8.2.4 requires is the surest
+                        // sign of data damaged in it.
+                        f.tiles_ok = false;
+                        failed.get_or_insert(Error::bitstream(format!(
+                            "tile {tile_num} does not end with its padding"
+                        )));
+                    }
+                    if saved.is_some() {
+                        f.saved_cdfs = saved;
+                    }
                 }
-            }
-            if saved.is_some() {
-                f.saved_cdfs = saved;
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
             }
             f.tile_num = tile_num + 1;
         }
-        if tg_end == num_tiles - 1 {
-            let f = self.frame.take().expect("frame in progress");
-            self.finish_frame(f)?;
-            self.seen_frame_header = false;
+        if let Some(e) = failed.or(first) {
+            return Err(e);
         }
-        Ok(())
+        Ok(tg_end == num_tiles - 1)
     }
 
     /// After the last tile: `frame_end_update_cdf()` and the decode frame
     /// wrapup process.
-    pub(crate) fn finish_frame(&mut self, mut f: FrameCtx) -> Result<()> {
+    pub(crate) fn finish_frame(&mut self, mut f: FrameCtx) {
+        let lr = filter_frame(&mut f, self.threads);
+        self.wrapup_with(f, lr);
+    }
+
+    /// The decode frame wrapup process (7.4) for a decoded frame whose
+    /// post-filters have made `LrFrame` `lr`: the reference update, and
+    /// the output if it is shown. A frame that failed comes here
+    /// concealed (`recovery.rs`), its CDFs those it was set up with
+    /// unless the tile it keeps them from decoded.
+    pub(crate) fn wrapup_with(&mut self, mut f: FrameCtx, lr: FrameBuf) {
         if !f.hdr.disable_frame_end_update_cdf
             && let Some(s) = f.saved_cdfs.take()
         {
@@ -873,12 +1191,6 @@ impl Decoder {
             // load clears them.
             f.cdfs = s;
         }
-        self.decode_frame_wrapup(f)
-    }
-
-    /// The decode frame wrapup process (7.4) for a decoded frame.
-    fn decode_frame_wrapup(&mut self, mut f: FrameCtx) -> Result<()> {
-        let lr = filter_frame(&mut f, self.threads);
         // `CurrFrame`, once the post-filters have made `LrFrame` of it.
         if f.filtered.is_none() {
             f.pool.give_back(std::mem::take(&mut f.cur));
@@ -888,13 +1200,20 @@ impl Decoder {
             .syntax
             .set(frame_syntax(&mut f, &self.ref_state.order_hint));
         let _ = data.frame.set(lr);
-        self.reference_update(&f.seq, &f.hdr, Arc::new(data));
-        Ok(())
+        let damaged = self.cur_damaged;
+        self.reference_update(&f.seq, &f.hdr, Arc::new(data), damaged);
     }
 
     /// The reference frame update process (7.20) for a frame whose slot
-    /// contents are `data`, and the output process if it is shown.
-    fn reference_update(&mut self, seq: &Arc<SequenceHeader>, h: &FrameHeader, data: Arc<RefData>) {
+    /// contents are `data`, and the output process if it is shown (a
+    /// `damaged` frame only when concealing, flagged).
+    fn reference_update(
+        &mut self,
+        seq: &Arc<SequenceHeader>,
+        h: &FrameHeader,
+        data: Arc<RefData>,
+        damaged: bool,
+    ) {
         let hs = Arc::new(RefHeaderState {
             frame_id: h.current_frame_id,
             frame_type: h.frame_type,
@@ -915,31 +1234,41 @@ impl Decoder {
                 self.ref_state.slots[i] = Some(hs.clone());
                 self.ref_state.valid[i] = true;
                 self.ref_state.order_hint[i] = h.order_hint;
+                self.recovery.damaged[i] = damaged;
+                self.recovery.unknown[i] = false;
             }
         }
         self.ref_state.current_frame_id = h.current_frame_id;
+        self.ref_state.frame_id_seen = true;
         if h.show_frame {
-            self.show(seq, &data, &h.film_grain);
+            self.show(seq, &data, &h.film_grain, damaged);
         }
     }
 
     /// Shows a frame: the output process (7.18), now, or when the unit
-    /// being flown has landed.
+    /// being flown has landed. A damaged frame is withheld, or with
+    /// concealment shown flagged.
     fn show(
         &mut self,
         seq: &Arc<SequenceHeader>,
         data: &Arc<RefData>,
         grain: &crate::header::FilmGrainParams,
+        damaged: bool,
     ) {
+        if damaged && !self.conceal {
+            return;
+        }
         match &mut self.flying {
-            Some(flight) => flight.shown.push(flight::Shown {
+            Some(flight) => flight.shown.push(flight::Shown::Frame {
                 seq: seq.clone(),
                 data: data.clone(),
-                grain: grain.clone(),
+                grain: Box::new(grain.clone()),
                 hdr: self.hdr,
+                concealed: damaged,
             }),
             None => {
-                let out = self.output(seq, data, grain);
+                let mut out = self.output(seq, data, grain);
+                out.concealed = damaged;
                 self.shown.push(out);
             }
         }
@@ -954,20 +1283,34 @@ impl Decoder {
         let hs = self.ref_state.slots[idx]
             .clone()
             .ok_or_else(|| Error::bitstream("show_existing_frame of an empty slot"))?;
+        let damaged = match self.assess_shown(&seq, &hdr) {
+            Ok(d) => d,
+            Err(e) => {
+                // A key frame's refresh did not happen.
+                self.recovery.lose_slots(hdr.refresh_frame_flags);
+                return Err(e);
+            }
+        };
         if hdr.frame_type == KEY_FRAME {
+            // The loading process (7.21) loads its frame id too.
+            self.ref_state.current_frame_id = hs.frame_id;
+            self.ref_state.frame_id_seen = true;
             // The reference frame loading process, then the update with
             // refresh_frame_flags = allFrames.
             let order_hint = data.order_hint;
+            let unknown = self.recovery.unknown[idx];
             for i in 0..NUM_REF_FRAMES {
                 if (hdr.refresh_frame_flags >> i) & 1 != 0 {
                     self.refs[i] = Some(data.clone());
                     self.ref_state.slots[i] = Some(hs.clone());
                     self.ref_state.valid[i] = true;
                     self.ref_state.order_hint[i] = order_hint;
+                    self.recovery.damaged[i] = damaged;
+                    self.recovery.unknown[i] = unknown;
                 }
             }
         }
-        self.show(&seq, &data, &hdr.film_grain);
+        self.show(&seq, &data, &hdr.film_grain, damaged);
         Ok(())
     }
 
@@ -1260,6 +1603,7 @@ pub(crate) fn build_frame(
     let c = &seq.color;
     let mi_rows = hdr.mi_rows;
     let mi_cols = hdr.mi_cols;
+    let hdr_tiles = hdr.tile_info.cols * hdr.tile_info.rows;
     let cdfs = if hdr.primary_ref_frame == PRIMARY_REF_NONE {
         CdfContext::new(hdr.base_q_idx)
     } else {
@@ -1344,6 +1688,7 @@ pub(crate) fn build_frame(
         mask: Box::new([0; 128 * 128]),
         tile_num: 0,
         tiles_ok: true,
+        sbs_done: vec![0; hdr_tiles],
         filtered: None,
         pool: pool.clone(),
     };

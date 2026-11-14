@@ -309,6 +309,15 @@ impl<'a> SymbolDecoder<'a> {
     pub(crate) fn trailing_ok(&self) -> bool {
         ReferenceSymbolDecoder::at(self).trailing_ok()
     }
+
+    /// Whether decoding has run so far past the end of the data that the
+    /// tile cannot end as 8.2.4 requires: `SymbolMaxBits` below -14, which
+    /// it may not be on entry to `exit_symbol()` and which only falls. The
+    /// data was cut short (or is not what was coded), and every symbol
+    /// from here on is read from the zeros past its end.
+    pub(crate) fn ran_out(&self) -> bool {
+        self.consumed() > 8 * self.data.len() as i64 + 14
+    }
 }
 
 /// The symbol decoder as 8.2 writes it, state and all: `SymbolValue`,
@@ -790,6 +799,14 @@ impl<'a> Coder<'a> {
 
     pub(crate) fn encoding(&self) -> bool {
         matches!(self, Coder::Enc(_))
+    }
+
+    /// See [`SymbolDecoder::ran_out`]; never, encoding.
+    pub(crate) fn ran_out(&self) -> bool {
+        match self {
+            Coder::Dec(d) | Coder::Both(d, _) => d.ran_out(),
+            Coder::Enc(_) => false,
+        }
     }
 
     /// Whether this is trial coding (see `SymbolEncoder::counting`).

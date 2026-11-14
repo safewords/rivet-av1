@@ -150,6 +150,12 @@ pub struct Frame {
     pub render_width: u32,
     /// See [`Self::render_width`].
     pub render_height: u32,
+    /// Whether the frame is not exactly what the stream codes: a decoder
+    /// concealing errors ([`crate::Decoder::set_concealment`]) filled in
+    /// what of it did not decode, or predicted it from a frame that was
+    /// filled in. Always `false` for a frame decoded without error from
+    /// references that were.
+    pub concealed: bool,
     /// The samples of every plane, packed: one byte each at 8 bits, else
     /// little-endian `u16` with the value in the low bits.
     pub data: Vec<u8>,
@@ -186,6 +192,7 @@ impl Frame {
             hdr: HdrMetadata::default(),
             render_width: width,
             render_height: height,
+            concealed: false,
             data: vec![0u8; offset],
             planes,
         }

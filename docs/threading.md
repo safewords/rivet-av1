@@ -312,8 +312,9 @@ task of the frame is taken. **The frame is then decoded again, from its
 header, the way one thread decodes it**: that reports the error, and
 leaves the decoder exactly as a one-thread decoder is after it (the frame
 state a later tile group of a damaged stream would go on into, among
-other things). The same for a tile whose padding is wrong, for a decoder
-that checks it (`set_strict`). Errors are rare, and the second decode is
+other things), and conceals it as one thread does (`recovery.rs`). The
+same for a tile whose padding is wrong, which is an error whatever the
+decoder's strictness. Errors are rare, and the second decode is
 what makes "the same errors at every thread count" true by construction
 rather than by argument. A thread that panics marks its frame abandoned
 on its way out (a drop guard), so the others end instead of waiting for a
@@ -361,11 +362,23 @@ together is less than twice that. More threads need more frames. From
   calling thread, until an earlier frame is complete, before it submits
   one more.
 
+**Tile lists fly too.** A tile list OBU (large scale tile decoding, 7.3)
+depends on the frame header in force and the anchor frames, and nothing
+depends on it: no frame refers to its output, and it updates no slot. In
+flight its entries are read and its anchors made references on the
+calling thread, and its tiles are decoded by a job of its own (`Job::work`:
+one task, started once the primary reference's saved CDFs are there), in
+a frame state of its own set up from the frame header, so several lists
+are decoded at once. The frame header in force without tile groups (the
+camera frame header) is kept as its header alone (`pending`) between
+units, so that the units after it fly. `tile_list_layout` is that of the
+last list whose result was taken.
+
 **Whatever does not fit is decoded in place.** A frame that is not a job
 (several tiles, intra block copy), a unit that begins inside a frame, an
 error of any kind, a tile that does not parse: the decoder goes back to
 how it was before that unit (a snapshot: the slots, the header state,
-the sequence header), waits for every unit before it, gives up the
+the sequence header, the camera frame header, the recovery marks), waits for every unit before it, gives up the
 frames in flight from that unit on, and decodes the unit with
 `decode_all`'s code. The units after it are then queued again from their
 bytes, which are kept until a unit's result is taken. So a unit's result,

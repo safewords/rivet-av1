@@ -1785,6 +1785,7 @@ mod tests {
             mask: Box::new([0; 128 * 128]),
             tile_num: 0,
             tiles_ok: true,
+            sbs_done: Vec::new(),
             filtered: None,
             pool: Default::default(),
         }

@@ -33,8 +33,11 @@ fn decoder() -> av1::Decoder {
     d
 }
 
-fn decode_all(packets: &[Vec<u8>]) {
+fn decode_all(packets: &[Vec<u8>], conceal: bool) {
     let mut d = decoder();
+    // Concealment fills in what does not decode from other frames, of
+    // other sizes perhaps: as calmly.
+    d.set_concealment(conceal);
     // `AV1_FRAMES_IN_FLIGHT`: the units are queued, with that many frames
     // in flight, and their results taken as they come.
     let flight: usize = std::env::var("AV1_FRAMES_IN_FLIGHT")
@@ -88,6 +91,7 @@ proptest! {
         let k2 = (cut_packet / 7) % n;
         let at = cut % (s[k2].len() + 1);
         s[k2].splice(at..at, splice);
-        decode_all(&s);
+        decode_all(&s, false);
+        decode_all(&s, true);
     }
 }

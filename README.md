@@ -70,25 +70,78 @@ takes them). With the frame header in force as the camera frame header
 frame, its tiles side by side in the list's order, returned as a shown
 frame is; `Decoder::tile_list_layout` says where each tile is.
 
-Not there yet:
+**Errors** do not stop the decoder (`src/decoder/recovery.rs`). A unit
+in which a frame fails returns its error, and decoding carries on, within
+the unit and after it, with what the specification calls processable
+(Annex C): each reference slot is marked *damaged* when its samples (or
+the CDFs, motion vectors and segment map its frame saved) may not be the
+stream's, and *unknown* when not even its header state is (the frame
+header that would have set it did not parse, or data was lost whole). A
+frame that refers to a damaged slot (`ref_frame_idx`, the slot whose
+grain parameters it loads, or any slot when it derives its references
+from every slot's order hint) is damaged too, and is decoded all the
+same, so that the slots it refreshes hold a frame of the right size; a
+frame that fails is finished with what of it decoded and the rest filled
+in, and put in its slots damaged. An intra frame refers to nothing, so
+exact output starts again at the first frame that does not depend on what
+was lost: a key frame at the latest (every slot), an intra-only frame for
+the slots it refreshes. A damaged frame is not output; frames are never
+returned unflagged unless they are exactly the stream's. Failing at a
+frame already known to be damaged (its parsing reads its references' CDFs)
+is no news and not reported again. What counts as a failure: a syntax
+element out of range, a reference that does not fit, tile data that runs
+out (`SymbolMaxBits` below -14 at a superblock's end, which 8.2.4 forbids
+at the tile's), and a tile that does not end with the padding 8.2.4
+requires, which is the surest sign of damage in data that parses (strict
+or not); a cut OBU, an OBU header that does not read, or a frame whose
+tile groups stop before its last tile; and, in a stream with frame ids, a
+reference whose id is not the one the header expects (a lost frame,
+noticed). A unit lost whole without frame ids cannot be noticed by the
+stream (a frame predicted from the wrong reference is a valid decode of
+another stream): `Decoder::signal_loss` tells the decoder, from a
+transport that knows (`Decoder::is_recovering` says whether frames are
+being held back). The encoder writes frame ids with `Config::frame_ids`.
 
-- **Tile lists in flight**: a tile list is decoded in place, not by a
-  decoder with frames in flight (`queue`).
-- **A frame-buffer pool for `CurrFrame`.** The copies the post-filters
-  start from are made into the planes of frames nothing holds any more,
-  but `CurrFrame` is allocated, zeroed, every frame: zeroing a recycled
-  plane measured 4 % to 7 % slower than the system's zeroed pages, and
-  recycling it without zeroing would need every sample to be shown
-  written before it is read. The pool as it is is neither faster nor
-  slower (below).
-- **Error recovery.** A corrupt frame returns `Error::Bitstream`; there is
-  no concealment, so decoding should resume at the next key frame.
-  Malformed input has not made it panic under the property tests below,
-  and frames larger than 2^26 pixels (adjustable, `set_max_pixels`) are
-  refused before allocation.
-- Conformance requirements that do not change the output (frame id
-  consistency, level limits) are not checked; `set_strict(true)` checks
-  each tile's trailing padding.
+`Decoder::set_concealment(true)` shows what is withheld otherwise: an
+inter frame whose tiles fail comes out with every superblock that did not
+decode (from the one each tile failed in) filled from its primary
+reference (`LAST_FRAME`'s slot when it has none), scaled to the frame's
+size if need be, after the post-filters have run over the frame as
+decoded; and the frames predicted from such a frame come out too. All of
+them have `Frame::concealed` set, and a unit that shows frames returns
+them rather than its error. (An intra frame that fails is filled with
+grey, Annex C's neutral value, for the slots; it is not shown.) The
+result is the same on any number of threads and frames in flight: a frame
+that fails in a job is decoded again in place, as before.
+
+**Conformance checks.** `Decoder::set_strict(true)` reports, as an error
+naming the rule and its section, the requirements that decoding does not
+need: the frame id rules of 6.8.2 (`current_frame_id` against the
+previous frame's, `DiffFrameID`, every reference's `expectedFrameId`,
+`display_frame_id`, `RefValid` of the slots referred to, `idLen` of at most
+16 bits) and 6.8.20's `film_grain_params_ref_idx`; and the limits of A.3
+for the level the operating point decoded declares (the tables' levels;
+31 and the levels not yet defined have none): `MaxPicSize`, `MaxHSize`,
+`MaxVSize`, at least 16x16, `MaxTiles`, `MaxTileCols`, every tile's width
+(64, or 128 with super-resolution, unless it is the right-most; at most
+`MAX_TILE_WIDTH` upscaled), area (4096 x 2304) and cropped width and
+height (8), and, where the sequence header gives a frame rate
+(`timing_info` with `equal_picture_interval`), each temporal unit's
+`TotalDisplayLumaSampleRate`, and over each second `NumFrameHeadersSec`,
+the tiles a second and `TotalDecodedLumaSampleRate` (A.3 divides that one
+by decoding times, which are the decoder model's; over a second, the
+frames decoded are what must be decoded in a second). Not checked: what
+needs the decoder model of Annex E (the buffer and bitrate limits, and
+`CompressedRatio`, whose `SpeedAdj` is a decode rate) and the parallelism
+limit on 588 251 136 samples a second (which needs the scalability
+metadata's temporal layers). Not strict, none is reported and the output
+is what it was, with the one exception above: a reference that is not the
+frame its id says is a lost frame, and the frames after it are damaged
+whether strict or not. Strict, every AOM vector passes but the two
+spatial-layer ones (`av1-1-b8-22-svc-L2T1`, `L2T2`), which declare level
+2.1 for their 1280x720 layer and so break `MaxPicSize`; every Argon
+conformance stream passes, and each of Argon's error streams for these
+rules gives the error that names its rule (below).
 
 ### Speed
 
@@ -109,6 +162,18 @@ kept safe):
   stream needs this to use more than two or three threads (a frame's
   parsing is one thread's); every unit's frames or error are those of
   decoding it in place.
+- Tile lists (large scale tile decoding) in flight as well: each list is
+  decoded by a job of its own, from the frame header in force and the
+  anchors, since nothing depends on a tile list and it depends on nothing
+  decoded alongside it. In place a list is one thread's whatever the
+  threads. On the Argon large-scale-tile streams (every tile list after
+  their anchor frames, 2 248 lists, three runs each, Apple silicon): one
+  thread 1.245 s; eight threads in place 1.242 s; four threads and four
+  lists in flight 0.641 s (1.94x); eight and eight 0.590 s (2.11x). Most
+  of those lists are a few small tiles, so setting up each list's frame
+  state is much of its time. `tile_list_layout` is then that of the last
+  list whose result was taken, and `set_anchor_frames` is for when no unit
+  is queued.
 
 The hottest kernels have SIMD versions chosen at run time —
 AVX2 on x86-64, NEON on aarch64 — each tested bit-exact against its scalar
@@ -147,7 +212,8 @@ With the SIMD versions off (`AV1_NO_SIMD=1`) the 1080p one-tile stream
 decodes at 34.7 MP/s on one thread.
 
 The first column is the decoder before this work (single-threaded scalar).
-Frames are still decoded one after another; no frame-parallel decoding.
+These are decodes one frame after another (`decode_all`), without frames
+in flight.
 
 The planes the post-filters write (`CdefFrame` copied from `CurrFrame`,
 `LrFrame` from `CdefFrame`) come from a pool of the planes that frames no
@@ -168,7 +234,11 @@ neither faster nor slower.
 Recycling `CurrFrame` too (zeroed, as it must start) was 4 % to 7 %
 slower at one thread and at four: zeroing a recycled plane costs more than
 the zeroed pages the system hands out. On this machine allocation was not
-a cost to begin with (the system time of a decode is about 1 % of it).
+a cost to begin with (the system time of a decode is about 1 % of it), so
+recycling it without zeroing (which would need every sample read to have
+been written first, a property of the whole decoder to keep) could gain
+at most that 1 %. This is the decision, final: `CurrFrame` is allocated
+zeroed every frame, the copies come from the pool.
 
 ## What it encodes
 
@@ -1240,8 +1310,9 @@ Not there yet:
   The suite also carries, per stream, reference output for each operating
   point (`layers/N`, about 75 000 more decodes of the same streams with
   layers dropped): the operating point 1 set was run, **2 763 / 2 763 pass**
-  (`ARGON_LAYERS=1`); the others were not run for time. The
-  error-resilience directories (no reference output) are not run.
+  (`ARGON_LAYERS=1`); the others were not run for time. The error
+  directories (streams that each break a requirement, no reference
+  output) are run for the frame id and level rules (below).
 
   The large-scale-tile directories (tile list OBUs, 7.3) have reference
   output made with AOMedia's `lightfield_tile_list_decoder`: the frames
@@ -1250,7 +1321,8 @@ Not there yet:
   picture of its own, in the list's order: the output frame of 7.3.1 cut
   at its tiles, without the samples no tile covers). `tests/argon.rs`
   decodes them that way and hashes the same bytes (`ARGON_FILTER=large`
-  runs only these). **All 571 pass**:
+  runs only these). **All 571 pass**, decoded in place and with four
+  tile lists in flight on four threads (`AV1_FRAMES_IN_FLIGHT=4`):
 
   | group | pass |
   |---|---|
@@ -1275,7 +1347,47 @@ Not there yet:
   tests).
 - **Malformed input** (`tests/fuzz.rs`, proptest): arbitrary bytes, and the
   committed vectors with bits flipped, bytes cut and garbage spliced in,
-  decoded in debug builds (overflow checks on) — errors, never a panic.
+  decoded in debug builds (overflow checks on), concealing and not —
+  errors, never a panic.
+- **Recovery** (`tests/recovery.rs`): the committed vectors (each played
+  twice, so that a key frame follows the damage) and encoder streams
+  (frames in order, alt-ref groups with hidden frames, two tiles, frame
+  ids) with a unit corrupted in its tile data, cut short, dropped with the
+  loss signalled and dropped without, each decoded on one thread, on
+  four, with four frames in flight, concealing and not: no frame comes out
+  unflagged that is not the clean decode's, every unit from the next key
+  frame on is exactly the clean decode's, a cut inter frame comes out
+  concealed (its superblocks the clean decode's up to where it was cut,
+  its reference's after), concealment is the same on one thread and on
+  four, and with frame ids a dropped unit is noticed without being
+  signalled. What the stream gives no way to notice is not caught: AV1
+  carries no checksum, so a changed header field that stays in range, a
+  changed `frame_to_show_map_idx`, or a change late in a tile's data whose
+  padding still checks out decodes as a valid frame of another stream.
+  Flipping one to three bits in the last three quarters of every unit of
+  the committed vectors (2 240 streams, 40 a unit), 2 130 had an error
+  reported and 61 gave at least one unflagged frame that was not the
+  stream's (in a few of them the damage was noticed, but only frames
+  later); most of the 61 changed a frame header (the five-byte units that
+  show a hidden frame, the headers of the film grain vectors, which carry
+  their grain parameters), the rest a tile's data, undetected.
+- **Conformance checks** (`tests/conformance.rs`, the unit tests of
+  `src/decoder/conformance.rs`, `argon_error_streams` in
+  `tests/argon.rs`): encoder streams with frame ids decode strictly, and
+  with a reference's `delta_frame_id_minus_1`, a `display_frame_id` or the
+  level rewritten (16 tile columns, a frame 8 wide, one 6208 wide, at
+  level 4.0) give the error that names the rule, while a decoder that is
+  not strict gives the frames it gave; each of the 59 Argon error streams
+  for a frame id or level rule (the suite's stream documentation names the
+  rule) gives, strictly, the error that names it, and not strictly no
+  such error. The AOM vectors decoded strictly: 242 of 244, the two
+  failures the spatial-layer vectors' 1280x720 frames at the level 2.1 they
+  declare. The Argon suite decoded strictly: 3 578 of 3 586, the eight
+  failures `TotalDisplayLumaSampleRate` above the level's
+  `MaxDisplayRate` at the frame rate their sequence headers give
+  (checked by hand: `profile0_core/test3564_3676`, 266 240 samples a frame
+  at 30 frames a second at level 2.0, is 8.0 M samples a second against
+  4.4 M), a requirement the suite lists as not tested.
 - **SIMD**: each SIMD kernel (CDEF, the interpolation filters, the inverse
   transforms, the loop filter) against its scalar version on random input,
   on x86-64 (AVX2) in CI and on aarch64 (NEON) by hand (below); `AV1_NO_SIMD=1`

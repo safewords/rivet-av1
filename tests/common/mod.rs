@@ -141,6 +141,9 @@ pub fn run_vector(path: &Path) -> Outcome {
     let mut dec = av1::Decoder::new();
     // Both coefficient readers on every block, held to each other.
     dec.set_coefficient_reader(av1::decoder::CoefficientReader::Checked);
+    // AV1_STRICT decodes strictly: every vector conforms, so no check may
+    // fail.
+    dec.set_strict(std::env::var("AV1_STRICT").is_ok_and(|v| v != "0"));
     // AV1_DECODE_THREADS runs the threaded decoder (tiles, post-filters).
     if let Some(n) = std::env::var("AV1_DECODE_THREADS")
         .ok()

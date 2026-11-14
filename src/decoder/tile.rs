@@ -3,7 +3,6 @@
 //! residual decoding are in `predict` and `residual`; motion vector
 //! prediction in `mvpred`.
 
-use crate::Result;
 use crate::cdf::{CdfContext, palette_color_cdf};
 use crate::consts::*;
 use crate::decoder::FrameCtx;
@@ -11,6 +10,7 @@ use crate::decoder::record::Pass;
 use crate::decoder::state::{Mi, Mv};
 use crate::symbol::{Coder, SymbolDecoder};
 use crate::tables::*;
+use crate::{Error, Result};
 
 /// The block-level variables of the syntax (`MiRow`, `YMode`, `RefFrame`,
 /// ...), reset for each block.
@@ -216,6 +216,9 @@ pub(crate) struct TileDecoder<'a, 'b> {
     /// superblock row. Zero and empty otherwise: every row is in the plane.
     pub(crate) band_top: [usize; 3],
     pub(crate) above_line: [Vec<u16>; 3],
+    /// The superblocks of the tile decoded so far, in raster order: where
+    /// concealment takes over when the tile fails (`recovery.rs`).
+    pub(crate) sbs_done: usize,
 }
 
 impl<'a, 'b> TileDecoder<'a, 'b> {
@@ -291,6 +294,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             cursor: Default::default(),
             band_top: [0; 3],
             above_line: Default::default(),
+            sbs_done: 0,
         }
     }
 
@@ -326,10 +330,22 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             let mut c = self.mi_col_start;
             while c < self.mi_col_end {
                 self.decode_sb(r, c)?;
+                self.check_data_left()?;
                 c += sb4;
             }
             r += sb4;
         }
+        Ok(())
+    }
+
+    /// After a superblock: an error if the tile's data has run out
+    /// (`SymbolDecoder::ran_out`), else one more superblock done.
+    #[inline]
+    fn check_data_left(&mut self) -> Result<()> {
+        if self.sd.ran_out() {
+            return Err(Error::bitstream("tile data ran out"));
+        }
+        self.sbs_done += 1;
         Ok(())
     }
 
@@ -345,6 +361,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         while c < self.mi_col_end {
             self.rec.begin_sb();
             self.decode_sb(r, c)?;
+            self.check_data_left()?;
             c += sb4;
         }
         self.rec.finish();
