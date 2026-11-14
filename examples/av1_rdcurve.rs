@@ -68,6 +68,7 @@ fn apply(cfg: &mut Config, name: &str, value: &str) {
         "tiles" => cfg.tile_cols_log2 = n() as u32,
         "threads" => cfg.threads = n() as usize,
         "altref" => cfg.altref = n() as u32,
+        "film_grain" => cfg.film_grain = n() != 0,
         _ => {
             if !cfg.tools.set(name, n() as u32) {
                 panic!("unknown setting {name}");

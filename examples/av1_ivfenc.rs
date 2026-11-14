@@ -7,7 +7,7 @@
 //! Settings are `name=value`: `speed`, `tiles` (tile columns, log2),
 //! `threads`, `frames` (at most this many), `key` (key frame interval),
 //! `bitrate` (bits per second at 30 frames/s), `altref` (the alt-ref
-//! group, 0 for none), and the `Tools` switches by name (after `speed`).
+//! group, 0 for none), `film_grain` (1: denoise and signal the grain), and the `Tools` switches by name (after `speed`).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -87,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(("frames", v)) => max_frames = v.parse()?,
             Some(("key", v)) => cfg.keyframe_interval = v.parse()?,
             Some(("altref", v)) => cfg.altref = v.parse()?,
+            Some(("film_grain", v)) => cfg.film_grain = v.parse::<u32>()? != 0,
             Some(("bitrate", v)) => {
                 // Bits per second at 30 frames/s.
                 cfg.target_bits_per_frame = Some(v.parse::<u64>()? / 30);

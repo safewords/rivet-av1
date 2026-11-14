@@ -18,6 +18,7 @@ mod aq;
 pub(crate) mod cdef;
 pub(crate) mod fwd;
 mod gop;
+mod grain;
 pub(crate) mod lr;
 mod rc;
 pub(crate) mod rdo;
@@ -32,7 +33,7 @@ use crate::consts::*;
 use crate::decoder::Decoder;
 use crate::decoder::tile::TileDecoder;
 use crate::frame::{ChromaFormat, ColorInfo, Frame, HdrMetadata};
-use crate::header::FrameHeader;
+use crate::header::{FilmGrainParams, FrameHeader};
 use crate::obu::{ColorConfig, SequenceHeader, write_obu};
 use crate::tables::AC_QLOOKUP;
 use crate::{Error, Result};
@@ -117,6 +118,14 @@ pub struct Config {
     /// profile 2's; at 12 bits every format is profile 2's. The sequence
     /// header's `seq_profile` follows from this and `bit_depth`.
     pub chroma: ChromaFormat,
+    /// Film grain: each frame is denoised before it is coded, and the
+    /// grain taken out is estimated (its strength by intensity and its
+    /// spatial correlation, per plane) and signalled in the frame header
+    /// (`film_grain_params`) for the decoder to synthesise. Off by
+    /// default. The reconstruction (and what a decoder outputs) has the
+    /// synthesised grain; it is not the source's grain, so PSNR against
+    /// the source falls while the bitrate does.
+    pub film_grain: bool,
 }
 
 /// The encoder's coding tools, each switchable (for measurement, or to
@@ -370,6 +379,7 @@ impl Config {
             altref: DEFAULT_ALTREF,
             monochrome: false,
             chroma: ChromaFormat::Yuv420,
+            film_grain: false,
         }
     }
 
@@ -408,7 +418,7 @@ pub struct Encoder {
     shown: u64,
     /// Frames waiting for their group (alt-ref groups), and whether each
     /// is to be a key frame.
-    queue: std::collections::VecDeque<(Frame, bool)>,
+    queue: std::collections::VecDeque<(Frame, bool, FilmGrainParams)>,
     /// Frames taken, and since the last key frame among them.
     received: u64,
     received_since_key: u64,
@@ -445,6 +455,11 @@ pub struct Encoder {
     last2_slot: usize,
     /// The frame being encoded looks like screen content.
     next_screen_content: bool,
+    /// The film grain parameters of the frame being encoded.
+    next_grain: FilmGrainParams,
+    /// The last frame taken (film grain: its noise is measured against
+    /// it).
+    grain_prev: Option<Frame>,
 }
 
 /// The slot the golden frame (the key frame, or a periodic boosted frame)
@@ -496,6 +511,8 @@ struct FrameParams {
     show: bool,
     /// The frame's display index.
     order_hint: u64,
+    /// `film_grain_params()`.
+    grain: FilmGrainParams,
     /// `allow_intrabc`, and the source's hash for its search.
     intrabc: bool,
     ibc: Option<Arc<tile::IbcHash>>,
@@ -618,7 +635,7 @@ impl Encoder {
                     || cfg.color.transfer_characteristics != TC_UNSPECIFIED
                     || cfg.color.matrix_coefficients != MC_UNSPECIFIED,
             },
-            film_grain_params_present: false,
+            film_grain_params_present: cfg.film_grain,
         };
         let q = cfg.quantizer.clamp(1, 255) as f64;
         let rc = cfg.target_bits_per_frame.map(|t| {
@@ -659,6 +676,8 @@ impl Encoder {
             last_slot: 0,
             last2_slot: 1,
             next_screen_content: false,
+            next_grain: Default::default(),
+            grain_prev: None,
         }
     }
 
@@ -725,14 +744,24 @@ impl Encoder {
         self.force_key = false;
         self.received += 1;
         self.received_since_key = if key { 1 } else { self.received_since_key + 1 };
+        // Film grain: the frame is coded denoised, its grain signalled
+        // (measured here, in display order, against the frame before).
+        let (frame, grain) = if self.cfg.film_grain {
+            let seed = (self.received.wrapping_mul(7919).wrapping_add(4321) as u16) | 1;
+            let prev = self.grain_prev.replace(frame.clone());
+            grain::estimate(frame, prev.as_ref(), seed, self.cfg.color.full_range)
+        } else {
+            (frame.clone(), FilmGrainParams::default())
+        };
         if !self.altref_groups() {
-            let (obus, recon) = self.code_one(frame, if key { Role::Key } else { Role::Inter })?;
+            self.next_grain = grain;
+            let (obus, recon) = self.code_one(&frame, if key { Role::Key } else { Role::Inter })?;
             let tu = self.temporal_unit(key, &[], &obus);
             self.recon = recon;
             self.last_key = key;
             return Ok(tu);
         }
-        self.queue.push_back((frame.clone(), key));
+        self.queue.push_back((frame, key, grain));
         self.pump(false)?;
         Ok(self.pop_ready().unwrap_or_default())
     }
@@ -775,9 +804,10 @@ impl Encoder {
     /// Codes the frames held whose group is complete (all of them when
     /// `all`).
     fn pump(&mut self, all: bool) -> Result<()> {
-        while let Some(&(_, key)) = self.queue.front() {
+        while let Some(&(_, key, _)) = self.queue.front() {
             if key {
-                let (frame, _) = self.queue.pop_front().expect("a frame");
+                let (frame, _, grain) = self.queue.pop_front().expect("a frame");
+                self.next_grain = grain;
                 let (obus, recon) = self.code_one(&frame, Role::Key)?;
                 let tu = self.temporal_unit(true, &[], &obus);
                 self.ready.push_back((tu, recon, true));
@@ -824,6 +854,7 @@ impl Encoder {
                 gop::Step::Code { idx, layer, show } => {
                     let at = idx as usize - 1;
                     let frame = self.queue[at].0.clone();
+                    self.next_grain = self.queue[at].2.clone();
                     let role = Role::Group {
                         hint: base + at as u64,
                         layer,
@@ -1321,6 +1352,7 @@ impl Encoder {
             order_hint,
             intrabc,
             ibc: None,
+            grain: self.next_grain.clone(),
         }
     }
 
@@ -1666,6 +1698,17 @@ impl Encoder {
             for _ in LAST_FRAME..=ALTREF_FRAME {
                 w.flag(false); // is_global
             }
+        }
+        // film_grain_params(): every frame is shown or showable.
+        if seq.film_grain_params_present {
+            let c = &seq.color;
+            grain::write_params(
+                &mut w,
+                &p.grain,
+                !key,
+                c.mono_chrome,
+                c.subsampling_x == 1 && c.subsampling_y == 1,
+            );
         }
         w.byte_align();
         w.finish()

@@ -588,6 +588,114 @@ fn intra_block_copy_round_trips() {
 }
 
 #[test]
+fn film_grain_round_trips() {
+    // Frames with grain (correlated noise, fresh each frame): coded
+    // denoised with the grain signalled, every frame (grain synthesised)
+    // decodes to the reconstruction; the grain the decoder synthesises is
+    // about as strong as the grain added; and the stream is smaller than
+    // the same frames coded with their grain.
+    let (w, h) = (192, 128);
+    let mut seed = 99u32;
+    let mut noise = || {
+        // About Gaussian: a sum of four uniforms, unit variance.
+        let mut s = 0.0;
+        for _ in 0..4 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            s += (seed >> 8) as f64 / (1u32 << 24) as f64 - 0.5;
+        }
+        s * 3f64.sqrt()
+    };
+    let sigma = 4.0;
+    // A soft picture (gradients and a slowly moving disc), the grain on it.
+    let frames: Vec<Frame> = (0..4u32)
+        .map(|t| {
+            let mut g = Frame::new(w, h, 8, ChromaFormat::Yuv420);
+            for p in 0..3 {
+                let pl = g.planes[p];
+                let k = if p == 0 { 1.0 } else { 2.0 };
+                for y in 0..pl.height {
+                    for x in 0..pl.width {
+                        let (fx, fy) = (x as f64 * k, y as f64 * k);
+                        let d = (fx - 60.0 - 2.0 * t as f64).hypot(fy - 64.0);
+                        let v = if p == 0 {
+                            60.0 + fx * 0.5 + fy * 0.3 + if d < 30.0 { 50.0 } else { 0.0 }
+                        } else {
+                            110.0 + fy * 0.1 + p as f64 * 10.0
+                        };
+                        g.set_sample(p, x, y, v as u16);
+                    }
+                }
+            }
+            for p in 0..3 {
+                let pl = g.planes[p];
+                // White noise smoothed over two samples each way.
+                let (pw, ph) = (pl.width as usize, pl.height as usize);
+                let white: Vec<f64> = (0..pw * ph).map(|_| noise()).collect();
+                let s = if p == 0 { sigma } else { sigma / 2.0 };
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let at = |dx: usize, dy: usize| {
+                            white[(y + dy).min(ph - 1) * pw + (x + dx).min(pw - 1)]
+                        };
+                        let n = (at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 2.0;
+                        let v = g.sample(p, x as u32, y as u32) as f64 + n * s;
+                        g.set_sample(p, x as u32, y as u32, v.round().clamp(0.0, 255.0) as u16);
+                    }
+                }
+            }
+            g
+        })
+        .collect();
+    let mut cfg = cfg_for(w, h);
+    cfg.quantizer = 80;
+    cfg.film_grain = true;
+    let mut enc = Encoder::new(cfg.clone());
+    let mut dec = Decoder::new();
+    let mut plain = Decoder::new();
+    plain.set_apply_grain(false);
+    let mut bytes = 0;
+    let mut strength = Vec::new();
+    let mut check = |tu: Vec<u8>, enc: &Encoder| {
+        bytes += tu.len();
+        let d = dec.decode(&tu).unwrap().unwrap();
+        assert_eq!(Some(&d), enc.reconstruction());
+        let n = plain.decode(&tu).unwrap().unwrap();
+        let pl = d.planes[0];
+        let mut se = 0.0;
+        for y in 0..pl.height {
+            for x in 0..pl.width {
+                let e = d.sample(0, x, y) as f64 - n.sample(0, x, y) as f64;
+                se += e * e;
+            }
+        }
+        strength.push((se / (pl.width * pl.height) as f64).sqrt());
+    };
+    for f in &frames {
+        let tu = enc.encode(f).unwrap();
+        if !tu.is_empty() {
+            check(tu, &enc);
+        }
+    }
+    while let Some(tu) = enc.flush().unwrap() {
+        check(tu, &enc);
+    }
+    assert_eq!(strength.len(), frames.len());
+    for s in &strength {
+        assert!(
+            (0.5 * sigma..1.5 * sigma).contains(s),
+            "synthesised grain of strength {s:.2} for {sigma}"
+        );
+    }
+    cfg.film_grain = false;
+    let (_, sizes) = round_trip(cfg, &frames);
+    let without: usize = sizes.iter().sum();
+    assert!(
+        bytes < without,
+        "{bytes} bytes with grain synthesis, {without} without"
+    );
+}
+
+#[test]
 fn every_tool_round_trips() {
     let src = natural(4);
     let crop = |f: &Frame| {
