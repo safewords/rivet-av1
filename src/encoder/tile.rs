@@ -311,7 +311,9 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The modes of the block about to be coded (encode mode): sets `plan`.
-    pub(crate) fn enc_decide_block(&mut self) -> Result<()> {
+    /// Returns true when the search left the block coded (see
+    /// `enc_decide_block_rd`).
+    pub(crate) fn enc_decide_block(&mut self) -> Result<bool> {
         // The block's `Lossless` (its segment's; the encoder codes no
         // segmentation), which mode info would only set after the decision.
         self.b.lossless = self.f.hdr.lossless_array[0];
@@ -319,7 +321,7 @@ impl TileDecoder<'_, '_> {
             return self.enc_decide_block_rd();
         }
         self.enc_decide_block_greedy();
-        Ok(())
+        Ok(false)
     }
 
     /// The prediction arguments `transform_block()` will use for the first

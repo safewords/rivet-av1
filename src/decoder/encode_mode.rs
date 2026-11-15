@@ -106,7 +106,7 @@ impl TileDecoder<'_, '_> {
         unreachable!()
     }
 
-    pub(crate) fn enc_decide_block(&mut self) -> crate::Result<()> {
+    pub(crate) fn enc_decide_block(&mut self) -> crate::Result<bool> {
         unreachable!()
     }
 

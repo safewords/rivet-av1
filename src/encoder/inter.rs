@@ -68,6 +68,8 @@ impl TileDecoder<'_, '_> {
         self.enc.as_mut().expect("encode mode").probing = true;
         let done = self.decode_block_prediction(r, c, size);
         self.enc.as_mut().expect("encode mode").probing = false;
+        // (A probe's plan is forced: nothing is coded ahead of it.)
+        debug_assert!(!matches!(done, Ok(true)));
         done?;
         let bits = self.sd.trial_bits() - bits0;
         self.rdo().log.truncate(from.log_start);

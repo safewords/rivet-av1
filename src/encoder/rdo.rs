@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use crate::Result;
 use crate::consts::*;
 use crate::decoder::state::Mi;
-use crate::decoder::tile::{Plan, TileDecoder};
+use crate::decoder::tile::{PARTITION_CODED, Plan, TileDecoder};
 use crate::encoder::inter::ProbeFrom;
 use crate::tables::*;
 
@@ -76,6 +76,16 @@ struct Trial {
 /// search that started the trial catches it.
 fn abandoned() -> crate::Error {
     crate::Error::Unsupported(String::new())
+}
+
+/// What a block's cheapest trial left: the state of its rectangle, its
+/// cost, its bits, its transform blocks with coefficients, the block.
+struct Post {
+    state: Snap,
+    cost: f64,
+    bits: u64,
+    nonzero: u32,
+    b: crate::decoder::tile::Block,
 }
 
 /// The state of a rectangle of the frame, as trial coding may change it.
@@ -468,9 +478,19 @@ impl TileDecoder<'_, '_> {
         let mut children_whole = true;
         let mut none_refs: Option<[i32; 2]> = None;
         let mut first = true;
-        for &p in cands.iter() {
+        // Inside a trial (the caller counting too) the caller's coding of
+        // the best candidate would only repeat that candidate's trial: the
+        // state its trial left (`best_post`, unless the trial was the last
+        // and left it in place: `at_best`) and its bits stand in for it.
+        let skip_replay = counting;
+        let mut best_post: Option<Snap> = None;
+        let mut at_best = false;
+        let mut best_bits = 0;
+        let last = cands.len() - 1;
+        for (k, &p) in cands.iter().enumerate() {
             if !first {
                 self.restore(&snap);
+                at_best = false;
             }
             // A flat block that codes with no residual as one block is not
             // split further (speed).
@@ -545,8 +565,38 @@ impl TileDecoder<'_, '_> {
             if cost < best.0 {
                 let seg = self.rdo().log[log_start..].to_vec();
                 best = (cost, p, seg);
+                if skip_replay {
+                    best_bits = bits;
+                    at_best = true;
+                    if k < last {
+                        let post = self.snap(r, c, b_size);
+                        if let Some(old) = best_post.replace(post) {
+                            self.release(old);
+                        }
+                    }
+                }
             }
             self.rdo().log.truncate(log_start);
+        }
+        if skip_replay && best.0 < f64::MAX {
+            if !at_best {
+                let post = best_post.take().expect("the best candidate's state");
+                self.restore(&post);
+                self.release(post);
+            }
+            if let Some(post) = best_post {
+                self.release(post);
+            }
+            self.release(snap);
+            self.b = saved_b;
+            self.sd.set_counting(counting);
+            self.sd.set_trial_bits(bits_start + best_bits);
+            self.rdo().log.extend(best.2);
+            self.spend(best.0)?;
+            return Ok(PARTITION_CODED);
+        }
+        if let Some(post) = best_post {
+            self.release(post);
         }
         self.restore(&snap);
         self.release(snap);
@@ -567,7 +617,12 @@ impl TileDecoder<'_, '_> {
     /// The candidates are trialled with the DCT alone (`Rdo::fast_tx`);
     /// the best then with its transform types searched, at each transform
     /// depth.
-    pub(crate) fn enc_decide_block_rd(&mut self) -> Result<()> {
+    ///
+    /// Returns true when the block is left coded: inside a trial (the
+    /// caller counting too) the caller's coding of the best candidate
+    /// would only repeat that candidate's trial, so the state the trial
+    /// left is put back instead, and its bits counted.
+    pub(crate) fn enc_decide_block_rd(&mut self) -> Result<bool> {
         let rdo = self.rdo();
         let plan = if let Some(d) = rdo.replay.pop_front() {
             match d {
@@ -580,7 +635,7 @@ impl TileDecoder<'_, '_> {
         if let Some(p) = plan {
             self.plan = p;
             self.rdo().log.push(Decision::Block(p));
-            return Ok(());
+            return Ok(false);
         }
         let cands = self.block_candidates();
         let (r, c, size) = (self.b.mi_row, self.b.mi_col, self.b.mi_size);
@@ -593,6 +648,11 @@ impl TileDecoder<'_, '_> {
         let tools = self.enc.as_ref().expect("encode mode").tools;
         let mut best: (f64, Plan, Vec<Decision>) = (f64::MAX, cands[0], Vec::new());
         let mut first = true;
+        // The state the cheapest trial so far left (the first of equal
+        // costs, as `best` keeps), for the caller in place of its coding
+        // (not when a test forces a variant, which may be taken dearer).
+        let skip_replay = counting && tools.force_inter_tool == 0;
+        let mut post: Option<Post> = None;
         let mut trial = |t: &mut Self, p: Plan, fast: bool| -> Result<(f64, bool, Vec<Decision>)> {
             if !first {
                 t.restore(&snap);
@@ -607,10 +667,23 @@ impl TileDecoder<'_, '_> {
             t.decode_block(r, c, size)?;
             let bits = t.sd.trial_bits() - bits0;
             let sse = t.rect_sse(snap.r0, snap.r1, snap.c0, snap.c1);
+            let cost = t.rd_cost(sse, bits);
             let rdo = t.rdo();
-            let zero = rdo.nonzero == 0;
+            let nonzero = rdo.nonzero;
             let seg = rdo.log.split_off(log_start);
-            Ok((t.rd_cost(sse, bits), zero, seg))
+            if skip_replay && post.as_ref().is_none_or(|q| cost < q.cost) {
+                let state = t.snap(r, c, size);
+                if let Some(old) = post.replace(Post {
+                    state,
+                    cost,
+                    bits,
+                    nonzero,
+                    b: t.b.clone(),
+                }) {
+                    t.release(old.state);
+                }
+            }
+            Ok((cost, nonzero == 0, seg))
         };
         let refine = tools.tx_type_rd || tools.tx_size;
         let mut fast_best: (f64, Plan) = (f64::MAX, cands[0]);
@@ -769,6 +842,27 @@ impl TileDecoder<'_, '_> {
                 }
             }
         }
+        match post {
+            // (`best` is the first trial of its cost, as `post` is.)
+            Some(q) if q.cost == best.0 => {
+                self.restore(&q.state);
+                self.release(q.state);
+                self.release(snap);
+                self.b = q.b;
+                self.sd.set_counting(counting);
+                self.sd.set_trial_bits(bits_start + q.bits);
+                let rdo = self.rdo();
+                rdo.fast_tx = fast_saved;
+                rdo.log.extend(best.2);
+                self.plan = best.1;
+                self.spend(best.0)?;
+                // What the caller's coding would have counted.
+                self.rdo().nonzero += q.nonzero;
+                return Ok(true);
+            }
+            Some(q) => self.release(q.state),
+            None => {}
+        }
         self.restore(&snap);
         self.release(snap);
         self.b = saved_b;
@@ -783,7 +877,7 @@ impl TileDecoder<'_, '_> {
         rdo.replay.extend(best.2.into_iter().skip(1));
         rdo.log.push(Decision::Block(best.1));
         self.spend(best.0)?;
-        Ok(())
+        Ok(false)
     }
 
     /// The deepest transform split a block may code: `tx_depth` (intra,

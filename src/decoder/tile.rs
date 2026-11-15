@@ -164,6 +164,12 @@ pub(crate) const PLAN_WEDGE: u8 = 2;
 /// (`COMPOUND_DIFFWTD`).
 pub(crate) const PLAN_DIFFWTD: u8 = 3;
 
+/// What the encoder's choice of a partition is when its search has left
+/// the block coded already (trial coding: the state its best candidate
+/// left is put back, its cost counted), so the walker codes nothing more
+/// of it.
+pub(crate) const PARTITION_CODED: usize = usize::MAX;
+
 /// The decoder of one tile: the symbol decoder, the tile's CDFs, the
 /// above/left contexts, and the block being decoded.
 pub(crate) struct TileDecoder<'a, 'b> {
@@ -650,6 +656,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         } else {
             0
         };
+        if planned == PARTITION_CODED {
+            return Ok(());
+        }
         let partition = if b_size < BLOCK_8X8 {
             PARTITION_NONE
         } else if has_rows && has_cols {
@@ -782,7 +791,9 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
 
     /// `decode_block( r, c, subSize )`.
     pub(crate) fn decode_block(&mut self, r: usize, c: usize, sub_size: usize) -> Result<()> {
-        self.decode_block_prediction(r, c, sub_size)?;
+        if self.decode_block_prediction(r, c, sub_size)? {
+            return Ok(());
+        }
         self.residual()?;
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size];
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size];
@@ -824,13 +835,16 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
     /// `decode_block()` up to its prediction: the block's mode info coded
     /// and stored, and the block predicted (the encoder's search measures
     /// a prediction by this alone).
+    ///
+    /// Returns true when the encoder's search left the block coded already
+    /// (see [`PARTITION_CODED`]): nothing more of it is to be coded.
     #[inline]
     pub(crate) fn decode_block_prediction(
         &mut self,
         r: usize,
         c: usize,
         sub_size: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ssx = self.ssx();
         let ssy = self.ssy();
         self.b = Block {
@@ -881,8 +895,8 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         b.interp_filter = [0, 0];
         b.compound_type = COMPOUND_AVERAGE;
         b.compound_idx = 1;
-        if self.sd.encoding() {
-            self.enc_decide_block()?;
+        if self.sd.encoding() && self.enc_decide_block()? {
+            return Ok(true);
         }
         self.mode_info();
         self.palette_tokens();
@@ -928,7 +942,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         } else {
             self.compute_prediction();
         }
-        Ok(())
+        Ok(false)
     }
 
     fn reset_block_context(&mut self, bw4: usize, bh4: usize) {
