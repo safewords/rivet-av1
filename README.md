@@ -1532,6 +1532,24 @@ Measured on the way and left out (speed 6, foreman, BD-rate PSNR-Y
   (`prune_split`); with flat blocks split unless they cost under 0.05 to
   0.15 lambda a sample, `rdoq` 3 is −2.0 %, but 1.3x the time.
 
+Where 4b5a62c stands, on a quiet machine: CPU time of each clip at all five
+quantisers, one thread, one encode at a time, rav1e 0.8.1 and rivet-av1
+interleaved, the best of two rounds (rav1e's seconds, then rivet-av1's
+time against them). Every clip at every tier is under rav1e's time:
+
+| clip | speed 4 | speed 6 | speed 8 |
+|---|---|---|---|
+| foreman | 12.81 s, 0.681x | 7.79 s, 0.629x | 6.67 s, 0.645x |
+| mobile | 17.65 s, 0.752x | 11.02 s, 0.658x | 9.44 s, 0.699x |
+| akiyo | 5.58 s, 0.551x | 3.25 s, 0.660x | 2.76 s, 0.645x |
+| ducks_take_off | 125.01 s, 0.958x | 74.39 s, 0.870x | 63.72 s, 0.912x |
+| park_joy | 129.83 s, 0.807x | 83.29 s, 0.724x | 71.16 s, 0.759x |
+| all five | 290.9 s, 0.858x | 179.7 s, 0.775x | 153.7 s, 0.812x |
+
+With the BD-rates of the table above, every clip is ahead of rav1e on
+PSNR-Y at every tier, and on PSNR-YUV at every tier but akiyo's at speed
+4 (+0.02 %, level).
+
 Not there yet:
 
 - **V everywhere**: V's +35 % to +59 % against rav1e in its own BD-rate
