@@ -267,7 +267,7 @@ fn quantise_row(
     is: &[u16],
 ) -> usize {
     #[cfg(target_arch = "aarch64")]
-    if col.len() % 4 == 0 {
+    if col.len().is_multiple_of(4) {
         // SAFETY: NEON is part of the aarch64 baseline.
         return unsafe { quantise_row_neon(col, inv, q, lv, oc, is) };
     }
@@ -310,7 +310,7 @@ unsafe fn quantise_row_neon(
 ) -> usize {
     use std::arch::aarch64::*;
     let n = col.len();
-    assert!(lv.len() >= n && oc.len() >= n && is.len() >= n && n % 4 == 0);
+    assert!(lv.len() >= n && oc.len() >= n && is.len() >= n && n.is_multiple_of(4));
     let inv = vdupq_n_f64(inv);
     let (ac_r, round, max) = (
         vdupq_n_f64(q.ac_r),
