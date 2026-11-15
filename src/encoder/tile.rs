@@ -196,8 +196,10 @@ struct QEntry {
     key: Option<(u8, u8, u64, u64, u64)>,
     res: Vec<i32>,
     levels: Vec<i32>,
-    /// The coefficients, `tw` a row.
+    /// The coefficients, `tw` a row, when they were asked for
+    /// (`has_coefs`).
     coefs: Vec<f64>,
+    has_coefs: bool,
     eob: usize,
 }
 
@@ -1263,7 +1265,7 @@ impl TileDecoder<'_, '_> {
                 self.choose_luma_tx_type(x, y, tx_sz)
             } else {
                 let t = self.chroma_intra_tx_type(tx_sz, uv_mode);
-                self.quantise_block(plane, x, y, tx_sz, t)
+                self.quantise_block(plane, x, y, tx_sz, t, false)
             };
             if eob > 0 {
                 return false;
@@ -1281,7 +1283,7 @@ impl TileDecoder<'_, '_> {
             TX_SIZE_SQR_UP[tx_sz] <= TX_16X16 && self.f.hdr.base_q_idx > 0 && !self.b.lossless;
         if !choice {
             self.plan.tx_type = DCT_DCT;
-            return self.quantise_block(0, x, y, tx_sz, DCT_DCT);
+            return self.quantise_block(0, x, y, tx_sz, DCT_DCT, false);
         }
         let mut best = (DCT_DCT, f64::MAX);
         for t in [DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST] {
@@ -1291,13 +1293,13 @@ impl TileDecoder<'_, '_> {
             }
         }
         self.plan.tx_type = best.0;
-        self.quantise_block(0, x, y, tx_sz, best.0)
+        self.quantise_block(0, x, y, tx_sz, best.0, false)
     }
 
     /// Distortion plus lambda times estimated bits of coding the luma
     /// residual at (x, y) with transform type `t`.
     fn trial_cost(&mut self, x: usize, y: usize, tx_sz: usize, t: usize) -> f64 {
-        let eob = self.quantise_block(0, x, y, tx_sz, t);
+        let eob = self.quantise_block(0, x, y, tx_sz, t, false);
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         let tw = w.min(32);
@@ -1385,7 +1387,7 @@ impl TileDecoder<'_, '_> {
             } else {
                 MAX_TX_SIZE_RECT[self.f.plane_residual_size(self.b.mi_size, plane)]
             };
-            if self.quantise_block(plane, x, y, tx_sz, DCT_DCT) > 0 {
+            if self.quantise_block(plane, x, y, tx_sz, DCT_DCT, false) > 0 {
                 return false;
             }
         }
@@ -1855,7 +1857,9 @@ impl TileDecoder<'_, '_> {
 
     /// Forward transforms and quantises the residual (source minus
     /// `CurrFrame`) of one transform block into `EncCtx::coefs`; returns the
-    /// end of block in the scan of `tx_type`.
+    /// end of block in the scan of `tx_type`; the coefficients into
+    /// `EncCtx::fc` too with `coefs` (for `rdoq`; without, they may be left
+    /// as they were).
     fn quantise_block(
         &mut self,
         plane: usize,
@@ -1863,6 +1867,7 @@ impl TileDecoder<'_, '_> {
         y: usize,
         tx_sz: usize,
         tx_type: usize,
+        coefs: bool,
     ) -> usize {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
@@ -1972,10 +1977,15 @@ impl TileDecoder<'_, '_> {
                     dc_r.to_bits(),
                     dz.to_bits(),
                 );
-                if entry.key == Some(key) && entry.res[..] == res[..w * h] {
+                if entry.key == Some(key)
+                    && (entry.has_coefs || !coefs)
+                    && entry.res[..] == res[..w * h]
+                {
                     enc.coefs[..tw * th].copy_from_slice(&entry.levels);
-                    for (k, row) in entry.coefs.chunks_exact(tw).enumerate() {
-                        fc[k * w..k * w + tw].copy_from_slice(row);
+                    if coefs {
+                        for (k, row) in entry.coefs.chunks_exact(tw).enumerate() {
+                            fc[k * w..k * w + tw].copy_from_slice(row);
+                        }
                     }
                     return entry.eob;
                 }
@@ -1994,7 +2004,8 @@ impl TileDecoder<'_, '_> {
                 entry.levels.clear();
                 entry.levels.extend_from_slice(&enc.coefs[..tw * th]);
                 entry.coefs.clear();
-                for k in 0..th {
+                entry.has_coefs = coefs;
+                for k in (0..th).filter(|_| coefs) {
                     entry.coefs.extend_from_slice(&fc[k * w..k * w + tw]);
                 }
                 entry.eob = eob;
@@ -2130,13 +2141,13 @@ impl TileDecoder<'_, '_> {
         tx_type: usize,
         type_search: bool,
     ) -> usize {
-        let eob = self.quantise_block(plane, x, y, tx_sz, tx_type);
         let on = match self.enc().tools.rdoq {
             0 => false,
             1 => !self.sd.counting() || (plane > 0 && self.rdoq_uv_trials()),
             2 => !type_search,
             _ => true,
         };
+        let eob = self.quantise_block(plane, x, y, tx_sz, tx_type, on);
         if eob == 0 || !on || self.b.lossless {
             return eob;
         }
