@@ -836,6 +836,44 @@ not (above). At speed 8 the next steps up cost more than rav1e's time
 leaves: three inter candidates, −3.2 % (+2.2 %) for about 1.03x rav1e's
 time; the halves of every block, −7.6 % (−2.5 %) for 2.3x.
 
+**The same streams, faster again.** Every clip at rav1e's time or less,
+each of the 75 streams byte for byte what it was (CPU seconds, one thread,
+the five quantisers together, each encode alone and interleaved with
+rav1e's; one run on a machine shared with other work, to a few percent):
+
+| clip | speed 4: rav1e, rivet-av1 | speed 6 | speed 8 |
+|---|---|---|---|
+| foreman | 13.1, 9.2 (0.70x) | 8.0, 5.7 (0.71x) | 8.1, 5.3 (0.65x) |
+| mobile | 18.2, 14.0 (0.77x) | 11.3, 8.2 (0.73x) | 10.4, 7.3 (0.71x) |
+| akiyo | 5.8, 3.3 (0.57x) | 3.3, 2.4 (0.71x) | 3.2, 2.0 (0.64x) |
+| ducks_take_off | 128.9, 123.1 (0.96x) | 76.6, 73.1 (0.96x) | 68.4, 60.8 (0.89x) |
+| park_joy | 133.5, 107.2 (0.80x) | 86.7, 71.6 (0.83x) | 74.2, 56.8 (0.77x) |
+| **all** | **299, 257 (0.86x)** | **186, 161 (0.87x)** | **164, 132 (0.81x)** |
+
+About 0.85x the time before at every speed, from:
+
+- **A search inside a trial no longer has its caller code its best
+  again.** A partition's, a block's or a transform type's search ran
+  inside its parent's trial, put the region back and handed the caller
+  its decisions to code again — the best candidate's trial repeated
+  exactly (counting mode adapts no CDF; the neighbours are the same). It
+  now keeps the state the best trial left and puts that back, counting its
+  bits and logging its decisions as the caller's coding would have
+  (`PARTITION_CODED`, `decode_block_prediction` returning true,
+  `Rdo::tx_coded`); the superblock's own coding, which adapts the CDFs, is
+  as it was. 0.93x at speed 6.
+- **Snapshots of what a trial changes, not more**: the rows of
+  `BlockDecoded` and the 64x64 blocks' CDEF indices a block can change (the
+  superblock's 3.4 KB and the frame's indices were copied every time), and
+  no samples in a search's own snapshot (each trial writes every sample of
+  the region before it reads one).
+- SATD of 8-bit samples in 16 bits, eight columns at a time, and the
+  motion search's predictions measured as made, in 16 bits; the
+  quantiser's rows four coefficients at a time; the quantiser cache's
+  coefficients copied only for rdoq; inter predictions read from the
+  references alone kept for when the search makes them again; nothing
+  allocated per transform block.
+
 **Groups at scene cuts**, measured and left out: a group ended at a scene
 cut (a frame whose quarter-size thumbnail, motion-searched against the
 one before, costs more than 1.2 times its own deviation from its block
