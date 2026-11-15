@@ -41,6 +41,19 @@ use crate::obu::{ColorConfig, SequenceHeader, write_obu};
 use crate::tables::AC_QLOOKUP;
 use crate::{Error, Result};
 
+/// The group a fast pan is coded in: see `Encoder::follow_content`. (On
+/// four pans of 40 frames, groups of 4 against 16: -8.5 %, -6.2 %, -1.9 %
+/// and -0.6 % BD-rate PSNR-YUV; of 8, -0.9 % to -0.2 %.)
+const SHORT_GROUP: usize = 4;
+/// See `Encoder::follow_content`: frames four apart in the test clips
+/// cost 0.05 (akiyo) to 0.76 (ducks_take_off) of their intra cost in the
+/// lookahead, in fast pans 0.8 to 0.99.
+const LOW_CORRELATION: f64 = 0.85;
+/// A pan whose frames cross the threshold back and forth codes worse in
+/// groups of both lengths than in either: whole groups again only well
+/// below it.
+const HYSTERESIS: f64 = 0.1;
+
 /// The default [`Config::speed`].
 pub const DEFAULT_SPEED: u32 = 4;
 
@@ -724,6 +737,8 @@ pub struct Encoder {
     /// The display indices of the hidden frames not yet shown (alt-ref
     /// groups).
     pending: Vec<u64>,
+    /// The last group was shortened (`follow_content`).
+    short_groups: bool,
     /// The display index of the group's anchor: the last key frame or
     /// alt-ref frame shown (alt-ref groups), kept as a reference.
     anchor: u64,
@@ -1016,6 +1031,7 @@ impl Encoder {
             received_since_key: 0,
             ready: Default::default(),
             pending: Vec::new(),
+            short_groups: false,
             anchor: 0,
             group_plan: None,
             since_key: 0,
@@ -1176,6 +1192,7 @@ impl Encoder {
                         break;
                     }
                     g = g.min(self.queue.len() - 1);
+                    g = self.follow_content(1, g);
                 }
                 if g > 0 {
                     let last = all && self.queue.len() == g + 1;
@@ -1212,10 +1229,47 @@ impl Encoder {
                 break;
             }
             g = g.min(self.queue.len());
+            g = self.follow_content(0, g);
             let last = all && g == self.queue.len();
             self.code_group(g, last)?;
         }
         Ok(())
+    }
+
+    /// How many of the `g` frames held from `start` to code as the next
+    /// group: `g`, or [`SHORT_GROUP`] where frames four apart have little
+    /// in common (a fast pan: the alt-ref frame cannot be predicted
+    /// across the group, nor the frames between from it). The test is
+    /// the lookahead's: each even frame predicted from the frame four
+    /// before it (six pairs, or at least three of the clip's last
+    /// frames), and the mean ratio of its cost to its intra cost, over the
+    /// two thirds of the pairs that cost least (a scene cut is in two of
+    /// them, two cuts close together in four), above [`LOW_CORRELATION`],
+    /// or once groups are short `HYSTERESIS` below it. Too few frames for
+    /// the test (the clip's last): as the group before.
+    fn follow_content(&mut self, start: usize, g: usize) -> usize {
+        let pairs = (g.saturating_sub(SHORT_GROUP + 1) / 2 + 1).min(6);
+        if g <= 2 * SHORT_GROUP {
+            return if self.short_groups && g > SHORT_GROUP {
+                SHORT_GROUP
+            } else {
+                g
+            };
+        }
+        let planes: Vec<_> = (0..pairs + 2)
+            .map(|k| lookahead::Plane::new(&self.queue[start + 2 * k].0))
+            .collect();
+        let mut r: Vec<f64> = (0..pairs)
+            .map(|k| {
+                let (intra, inter) = lookahead::costs(&planes[k + 2], &[&planes[k]]);
+                inter / intra.max(1e-9)
+            })
+            .collect();
+        r.sort_by(f64::total_cmp);
+        let n = (2 * pairs).div_ceil(3);
+        let threshold = LOW_CORRELATION - if self.short_groups { HYSTERESIS } else { 0.0 };
+        self.short_groups = r[..n].iter().sum::<f64>() / n as f64 > threshold;
+        if self.short_groups { SHORT_GROUP } else { g }
     }
 
     /// Codes the next `g` frames held as a group (see `gop`): its temporal
@@ -2559,8 +2613,9 @@ fn scaled_qidx(q: u32, log2: f64, bit_depth: u32) -> u32 {
 const KEY_Q: f64 = -1.2;
 const KEY_Q_LOW_DELAY: f64 = -1.0;
 /// The same for a group's alt-ref frame (layer 0) and its top layer; the
-/// layers between are spaced evenly. (-0.6 of -0.4, -0.6 and -0.8; 0.5 of
-/// 0.5, 0.7 and 0.9.)
+/// layers between are spaced evenly. (-0.6 of -0.3, -0.6 and -0.9; 0.5 of
+/// 0.0 to 0.9: 0.3 is -1.1 % BD-rate PSNR-Y and -0.3 % PSNR-YUV at
+/// speeds 4, 6 and 8, but for 1.07x the time, which no tier has.)
 const ALTREF_Q: f64 = -0.6;
 const TOP_Q: f64 = 0.5;
 

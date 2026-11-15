@@ -311,8 +311,10 @@ them:
   keeps the hidden frames still to be shown, the group's anchor and the
   latest frames; the order hints place them), and each is coded finer the
   more frames refer to it: a key frame at a quantiser step 1.2 octaves
-  below the configured quantiser's, a group's alt-ref frame 0.6 below, its
-  top layer 0.5 above, the layers between evenly spaced. The encoder holds
+  below the configured quantiser's, a group's alt-ref frame 0.6 below,
+  its top layer 0.5 above, the layers between evenly spaced. Where frames four apart have little in common
+  (a fast pan, measured by the lookahead before the group is formed),
+  groups are 4 frames instead (below). The encoder holds
   a group's frames until the last of them is given, so the first temporal
   unit comes out a group late (16 frames), then one a frame;
   `Encoder::flush` hands out the rest, and a stream may end anywhere in a
@@ -1225,53 +1227,193 @@ of the table above every first group is as it was, and seven clips
 move, all within 5 % (foreman at 1000 kb/s in 24 frames from +3.7 % to
 −1.6 %, ducks_take_off at 1000 kb/s from +1.7 % and +1.0 % to −4.2 %).
 
+**Where foreman's gap is.** rav1e's foreman streams (speed 6, quantiser
+128), parsed by this crate's own decoder with a counter on each plane's
+residual bits, say what rav1e does differently. Its V is quantised about
+an octave finer than luma in every frame (`DeltaQVAc` −32 to −44, U's
+−8 to −24, on every clip alike: a fixed rule, not a reading of the
+content), so against rav1e the encoder is +35 % to +59 % in V's own
+BD-rate on all five clips; that, not foreman, is most of every clip's
+PSNR-YUV gap, and foreman's is only the largest because its luma gap is.
+Its groups are 4 frames, its quality falls through the clip (key frame
+39.9 dB, the last frames 35.2 dB) where this encoder's holds (41.0 to
+about 37 dB), and its inter frames code half the luma residual
+(78.8 kbit against 151.6 kbit over the clip, 86 % of the area skipped
+against 71 %) at 0.8 dB lower PSNR-Y; partitions and transform sizes are
+alike. Tried on foreman and the rest (speed 6, BD-rate PSNR-Y against
+the encoder before, or for the multiplier, the key frame and `Tools::aq`
+against it with the top layer at 0.3 and the key frame's chroma finer,
+below): groups of 8 or 4 (foreman +3.8 %, +4.4 %); the
+Lagrange multiplier at 0.07, 0.14 and 0.2 of the squared step, not 0.1
+(+0.9 % to +6.7 % PSNR-Y on average, foreman +0.7 % to +3.9 %); the key
+frame at −0.9 or −1.5 octaves (foreman +1.0 % and +0.9 %); the alt-ref
+frame at −0.3 or −0.9 (foreman +0.7 % and +2.2 %); the superblock
+quantisers of `Tools::aq` (foreman +1.8 %, on average +0.7 %); and the
+offsets of each layer of a group from the lookahead's temporal
+importance (each frame's share of what the frames predicted from it do
+not code afresh, carried down the pyramid, the offset a third of an
+octave per doubling: on average +0.1 % (+0.3 %) with the top layer at
+0.5, −0.5 % (+0.3 %) at 0.3, foreman +0.1 % and +0.7 %). So foreman's
+luma gap is in how bits are spread over the clip in time, which nothing
+measured here spreads better.
+
+Measured and left out, each against the encoder before (BD-rate PSNR-Y
+(PSNR-YUV), the five clips):
+
+| change | speed 4 | speed 6 | speed 8 | time |
+|---|---|---|---|---|
+| the top layer 0.3 octave coarser, not 0.5 (0.0 to 0.4 measured at speed 6: 0.4 −0.5 % (−0.1 %), 0.2 −1.3 % (−0.2 %), 0.0 −1.4 % (+0.5 %)) | −1.1 % (−0.3 %) | −1.1 % (−0.3 %) | −1.1 % (−0.2 %) | 1.07x |
+| the key frame's chroma 0.3 octave finer than its luma | +0.6 % (−0.4 %) | +0.4 % (−0.5 %) | +0.5 % (−0.4 %) | ±0 |
+| both | −0.6 % (−0.8 %) | −0.7 % (−0.9 %) | −0.7 % (−0.9 %) | 1.07x |
+
+The finer top layer gains on luma everywhere and most on the high-motion
+clips (ducks_take_off −3.0 % (−2.3 %) at speed 6), costs the CIF clips'
+chroma (foreman +0.5 % PSNR-YUV), and its finer frames take 6.6 % more
+time (one encode at a time, two rounds, quantisers 96 and 160, against
+1.002x for everything else here): more than any tier has under rav1e's
+time, and no split threshold buys it back (the top layer's small blocks
+split at 4 and 6 lambda per sample, not 2.5: 1.06x). The finer key-frame
+chroma is a trade, better than the two-for-one of every-frame chroma
+below but a trade, and over longer clips the key frame weighs less: on
+the 60-frame scene-cut clips below, both together are ±0 % to +0.3 %
+PSNR-Y and +1.0 % to +1.3 % PSNR-YUV on CIF.
+
+**Chroma quantiser offsets**, measured and left out: finer chroma in
+every frame (`DeltaQUAc`/`DeltaQVAc` and DC, with `separate_uv_delta_q`)
+trades on the line the plane weights do (above), about two of PSNR-Y for
+one of PSNR-YUV: V an octave finer +2.5 % (−0.9 %), half an octave
++1.4 % (−0.7 %), rav1e's shape (U AC half an octave, V DC three
+quarters, V AC one) +4.1 % (−1.0 %), all at speed 6 against the encoder
+before. In the alt-ref frame (−0.3: +0.7 % (−0.4 %) against the top layer
+at 0.3 alone) or growing up the layers (−0.3 in the top layer: +0.6 %
+(±0); coarser, +0.2: −0.1 % (+0.3 %)) no better.
+
+**Groups that follow the content.** Four pans of 40 frames, a 352x288
+window moving across a 720p clip (park_joy at 24 samples a frame; ducks_take_off at 24 and 6; park_joy
+at 12; park_joy at 20 and 14), cost 0.8 to 0.99 of their intra cost
+predicted from the frame four before them in the lookahead, against
+0.05 (akiyo) to 0.76 (ducks_take_off) in the test clips; the alt-ref
+frame of a group of 16 is coded nearly intra and the frames between
+from little. Groups of 4 there, against 16: −8.5 %, −6.2 %, −1.9 % and
+−0.6 % BD-rate PSNR-YUV at speed 6 (groups of 8: −0.9 % to −0.2 %). So
+before each group the lookahead measures six pairs of frames four apart
+and makes the group 4 frames when the cheapest two thirds of them
+average above 0.85 (`Encoder::follow_content`; once short, whole groups
+again only below 0.75: a pan whose frames cross back and forth coded
+worse in groups of both lengths than in either). Against the encoder
+before, on the four pans, BD-rate PSNR-Y (PSNR-YUV):
+
+| pan | speed 4 | speed 6 | speed 8 |
+|---|---|---|---|
+| park_joy, 24 samples a frame | −9.1 % (−9.7 %) | −8.1 % (−8.5 %) | −8.6 % (−9.2 %) |
+| ducks_take_off, 24 and 6 | −5.5 % (−6.0 %) | −5.8 % (−6.2 %) | −5.3 % (−5.7 %) |
+| park_joy, 12 | +0.2 % (±0) | +0.4 % (+0.2 %) | +0.6 % (+0.4 %) |
+| park_joy, 20 and 14 | −0.7 % (−1.4 %) | +0.1 % (−0.6 %) | +0.2 % (−0.5 %) |
+
+(The third shortens its first four groups and not its fifth.) In the
+five test clips and the scene-cut clips below no group is shortened:
+their streams are the same, byte for byte, at speeds 4, 6 and 8. The
+test costs six lookahead predictions a group.
+
+**Groups at scene cuts**, measured again and left out. Five clips cut
+together from the test clips (three of CIF, 60 frames, cuts after 20 and
+40, after 11 and 38, after 5, 35 and 38 frames; two of 720p, 40 frames,
+after 20, after 7 and 37), with the cuts given (the best a detector
+could do), speed 6, against groups that ignore them: the group ended
+before the cut +2.5 % (+2.7 %) (and with the layers' offsets from the
+lookahead's temporal importance, so that a short group's alt-ref frame
+is not coded as finely as a long one's, +1.2 % (+1.3 %)); the pyramid's
+first split put at the cut, so the frames on each side are predicted
+from their own scene, +2.0 % (+2.2 %); the group ended *at* the cut, the
+new scene's first frame its alt-ref and the next group's anchor, +0.6 %
+(+0.4 %), from −1.3 % on one clip to +1.9 % on another. A pyramid that
+spans a cut already codes the new scene from the alt-ref frame beyond it
+and the old one from the anchor; every way of ending a group adds alt-ref
+frames. So a cut moves no group, and the test above, which takes the
+cheapest two thirds of its pairs, is not moved by one (or two close
+together): the cut clips code as before. A key frame at a cut, which a
+stream needs for seeking but not for its rate, is the caller's
+(`Encoder::force_keyframe`).
+
+**Rate control on what the lookahead cannot see**, measured and left
+out. `examples/av1_ratetest.rs`' fast pan is one frame of mobile moved
+13 and 5 samples a frame: at half size every other frame is half a
+sample off in both directions, and mobile's fine texture aliased there
+makes the frames at odd distances measure 25 to 30 times the
+complexity of those at even ones while costing 4 times as much. A
+layer's model fitted on one parity mispredicts the other tenfold, and the
+24-frame clip at 1000 kb/s lands −12.7 %. Measured: the lookahead's
+search also trying the diagonal half sample (the motion clip unchanged,
+−13.7 %, and a noisy natural clip moved from −0.2 % to +15.7 %); the
+model's complexity term `inter^β intra^(1−β)` instead of `inter`, β 0.5
+(the pan at 1000 kb/s −1.1 %, the still clip at 300 kb/s +1.0 % and
+−3.8 %, but noise at 300 kb/s −21.5 % and a noisy natural clip's first
+group −11.7 %) and 0.7 (no better). Neither keeps the natural clips
+where they are. The suite of the table above (62 cases) is unchanged by
+this round (no group in it is shortened): at speed 6, 55 within 5 % (52
+of 62 first groups), every natural, noisy and segment case among them
+(46 of 46); at speed 4, 55 (58) and 46. The still clip cannot spend its
+rate (at 1000 kb/s its quantiser is 1); the pan lands −12.7 % at 1000
+kb/s in 24 frames, and fresh noise at 300 kb/s +19.4 % in 24 frames at
+speed 6.
+
+Against rav1e 0.8.1 (CPU time of the five clips at all five quantisers,
+one encode at a time, rav1e, develop at 9b54c81 and this interleaved,
+the best of two rounds):
+
+| speed | BD-rate PSNR-Y (PSNR-YUV) | time / rav1e | develop's time / rav1e |
+|---|---|---|---|
+| 4 | −4.65 % (−0.18 %) | 0.994x | 0.991x |
+| 6 | −5.38 % (−0.86 %) | 0.975x | 0.971x |
+| 8 | −4.67 % (−0.37 %) | 0.964x | 0.961x |
+
+The BD-rates are develop's: the five clips' streams are the same. The
+time is the group test's six lookahead predictions a group, 0.2 % to
+0.4 %.
+
+The five clips' streams are those of the encoder before, so per clip as
+above: foreman +4.3 % (+6.5 %) / +3.5 % (+6.3 %) / +3.0 % (+5.9 %) at
+speeds 4 / 6 / 8.
+
 Not there yet:
 
-- **Groups that follow the content**: a group is 16 frames whatever the
-  frames are (cut only by a key frame); a scene cut inside a group, or a
-  fast pan the alt-ref frame cannot be predicted across, is coded as if
-  it were not there (ending groups at scene cuts cost 1 % to 5 % on cut
-  clips: above). No temporal filtering of the alt-ref frames (built,
-  measured at ±0, left out: above).
-- **foreman, and the margin at speed 4**: every tier is at parity with
-  rav1e on average (above), speed 4 with the least room (−0.18 %
-  PSNR-YUV at 0.997x its time). foreman trails at every tier (+3.0 % to
-  +4.3 % PSNR-Y, +5.9 % to +6.5 % PSNR-YUV, mostly V), and akiyo in
-  PSNR-YUV at speed 4. rav1e's
-  inter frames code smaller blocks, each with one transform, but in this
-  search splitting every block is worth under 1 % (above): what is left
-  of foreman's gap is not in the split decision.
+- **foreman's luma, and V everywhere**: foreman trails rav1e by +3.0 %
+  to +4.3 % PSNR-Y, akiyo by up to +1.2 % at speed 4; in each, rav1e lets quality
+  fall through the clip and spends half the luma residual on its inter
+  frames (above). What would close it is a lookahead that prices each
+  block's worth to the frames after it and spends the bits there; the
+  frame-level version of that, built and measured, does not pay. V's
+  +35 % to +59 % against rav1e is rav1e's octave-finer V, a trade on the
+  PSNR-Y–PSNR-YUV line, left where it is.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
-  previous frame's prediction of each superblock), −0.2 % to +0.2 % on the
-  test clips; off by default. No segmentation.
-- **Chroma quantiser offsets**: the frame header's delta-q for U and V is
-  zero (luma's DC is half an octave coarser). Finer chroma, in every
-  frame, by layer, in the key frame or matched to the weights, trades
-  PSNR-Y for PSNR-YUV on the same line as the weights (above).
+  previous frame's prediction of each superblock): −0.2 % to +0.2 % on the
+  test clips when it was built, +0.7 % (+0.7 %) at speed 6 in this round
+  (with the top layer at 0.3; foreman +1.8 %); off
+  by default. No segmentation.
 - **Inter tools that pay at the tiers**: global motion, wedge and
   difference-weighted compound, inter-intra, distance-weighted compound
   and dual filters are built, tested and searched, but at speeds 4 to 8
-  gain less than their time there (above); a
-  vector searched for OBMC or a warp (the block's own vector is kept) and
-  a cheaper probe would make them pay.
+  gain less than their time there (above); a vector searched for OBMC or
+  a warp (the block's own vector is kept) and a cheaper probe would make
+  them pay. Not measured again here.
 - **Film grain from a temporal denoiser**: the denoiser is spatial (it
   leaves part of a coarse grain in the picture coded), the strength of the
   grain is measured to within about 20 % (above), and every frame codes its
   parameters afresh (`update_grain` 1) where an unchanged set could be
-  taken from a reference frame for a few bits.
+  taken from a reference frame for a few bits. Not measured again here.
 - **Intra block copy for blocks under 8x8**, and copies that are not exact
   (the search finds where a block's source appears again exactly, and the
-  stack's vectors).
-- **Rate control on what the lookahead cannot see**: its estimates are
-  within about a factor of two of what a frame costs (more for noise the
-  encoder refines, or a frame of a still scene it refines rather than
-  copies), and planning again after every frame does the rest; a short
-  clip's last frames cannot repay a misprediction, so a still scene
-  undershoots (it cannot use the bits) and a 24-frame fast pan lands 8 %
-  to 11 % low. The groups themselves are planned with their key frames
-  only at the start of a clip or after a key frame; no lookahead past the
-  group.
+  stack's vectors). Not measured again here.
+- **Rate control on what the lookahead cannot see**: a frame whose
+  half-size picture misleads the lookahead (fine texture moving by odd
+  samples) is mispredicted by its layer's model, and a short clip's last
+  frames cannot repay it (the synthetic pan −12 % in 24 frames); a still
+  scene cannot spend a high rate. The groups are planned with their key
+  frames only at the start of a clip or after a key frame; no lookahead
+  past the group.
+- **No temporal filtering of the alt-ref frames** (built, measured at ±0,
+  left out: above).
 
 ## How it is checked
 
