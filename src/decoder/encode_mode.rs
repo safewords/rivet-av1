@@ -95,6 +95,14 @@ impl TileDecoder<'_, '_> {
     pub(crate) fn count_nonzero(&mut self) {}
 
     #[inline(always)]
+    pub(crate) fn enc_prediction_cached(&mut self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn enc_prediction_store(&mut self) {}
+
+    #[inline(always)]
     pub(crate) fn enc_tx_coded(&self) -> bool {
         false
     }

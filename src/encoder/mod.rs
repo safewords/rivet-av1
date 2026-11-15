@@ -2183,6 +2183,7 @@ impl Encoder {
             ibc: p.ibc.clone(),
             probing: false,
             tx_states: Default::default(),
+            pred: Default::default(),
         })
     }
 

@@ -69,6 +69,152 @@ pub(crate) struct EncCtx {
     pub(crate) probing: bool,
     /// The transform type search's states (before, and its best's).
     pub(crate) tx_states: [TxState; 2],
+    /// Inter predictions kept (see [`PredCache`]).
+    pub(crate) pred: PredCache,
+}
+
+/// Inter predictions the search made, kept for when it makes them again:
+/// a block's trials differ in the residual (its skip flag, its transform
+/// depth and types) more often than in the prediction, and what follows a
+/// search codes its best again. Only predictions read from the references
+/// alone are kept — of a block of 8x8 or more (a smaller one's chroma may
+/// take its neighbours' vectors), with simple motion (no overlapped or
+/// warped motion), neither inter-intra nor a block copy — so a prediction
+/// is a function of the block's place and size and of its vectors,
+/// references, filters and compound mode, all in the key, and of the
+/// frame's references, the same for the whole frame: the same whether it
+/// is made again or not.
+pub(crate) struct PredCache {
+    slots: Vec<PredEntry>,
+}
+
+impl Default for PredCache {
+    fn default() -> Self {
+        PredCache {
+            slots: (0..PRED_SLOTS).map(|_| PredEntry::default()).collect(),
+        }
+    }
+}
+
+const PRED_SLOTS: usize = 256;
+
+#[derive(Default)]
+struct PredEntry {
+    key: Option<[u64; 4]>,
+    /// The planes' samples, one after the other, rows of the block's width
+    /// in each.
+    samples: Vec<u16>,
+}
+
+impl TileDecoder<'_, '_> {
+    /// The key of the block's inter prediction, and its slot, when it may
+    /// be kept (see [`PredCache`]).
+    #[inline]
+    fn prediction_key(&self) -> Option<([u64; 4], usize)> {
+        let b = &self.b;
+        let keep = b.is_inter
+            && !b.use_intrabc
+            && !b.interintra
+            && b.ref_frame[1] != INTRA_FRAME
+            && b.motion_mode == SIMPLE
+            && NUM_4X4_BLOCKS_WIDE[b.mi_size] >= 2
+            && NUM_4X4_BLOCKS_HIGH[b.mi_size] >= 2
+            && !self.enc().probing;
+        if !keep {
+            return None;
+        }
+        // (The prediction reads the block's own mode info.)
+        let m = self.mi(b.mi_row, b.mi_col);
+        let key = [
+            b.mi_row as u64
+                | (b.mi_col as u64) << 16
+                | (b.mi_size as u64) << 32
+                | (b.has_chroma as u64) << 40
+                | (b.y_mode as u64 & 0xFF) << 48
+                | (m.ref_frame[0] as u8 as u64) << 56,
+            m.ref_frame[1] as u8 as u64
+                | (m.interp_filter[0] as u64) << 8
+                | (m.interp_filter[1] as u64) << 16
+                | (b.compound_type as u64 & 0xF) << 24
+                | (b.comp_group_idx as u64 & 0xF) << 28
+                | (b.compound_idx as u64 & 0xF) << 32
+                | (b.mask_type as u64 & 0xF) << 36
+                | (b.wedge_index as u64 & 0xFF) << 40
+                | (b.wedge_sign as u64 & 0xFF) << 48,
+            m.mv[0][0] as u32 as u64 | (m.mv[0][1] as u32 as u64) << 32,
+            m.mv[1][0] as u32 as u64 | (m.mv[1][1] as u32 as u64) << 32,
+        ];
+        let h = (key[0] ^ key[1].rotate_left(17) ^ key[2].rotate_left(31) ^ key[3].rotate_left(47))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        Some((key, (h >> 56) as usize % PRED_SLOTS))
+    }
+
+    /// The rectangle of plane `plane`'s prediction: `(x, y, w, h)`
+    /// (`compute_prediction`'s).
+    #[inline]
+    fn prediction_rect(&self, plane: usize) -> (usize, usize, usize, usize) {
+        let plane_sz = self.f.plane_residual_size(self.b.mi_size, plane);
+        let (sub_x, sub_y) = self.f.plane_ss(plane);
+        (
+            (self.b.mi_col >> sub_x) * MI_SIZE,
+            (self.b.mi_row >> sub_y) * MI_SIZE,
+            NUM_4X4_BLOCKS_WIDE[plane_sz] * 4,
+            NUM_4X4_BLOCKS_HIGH[plane_sz] * 4,
+        )
+    }
+
+    /// Puts back the block's inter prediction when it is kept (see
+    /// [`PredCache`]) and returns true.
+    pub(crate) fn enc_prediction_cached(&mut self) -> bool {
+        let Some((key, slot)) = self.prediction_key() else {
+            return false;
+        };
+        let e = self.enc.as_ref().expect("encode mode");
+        let entry = &e.pred.slots[slot];
+        if entry.key != Some(key) {
+            return false;
+        }
+        let planes = 1 + if self.b.has_chroma { 2 } else { 0 };
+        let mut at = 0;
+        for plane in 0..planes {
+            let (x, y, w, h) = self.prediction_rect(plane);
+            let pl = &mut self.f.cur.planes[plane];
+            for i in 0..h {
+                let o = (y + i) * pl.stride + x;
+                pl.data[o..o + w].copy_from_slice(&entry.samples[at..at + w]);
+                at += w;
+            }
+        }
+        // (What `compute_prediction` sets of the block.)
+        self.b.is_inter_intra = false;
+        true
+    }
+
+    /// Keeps the inter prediction just made, when it may be kept.
+    pub(crate) fn enc_prediction_store(&mut self) {
+        let Some((key, slot)) = self.prediction_key() else {
+            return;
+        };
+        let planes = 1 + if self.b.has_chroma { 2 } else { 0 };
+        let rects = [0, 1, 2].map(|p| {
+            if p < planes {
+                self.prediction_rect(p)
+            } else {
+                (0, 0, 0, 0)
+            }
+        });
+        let e = self.enc.as_mut().expect("encode mode");
+        let entry = &mut e.pred.slots[slot];
+        entry.samples.clear();
+        for (plane, &(x, y, w, h)) in rects.iter().enumerate().take(planes) {
+            let pl = &self.f.cur.planes[plane];
+            for i in 0..h {
+                let o = (y + i) * pl.stride + x;
+                entry.samples.extend_from_slice(&pl.data[o..o + w]);
+            }
+        }
+        entry.key = Some(key);
+    }
 }
 
 /// The positions of the source's luma 8x8 blocks (every sample position

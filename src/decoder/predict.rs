@@ -15,6 +15,18 @@ const EDGE_LEN: usize = EDGE_OFF + 2 * 129 + 16;
 impl TileDecoder<'_, '_> {
     /// `compute_prediction()` (5.11.33).
     pub(crate) fn compute_prediction(&mut self) {
+        // (The encoder's search makes the same inter prediction several
+        // times over: see `enc_prediction_cached`.)
+        if self.sd.encoding() && self.enc_prediction_cached() {
+            return;
+        }
+        self.compute_prediction_planes();
+        if self.sd.encoding() {
+            self.enc_prediction_store();
+        }
+    }
+
+    fn compute_prediction_planes(&mut self) {
         let sb_mask = if self.f.seq.use_128x128_superblock {
             31
         } else {
