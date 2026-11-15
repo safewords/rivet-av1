@@ -683,7 +683,7 @@ impl TileDecoder<'_, '_> {
             ref_frame: INTRA_FRAME,
             ..Default::default()
         };
-        let mut out: Vec<(Plan, f64)> = Vec::new();
+        let mut out: Vec<(Plan, f64)> = Vec::with_capacity(tools.intra_candidates as usize + 8);
         // The best by SATD, filter intra modes among them (measured against
         // trialling the best filter intra mode as well as the best plain
         // ones: -0.20 % against -0.10 % BD-rate PSNR-Y at speed 6).
@@ -761,16 +761,16 @@ impl TileDecoder<'_, '_> {
         let lambda = self.enc().lambda;
         let tools = self.enc().tools;
         let ms = self.b.mi_size;
-        let mut inter: Vec<(Plan, f64)> = Vec::new();
+        let mut inter: Vec<(Plan, f64)> = Vec::with_capacity(5 * refs.len() + 8);
         // The searched vector of each reference, for compound candidates.
-        let mut searched_mv: Vec<(i32, Mv)> = Vec::new();
+        let mut searched_mv: Vec<(i32, Mv)> = Vec::with_capacity(refs.len());
         for &rf in refs {
             self.b.ref_frame = [rf, NONE];
             self.b.is_inter = true;
             self.b.use_intrabc = false;
             self.find_mv_stack(false);
             let n = self.b.num_mv_found;
-            let mut cands: Vec<(usize, usize, Mv, f64)> = Vec::new();
+            let mut cands: Vec<(usize, usize, Mv, f64)> = Vec::with_capacity(5);
             cands.push((NEARESTMV, 0, self.b.ref_stack_mv[0][0], 2.0));
             for idx in 1..n.min(3) {
                 cands.push((NEARMV, idx, self.b.ref_stack_mv[idx][0], 3.0 + idx as f64));
@@ -2017,6 +2017,13 @@ impl TileDecoder<'_, '_> {
                     &mut fc,
                 );
                 entry.key = Some(key);
+                if entry.res.capacity() == 0 {
+                    // (The largest block kept, once: an entry holds blocks
+                    // of every size in turn.)
+                    entry.res.reserve_exact(32 * 32);
+                    entry.levels.reserve_exact(32 * 32);
+                    entry.coefs.reserve_exact(32 * 32);
+                }
                 entry.res.clear();
                 entry.res.extend_from_slice(&res[..w * h]);
                 entry.levels.clear();
