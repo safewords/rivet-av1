@@ -225,7 +225,6 @@ pub(crate) fn forward_quantise(
     levels: &mut [i32],
     out: &mut [f64],
 ) -> usize {
-    const MAX_LEVEL: f64 = ((1 << 20) - 1) as f64;
     SCRATCH.with_borrow_mut(|sc| {
         transform(residual, tx_sz, tx_type, sc);
         let (w, tw, th) = (
@@ -240,13 +239,7 @@ pub(crate) fn forward_quantise(
             let lv = &mut levels[k * tw..(k + 1) * tw];
             let oc = &mut out[k * w..k * w + tw];
             let is = &iscan[k * tw..(k + 1) * tw];
-            for (((o, c), &v), &s) in lv.iter_mut().zip(oc.iter_mut()).zip(col).zip(is) {
-                let v = v as f64 * inv;
-                *c = v;
-                let l = (v.abs() * q.ac_r + q.ac_round).floor().min(MAX_LEVEL) as i32;
-                *o = if v < 0.0 { -l } else { l };
-                eob = eob.max(if l != 0 { s as usize + 1 } else { 0 });
-            }
+            eob = eob.max(quantise_row(col, inv, q, lv, oc, is));
         }
         // The DC coefficient, the first of every scan, has its own step and
         // rounding: what the loop made of it is replaced.
@@ -259,6 +252,94 @@ pub(crate) fn forward_quantise(
         }
         eob
     })
+}
+
+/// One row of [`forward_quantise`]'s coefficients (`col`, scaled by
+/// `inv`) into `oc`, and their AC levels into `lv`; returns the end of
+/// block they make (`is`: their places in the scan).
+#[inline(always)]
+fn quantise_row(
+    col: &[f32],
+    inv: f64,
+    q: Quantiser,
+    lv: &mut [i32],
+    oc: &mut [f64],
+    is: &[u16],
+) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    if col.len() % 4 == 0 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        return unsafe { quantise_row_neon(col, inv, q, lv, oc, is) };
+    }
+    quantise_row_scalar(col, inv, q, lv, oc, is)
+}
+
+const MAX_LEVEL: f64 = ((1 << 20) - 1) as f64;
+
+fn quantise_row_scalar(
+    col: &[f32],
+    inv: f64,
+    q: Quantiser,
+    lv: &mut [i32],
+    oc: &mut [f64],
+    is: &[u16],
+) -> usize {
+    let mut eob = 0;
+    for (((o, c), &v), &s) in lv.iter_mut().zip(oc.iter_mut()).zip(col).zip(is) {
+        let v = v as f64 * inv;
+        *c = v;
+        let l = (v.abs() * q.ac_r + q.ac_round).floor().min(MAX_LEVEL) as i32;
+        *o = if v < 0.0 { -l } else { l };
+        eob = eob.max(if l != 0 { s as usize + 1 } else { 0 });
+    }
+    eob
+}
+
+/// [`quantise_row_scalar`] four coefficients at a time: the same
+/// operations, each rounded as the scalar one is (no fused multiply-add),
+/// so the same values.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantise_row_neon(
+    col: &[f32],
+    inv: f64,
+    q: Quantiser,
+    lv: &mut [i32],
+    oc: &mut [f64],
+    is: &[u16],
+) -> usize {
+    use std::arch::aarch64::*;
+    let n = col.len();
+    assert!(lv.len() >= n && oc.len() >= n && is.len() >= n && n % 4 == 0);
+    let inv = vdupq_n_f64(inv);
+    let (ac_r, round, max) = (
+        vdupq_n_f64(q.ac_r),
+        vdupq_n_f64(q.ac_round),
+        vdupq_n_f64(MAX_LEVEL),
+    );
+    let level = |v: float64x2_t| {
+        vcvtq_s64_f64(vminq_f64(
+            vrndmq_f64(vaddq_f64(vmulq_f64(vabsq_f64(v), ac_r), round)),
+            max,
+        ))
+    };
+    let mut eob = vdupq_n_u32(0);
+    for j in (0..n).step_by(4) {
+        // SAFETY: j + 4 <= n, within each slice (asserted above).
+        unsafe {
+            let c = vld1q_f32(col.as_ptr().add(j));
+            let v0 = vmulq_f64(vcvt_f64_f32(vget_low_f32(c)), inv);
+            let v1 = vmulq_f64(vcvt_high_f64_f32(c), inv);
+            vst1q_f64(oc.as_mut_ptr().add(j), v0);
+            vst1q_f64(oc.as_mut_ptr().add(j + 2), v1);
+            let l = vcombine_s32(vmovn_s64(level(v0)), vmovn_s64(level(v1)));
+            let neg = vcombine_u32(vmovn_u64(vcltzq_f64(v0)), vmovn_u64(vcltzq_f64(v1)));
+            vst1q_s32(lv.as_mut_ptr().add(j), vbslq_s32(neg, vnegq_s32(l), l));
+            let s = vaddq_u32(vmovl_u16(vld1_u16(is.as_ptr().add(j))), vdupq_n_u32(1));
+            eob = vmaxq_u32(eob, vandq_u32(s, vtstq_s32(l, l)));
+        }
+    }
+    vmaxvq_u32(eob) as usize
 }
 
 /// The inverse of the decoder's 1D inverse Walsh-Hadamard transform
@@ -687,6 +768,41 @@ mod tests {
     /// The quantiser applied as the coefficients come out of the
     /// transform gives the levels and the end of block that quantising
     /// [`forward_2d`]'s coefficients gives.
+    /// A row of levels four at a time against one at a time: signs,
+    /// zeros of both signs, the dead zone's edge, the largest level.
+    #[test]
+    fn quantise_row_matches_scalar() {
+        let mut seed = 9u32;
+        for n in [4usize, 8, 16, 32] {
+            for (ac_r, round) in [(0.05, 0.38), (0.013, 0.30), (1.0, 0.5)] {
+                let q = Quantiser {
+                    ac_r,
+                    dc_r: 0.0,
+                    ac_round: round,
+                };
+                for _ in 0..200 {
+                    let col: Vec<f32> = (0..n)
+                        .map(|k| {
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            match k % 7 {
+                                0 => -0.0,
+                                1 => 1e9,
+                                _ => ((seed >> 8) % 4001) as f32 - 2000.0 + 0.37,
+                            }
+                        })
+                        .collect();
+                    let is: Vec<u16> = (0..n as u16).map(|k| (k * 7) % 61).collect();
+                    let (mut l1, mut l2) = (vec![0; n], vec![0; n]);
+                    let (mut o1, mut o2) = (vec![0.0; n], vec![0.0; n]);
+                    let e1 = quantise_row(&col, 0.7, q, &mut l1, &mut o1, &is);
+                    let e2 = quantise_row_scalar(&col, 0.7, q, &mut l2, &mut o2, &is);
+                    assert_eq!((e1, &l1), (e2, &l2));
+                    assert!(o1.iter().zip(&o2).all(|(a, b)| a.to_bits() == b.to_bits()));
+                }
+            }
+        }
+    }
+
     #[test]
     fn forward_quantise_matches_quantising_the_transform() {
         use crate::decoder::residual::{inverse_scan, scan_for};
