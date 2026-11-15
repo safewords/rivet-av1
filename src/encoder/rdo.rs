@@ -116,7 +116,45 @@ fn plane_rect(
     (r0 >> ssy, (r1 + ssy) >> ssy, c0 >> ssx, (c1 + ssx) >> ssx)
 }
 
+/// The 64x64 blocks (rows, columns of `cdef_idx`) a luma 4x4 rectangle
+/// lies in, inside the array.
+fn cdef_cells(
+    len: usize,
+    stride: usize,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    c1: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let rows = len / stride;
+    let cr = (r0 >> 4).min(rows)..((r1.max(r0 + 1) - 1) >> 4).min(rows - 1) + 1;
+    let cc = (c0 >> 4).min(stride)..((c1.max(c0 + 1) - 1) >> 4).min(stride - 1) + 1;
+    (cr, cc.start.min(cc.end)..cc.end)
+}
+
+/// The rows of a plane's `BlockDecoded` array holding the luma 4x4 rows
+/// `a..=b` of a superblock (its row 0 is the row above the superblock).
+fn bd_rows(a: usize, b: usize, ssy: usize) -> std::ops::RangeInclusive<usize> {
+    (a >> ssy) + 1..=((b >> ssy) + 1).min(33)
+}
+
 impl TileDecoder<'_, '_> {
+    /// The luma 4x4 rows of its superblock, first and last, whose rows of
+    /// `BlockDecoded` coding the rows `r0..r1` may write: from the even one
+    /// at or above `r0` (a chroma block of a 4-high block covers the row
+    /// above). See [`bd_rows`].
+    fn block_decoded_rows(&self, r0: usize, r1: usize) -> (usize, usize) {
+        let mask = if self.f.seq.use_128x128_superblock {
+            31
+        } else {
+            15
+        };
+        let base = r0 & !mask;
+        let a = (r0 - base) & !1;
+        let b = r1.max(r0 + 1) - 1 - base;
+        (a, b)
+    }
+
     pub(crate) fn rdo(&mut self) -> &mut Rdo {
         &mut self.enc.as_mut().expect("encode mode").rdo
     }
@@ -199,12 +237,23 @@ impl TileDecoder<'_, '_> {
         s.left_seg.clear();
         s.left_seg
             .extend_from_slice(&self.left_seg_pred_ctx[r0..r1.min(self.left_seg_pred_ctx.len())]);
-        // (The flags are one array: one copy, not one per row.)
+        // The rows of `BlockDecoded` and the 64x64 blocks' CDEF indices that
+        // coding the rectangle can change (whole rows of the flags: a few
+        // short copies instead of the superblock's every flag).
+        let (bd0, bd1) = self.block_decoded_rows(r0, r1);
         s.block_decoded.clear();
-        s.block_decoded
-            .extend_from_slice(self.block_decoded.as_flattened().as_flattened());
+        for p in 0..f.num_planes {
+            let (_, ssy) = f.plane_ss(p);
+            for row in &self.block_decoded[p][bd_rows(bd0, bd1, ssy)] {
+                s.block_decoded.extend_from_slice(row);
+            }
+        }
         s.cdef.clear();
-        s.cdef.extend_from_slice(&f.cdef_idx);
+        let (cr, cc) = cdef_cells(f.cdef_idx.len(), f.cdef_stride, r0, r1, c0, c1);
+        for row in cr {
+            s.cdef
+                .extend_from_slice(&f.cdef_idx[row * f.cdef_stride + cc.start..][..cc.len()]);
+        }
         s.q = self.current_q_index;
         s.delta_lf = self.delta_lf;
         s.read_deltas = self.read_deltas;
@@ -264,11 +313,24 @@ impl TileDecoder<'_, '_> {
         self.above_seg_pred_ctx[c0..c0 + n].copy_from_slice(&s.above_seg);
         let n = s.left_seg.len();
         self.left_seg_pred_ctx[r0..r0 + n].copy_from_slice(&s.left_seg);
-        self.block_decoded
-            .as_flattened_mut()
-            .as_flattened_mut()
-            .copy_from_slice(&s.block_decoded);
-        f.cdef_idx.copy_from_slice(&s.cdef);
+        let (bd0, bd1) = self.block_decoded_rows(r0, r1);
+        let mut at = 0;
+        for p in 0..self.f.num_planes {
+            let (_, ssy) = self.f.plane_ss(p);
+            for row in &mut self.block_decoded[p][bd_rows(bd0, bd1, ssy)] {
+                let n = row.len();
+                row.copy_from_slice(&s.block_decoded[at..at + n]);
+                at += n;
+            }
+        }
+        let f = &mut *self.f;
+        let (cr, cc) = cdef_cells(f.cdef_idx.len(), f.cdef_stride, r0, r1, c0, c1);
+        let mut at = 0;
+        for row in cr {
+            f.cdef_idx[row * f.cdef_stride + cc.start..][..cc.len()]
+                .copy_from_slice(&s.cdef[at..at + cc.len()]);
+            at += cc.len();
+        }
         self.current_q_index = s.q;
         self.delta_lf = s.delta_lf;
         self.read_deltas = s.read_deltas;
