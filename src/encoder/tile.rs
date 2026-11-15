@@ -295,6 +295,9 @@ impl EncCtx {
     }
 }
 
+/// Vectors are below this in magnitude, in eighths (`MV_LOW`, `MV_UPP`).
+const MV_LIMIT: i32 = 1 << 14;
+
 /// Approximate bits of a motion vector difference component:
 /// `3 + 2 log2(|d| / 2 + 1)` (a piecewise-linear log2), 1 for none.
 fn mv_bits(d: i32) -> f64 {
@@ -963,6 +966,11 @@ impl TileDecoder<'_, '_> {
                 self.find_mv_stack(true);
                 let nearest = self.b.ref_stack_mv[0];
                 let global = self.b.global_mvs;
+                let [mv1, mv2] = if tools.joint_compound && !self.f.hdr.force_integer_mv {
+                    self.joint_refine([LAST_FRAME, r2], [mv1, mv2], nearest)
+                } else {
+                    [mv1, mv2]
+                };
                 for (mode, mvs, bits) in [
                     (NEAREST_NEARESTMV, nearest, 3.0),
                     (GLOBAL_GLOBALMV, global, 4.0),
@@ -1725,6 +1733,67 @@ impl TileDecoder<'_, '_> {
             let st = e.stride[0];
             satd(&e.src[0][y * st + x..], st, &p1[..], w, w, h)
         })
+    }
+
+    /// Refines the searched vectors `mv` of a compound pair from
+    /// references `rf` jointly (`Tools::joint_compound`): each in turn,
+    /// the other held, searched in cross steps of a half and a quarter
+    /// sample (an eighth with high precision) for the least SATD of the
+    /// average of the two predictions plus the multiplier times its bits
+    /// against `pred`. Each vector found alone fits the source; the
+    /// average of the two wants each to fit what the other leaves.
+    fn joint_refine(&self, rf: [i32; 2], mut mv: [Mv; 2], pred: [Mv; 2]) -> [Mv; 2] {
+        let w = block_width(self.b.mi_size);
+        let h = block_height(self.b.mi_size);
+        let x = self.b.mi_col * MI_SIZE;
+        let y = self.b.mi_row * MI_SIZE;
+        let lambda = self.enc().lambda;
+        let min_step = if self.f.hdr.allow_high_precision_mv {
+            1
+        } else {
+            2
+        };
+        PRED.with_borrow_mut(|bufs| {
+            let [other, cand] = bufs;
+            for k in 0..2 {
+                self.inter_pred(0, x, y, w, h, rf[1 - k], mv[1 - k], other);
+                let mut cost = |m: Mv| -> f64 {
+                    self.inter_pred(0, x, y, w, h, rf[k], m, cand);
+                    for (a, &b) in cand[..w * h].iter_mut().zip(&other[..w * h]) {
+                        *a = (*a + b + 1) >> 1;
+                    }
+                    let e = self.enc();
+                    let st = e.stride[0];
+                    satd(&e.src[0][y * st + x..], st, &cand[..], w, w, h) as f64
+                        + lambda * (mv_bits(m[0] - pred[k][0]) + mv_bits(m[1] - pred[k][1]))
+                };
+                let mut best = (cost(mv[k]), mv[k]);
+                let mut step = 4;
+                while step >= min_step {
+                    // The cross around the best, moving while it improves
+                    // (at most four times a step).
+                    for _ in 0..4 {
+                        let centre = best.1;
+                        for (dy, dx) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                            let m = [centre[0] + dy * step, centre[1] + dx * step];
+                            if m[0].abs() >= MV_LIMIT || m[1].abs() >= MV_LIMIT {
+                                continue;
+                            }
+                            let c = cost(m);
+                            if c < best.0 {
+                                best = (c, m);
+                            }
+                        }
+                        if best.1 == centre {
+                            break;
+                        }
+                    }
+                    step /= 2;
+                }
+                mv[k] = best.1;
+            }
+        });
+        mv
     }
 
     /// The motion search: full-pel, then half- and quarter- (and eighth-)

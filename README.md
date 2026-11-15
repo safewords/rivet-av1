@@ -1293,7 +1293,8 @@ not code afresh, carried down the pyramid, the offset a third of an
 octave per doubling: on average +0.1 % (+0.3 %) with the top layer at
 0.5, −0.5 % (+0.3 %) at 0.3, foreman +0.1 % and +0.7 %). So foreman's
 luma gap is in how bits are spread over the clip in time, which nothing
-measured here spreads better.
+measured here spreads better. (It was not: it was in the motion search's
+multiplier; "Where foreman's gap was", below.)
 
 Measured and left out, each against the encoder before (BD-rate PSNR-Y
 (PSNR-YUV), the five clips):
@@ -1413,16 +1414,131 @@ The five clips' streams are those of the encoder before, so per clip as
 above: foreman +4.3 % (+6.5 %) / +3.5 % (+6.3 %) / +3.0 % (+5.9 %) at
 speeds 4 / 6 / 8.
 
+**Where foreman's gap was: the SATD multiplier.** Read with rivet-av1's
+own parser at the same PSNR-Y (rav1e at quantiser 128, rivet-av1 at 138,
+speed 6, both 36.3 dB), the two encoders' foreman streams differ in one
+place: the frames of the top layer, which both code between references
+a frame away on each side. rav1e's (base_q_idx 160) skip 97 % of their
+area and come out at 35.9 dB for 20.9 kbit; rivet-av1's (158) took 33.9
+kbit, 17.4 of it luma residual, for the same 35.9 dB. (Its hidden frames
+were 154 kbit against 145 at 0.1 dB more, its key frame 74 kbit against
+81 at 0.3 dB more.) Measured in the encoder, those frames' inter blocks
+predicted the source at 34.2 dB before their residual (the hidden
+layers' at 29.5 to 32.8 dB), so the residual was making up for the
+prediction, not for how the bits were spread. More Lagrange multiplier
+in the top layer (1.5, 2 and 3 times) did not help: +1.3 %, +3.8 % and
++9.0 % on foreman; rav1e also codes no switchable filters, OBMC, warps or
+high-precision vectors in these streams, so it was not tools.
+
+What was wrong was the other multiplier: the one the SATD-based decisions
+weigh bits with (`EncCtx::lambda`: the motion search's SAD and SATD
+against a vector's bits, the inter and intra candidates' preselection,
+the angle deltas, the chroma ranking, the inter tools' probes). It was
+0.4 times the quantiser step (`AC_QLOOKUP`), about ten times the square
+root of the rate-distortion multiplier (0.1 times the square of an
+eighth of the step), so that a vector's bits cost seven to ten times
+the SATD they save; the search kept the predicted vectors and the
+stacked candidates over better ones it had found. `Tools::satd_lambda`
+(hundredths of the step), at speed 6 against develop at 6a360ec (the
+five clips; foreman alone below 0.06):
+
+| multiplier | BD-rate PSNR-Y (PSNR-YUV) | foreman |
+|---|---|---|
+| 0.40 (develop) | — | — |
+| 0.30 | | −2.9 % (−2.9 %) |
+| 0.20 | | −6.3 % (−6.2 %) |
+| 0.12 | −4.75 % (−4.56 %) | −9.6 % (−9.3 %) |
+| 0.10 | −5.05 % (−4.83 %) | −10.1 % (−10.0 %) |
+| 0.08 | −5.30 % (−5.00 %) | −10.7 % (−10.3 %) |
+| **0.06** | **−5.49 % (−5.14 %)** | −10.9 % (−10.7 %) |
+| 0.045 | −5.42 % (−5.07 %) | −10.7 % (−10.3 %) |
+| 0.04, 0.02 | | −10.3 %, −9.6 % |
+
+Each use is worth part of it (at 0.08 on foreman: the motion search
+alone −1.8 %, the inter candidates' preselection alone −4.8 %, both
+−9.3 %, every use −10.7 %), and none wants a value of its own (with the
+rest at 0.06: the motion search at 0.12 or 0.04, −5.09 % and −5.34 %;
+the inter candidates at 0.04, −5.38 %). At speed 4, 0.08 (−4.22 %
+(−3.95 %); 0.06 −4.16 %); at speed 8, 0.06 (−7.16 % (−6.73 %); 0.08
+−6.73 %). So 0.08 to speed 4 and 0.06 from speed 5. Elsewhere, not in
+the tables: speed 2, foreman −9.9 %; speeds 9 and 10 (the CIF clips),
+−7.1 % and −7.8 %.
+
+The finer search costs time at speeds 6 and 8 (more of the search's
+candidates within reach of its bound, more blocks taking a searched
+vector): against develop at e2a2ece, 1.003x at speed 4, 1.015x at 6 and
+1.015x at 8 (CPU time of the five clips at all five quantisers, one
+encode at a time, interleaved, the best of two rounds). Bought back:
+speed 6 trials two inter candidates, not three (+0.3 % (+0.4 %), 0.92x),
+speed 8 ranks the intra modes of inter frames only when the plainest
+score under 1.0 times the bound, not 1.2 (`intra_early` 100: +0.2 %
+(+0.3 %), 0.985x). Against develop (6a360ec's streams, which e2a2ece's
+are) and rav1e 0.8.1, BD-rate PSNR-Y (PSNR-YUV); time against e2a2ece:
+
+| speed | against develop | against rav1e | foreman against rav1e | time |
+|---|---|---|---|---|
+| 4 | −4.22 % (−3.95 %) | −9.17 % (−4.59 %) | −4.81 % (−2.68 %) | 1.003x |
+| 6 | −5.18 % (−4.78 %) | −10.76 % (−6.08 %) | −7.15 % (−4.60 %) | 0.931x |
+| 8 | −7.01 % (−6.48 %) | −11.96 % (−7.41 %) | −10.29 % (−7.33 %) | 1.000x |
+
+Per clip against develop at speeds 4 / 6 / 8: foreman −8.4 % / −10.2 % /
+−12.8 %, mobile −5.2 % / −6.3 % / −8.4 %, akiyo −3.5 % / −4.8 % / −6.1 %,
+ducks_take_off −0.9 % / −0.8 % / −3.2 %, park_joy −3.1 % / −3.8 % /
+−4.5 % (PSNR-YUV within 0.5 % of each); against rav1e, PSNR-Y (PSNR-YUV):
+
+| clip | speed 4 | speed 6 | speed 8 |
+|---|---|---|---|
+| foreman | −4.8 % (−2.7 %) | −7.2 % (−4.6 %) | −10.3 % (−7.3 %) |
+| mobile | −19.6 % (−12.9 %) | −19.9 % (−13.6 %) | −18.4 % (−13.6 %) |
+| akiyo | −2.3 % (+0.0 %) | −5.2 % (−2.8 %) | −8.0 % (−5.6 %) |
+| ducks_take_off | −10.8 % (−3.6 %) | −11.9 % (−4.2 %) | −12.7 % (−4.7 %) |
+| park_joy | −8.4 % (−3.8 %) | −9.7 % (−5.2 %) | −10.5 % (−5.8 %) |
+
+Measured on the way and left out (speed 6, foreman, BD-rate PSNR-Y
+(PSNR-YUV) against the encoder before unless said):
+
+- **Joint compound search** (`Tools::joint_compound`, built, off): a
+  compound pair's two searched vectors refined in turn against the
+  average of their predictions, half and quarter samples. −0.95 %
+  (−0.93 %) on the five clips with the new multiplier (foreman −1.0 %),
+  but 1.07x the time (with two inter candidates at speed 6, 1.12x);
+  refined only where the pair's SATD was within 1.0 or 1.15 times the
+  best single candidate's, foreman −0.35 % and −0.77 %. Starting at whole
+  samples or iterating twice gained nothing more. The compound modes
+  with one vector predicted (NEAREST_NEWMV, NEW_NEARESTMV) as candidates
+  too: +0.1 % (−0.1 %).
+- **Separate U and V quantisers** (`separate_uv_delta_q`, delta-q per
+  plane, as rav1e's): V −16, +0.7 % (−0.4 %); U −8 and V −32 (rav1e's key
+  frame's), +2.2 % (−0.6 %); rav1e's per layer, +2.9 % (−0.5 %); U +8 and
+  V −16, +0.9 % (+0.6 %); U +12, +0.2 % (+1.3 %); V −16 with V weighed 2
+  in the search, not 3, +0.5 % (+0.5 %). The same trade as before.
+- **Per-layer Lagrange multipliers**: the top layer's ×1.5, ×2, ×3:
+  +1.3 %, +3.8 %, +9.0 %; the alt-ref frame's ×0.7, ×1.4: +0.8 %, +0.4 %;
+  the key frame's ×0.7, ×1.4: +1.0 %, +0.4 %.
+- **rav1e's group shape**: groups of 4 with its offsets (key −0.92,
+  alt-ref −0.37, top +0.79 octaves), +5.0 % (+5.2 %); its offsets in
+  groups of 16, +0.6 % (+0.6 %).
+- **Each luma direction's loop filter level on its own** (rav1e's are
+  apart, 33 and 18): ±2 and ±4 around the joint level, +0.2 % to −0.1 %.
+- **Speed 2's tools, one at a time** (rivet-av1 at speed 2 was −16 %
+  against rav1e at 6 on foreman): put back to speed 4's value at speed
+  2, the transform type search's early stop costs +4.4 %, rate-distortion
+  quantisation only in the coded blocks +4.0 %, the halves only to 16
+  wide +3.7 %, the reduced transform set +3.3 %; the rest under 2 %. At
+  speeds 4 and 6, rate-distortion quantisation in every trial
+  (`rdoq` 3) cost +2.6 % and +2.5 % on foreman (the README has it at
+  −3.7 % when it went in): its trials leave more blocks without
+  coefficients, and a block coded flat is not tried split
+  (`prune_split`); with flat blocks split unless they cost under 0.05 to
+  0.15 lambda a sample, `rdoq` 3 is −2.0 %, but 1.3x the time.
+
 Not there yet:
 
-- **foreman's luma, and V everywhere**: foreman trails rav1e by +3.0 %
-  to +4.3 % PSNR-Y, akiyo by up to +1.2 % at speed 4; in each, rav1e lets quality
-  fall through the clip and spends half the luma residual on its inter
-  frames (above). What would close it is a lookahead that prices each
-  block's worth to the frames after it and spends the bits there; the
-  frame-level version of that, built and measured, does not pay. V's
-  +35 % to +59 % against rav1e is rav1e's octave-finer V, a trade on the
-  PSNR-Y–PSNR-YUV line, left where it is.
+- **V everywhere**: V's +35 % to +59 % against rav1e in its own BD-rate
+  is rav1e's octave-finer V, a trade on the PSNR-Y–PSNR-YUV line (with
+  separate U and V quantisers too, above), left where it is. foreman's
+  luma, which trailed rav1e by +3.0 % to +4.3 %, was the motion search's
+  multiplier (above); it is now ahead at every tier.
 - **Adaptive quantisation that pays**: `Tools::aq` codes a quantiser per
   superblock (`delta_qindex`) from a temporal-importance estimate (the
   previous frame's prediction of each superblock): −0.2 % to +0.2 % on the

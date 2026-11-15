@@ -389,6 +389,20 @@ pub struct Tools {
     pub restoration_top: bool,
     /// `rect_max` in the frames of a group's top layer.
     pub rect_max_top: u8,
+    /// The multiplier of the SATD-based preselection and the motion
+    /// search (`EncCtx::lambda`: SATD per bit), in hundredths of the
+    /// quantiser step (`AC_QLOOKUP`). 6 from speed 5, 8 below: 40, which
+    /// it was, weighed a vector's bits about seven times what they are
+    /// worth against the SATD, so that blocks took the predicted vectors
+    /// and the stacked candidates over the better predictions a search
+    /// finds (at speed 6, −5.5 % BD-rate PSNR-Y and −5.1 % PSNR-YUV,
+    /// foreman −10.9 %; README).
+    pub satd_lambda: u8,
+    /// Compound candidates' searched vectors refined jointly: each in
+    /// turn searched (half and quarter samples) against the average of its
+    /// prediction with the other's, not on its own. −1.0 % BD-rate PSNR-Y
+    /// at speed 6 (foreman −1.0 %), for 1.07x the time: off.
+    pub joint_compound: bool,
 }
 
 /// `Tools::force_inter_tool`: the sharp filter (smooth across with
@@ -439,10 +453,12 @@ impl Tools {
             },
             // Four at speed 4, the time from the thresholds below: with
             // them, −0.4 % BD-rate PSNR-Y and PSNR-YUV for 1.02x the time.
+            // Two at speed 6, for the time of the finer motion search
+            // (`satd_lambda`): +0.3 % (+0.4 %) for 0.92x.
             inter_candidates: match s {
                 0..=1 => 5,
                 4 => 4,
-                2..=6 => 3,
+                2..=5 => 3,
                 _ => 2,
             },
             cdef: s <= 9,
@@ -544,9 +560,12 @@ impl Tools {
             angle_delta_uv: s <= 8,
             // 1.1x at speed 4, which spends the time on its inter
             // candidates instead (1.0x: +0.1 % PSNR-YUV; 0.8x: +0.8 %).
+            // 1.0x at speed 8, for the time of the finer motion search
+            // (`satd_lambda`): +0.2 % (+0.3 %) for 0.985x.
             intra_early: match s {
                 4 => 110,
-                5..=8 => 120,
+                5..=7 => 120,
+                8 => 100,
                 _ => 0,
             },
             // One trial from speed 4: as much gain for less time.
@@ -566,6 +585,8 @@ impl Tools {
             restoration_sgr: s <= 3,
             restoration_top: true,
             rect_max_top: if s >= 4 { 16 } else { 128 },
+            satd_lambda: if s >= 5 { 6 } else { 8 },
+            joint_compound: false,
         }
     }
 
@@ -659,6 +680,8 @@ impl Tools {
             "restoration_sgr" => self.restoration_sgr = b,
             "restoration_top" => self.restoration_top = b,
             "rect_max_top" => self.rect_max_top = value.min(128) as u8,
+            "satd_lambda" => self.satd_lambda = value.min(255) as u8,
+            "joint_compound" => self.joint_compound = b,
             _ => return false,
         }
         true
@@ -1709,7 +1732,7 @@ impl Encoder {
                     .iter()
                     .map(|&qi| {
                         (
-                            0.4 * AC_QLOOKUP[bdi][qi as usize] as f64,
+                            tools.satd_lambda as f64 / 100.0 * AC_QLOOKUP[bdi][qi as usize] as f64,
                             rd_lambda(&self.cfg, qi as u32),
                         )
                     })
@@ -2147,7 +2170,7 @@ impl Encoder {
             src: src.clone(),
             stride: stride.to_vec(),
             coefs: Box::new([0; 1024]),
-            lambda: 0.4 * qstep * scale,
+            lambda: self.cfg.tools.satd_lambda as f64 / 100.0 * qstep * scale,
             rd_lambda: rd_lambda(&self.cfg, p.qidx),
             refs: p.search_refs.clone(),
             search_range: self.cfg.search_range,
