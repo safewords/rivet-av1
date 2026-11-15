@@ -1654,6 +1654,56 @@ fn block_inter_prediction_unscaled(
     });
 }
 
+/// [`block_inter_prediction`] in 16 bits, for the encoder's estimates: a
+/// single prediction (not a compound one's rounding) from a reference of
+/// the frame's own size, the same values. Returns false, writing nothing,
+/// for any other.
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_inter_prediction_i16(
+    refp: &PlaneBuf,
+    last_x: i32,
+    last_y: i32,
+    x: i64,
+    y: i64,
+    x_step: i64,
+    y_step: i64,
+    w: usize,
+    h: usize,
+    interp_filter: [u8; 2],
+    rv: RoundingVars,
+    pred: &mut [i16],
+) -> bool {
+    let unscaled = x_step == 1 << SCALE_SUBPEL_BITS && y_step == 1 << SCALE_SUBPEL_BITS;
+    if !unscaled || rv.round1 == 7 {
+        return false;
+    }
+    let filters = filter_kinds(interp_filter, w, h);
+    BUFFERS.with_borrow_mut(|buffers| {
+        let Buffers {
+            edges,
+            intermediate,
+            ..
+        } = buffers;
+        block_inter_prediction16(
+            refp,
+            last_x,
+            last_y,
+            x,
+            y,
+            w,
+            h,
+            filters,
+            rv,
+            0,
+            &mut pred[..w * h],
+            &mut edges[0],
+            intermediate,
+        );
+    });
+    true
+}
+
 /// A thread's buffers for inter prediction, reused from block to block
 /// (they only grow, and every use writes what it reads). One borrow of
 /// them serves a block, however many of them it uses.

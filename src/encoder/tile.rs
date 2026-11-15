@@ -13,9 +13,11 @@
 use crate::Result;
 use crate::consts::*;
 use crate::decoder::predict::block_inter_prediction;
+#[cfg(not(target_arch = "x86_64"))]
+use crate::decoder::predict::block_inter_prediction_i16;
 use crate::decoder::state::Mv;
 use crate::decoder::tile::{Plan, TileDecoder, is_directional_mode};
-use crate::dsp::enc::{sad, satd};
+use crate::dsp::enc::{sad, satd, satd_8bit};
 use crate::encoder::Tools;
 use crate::encoder::fwd::{Quantiser, coef_bound, forward_quantise, forward_wht};
 use crate::encoder::rdo::{Decision, Rdo};
@@ -173,6 +175,9 @@ const SQUARE8: [(i32, i32); 8] = [
 thread_local! {
     /// Scratch for inter predictions.
     static PRED: std::cell::RefCell<[Vec<i32>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+    /// Scratch for 16-bit inter predictions (8-bit samples).
+    #[cfg(not(target_arch = "x86_64"))]
+    static PRED16: std::cell::RefCell<[Vec<i16>; 2]> = const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
 
 /// A transform block's levels as [`forward_quantise`] gave them, kept for
@@ -398,14 +403,12 @@ impl TileDecoder<'_, '_> {
         let e = self.enc();
         let cur = &self.f.cur.planes[plane];
         let st = e.stride[plane];
-        satd(
-            &e.src[plane][y * st + x..],
-            st,
-            &cur.data[y * cur.stride + x..],
-            cur.stride,
-            w.max(4),
-            h.max(4),
-        )
+        let (a, b) = (&e.src[plane][y * st + x..], &cur.data[y * cur.stride + x..]);
+        if self.f.bit_depth == 8 {
+            satd_8bit(a, st, b, cur.stride, w.max(4), h.max(4))
+        } else {
+            satd(a, st, b, cur.stride, w.max(4), h.max(4))
+        }
     }
 
     /// Predicts `plane` with intra `mode` as `transform_block()` would and
@@ -1457,12 +1460,62 @@ impl TileDecoder<'_, '_> {
         );
     }
 
+    /// The luma inter prediction from `ref_frame` with `mv` in 16 bits
+    /// (8-bit samples: [`satd_8bit`] measures it), or false.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn inter_pred16(&self, ref_frame: i32, mv: Mv, pred: &mut Vec<i16>) -> bool {
+        if self.f.bit_depth != 8 {
+            return false;
+        }
+        let w = block_width(self.b.mi_size);
+        let h = block_height(self.b.mi_size);
+        let x = self.b.mi_col * MI_SIZE;
+        let y = self.b.mi_row * MI_SIZE;
+        let ref_idx = self.f.hdr.ref_frame_idx[(ref_frame - LAST_FRAME) as usize];
+        let r = self.f.refs[ref_idx].as_ref().expect("a reference");
+        let (sx, sy, stx, sty) =
+            self.f
+                .scale_mv(0, r.upscaled_width as i32, r.frame_height as i32, x, y, mv);
+        let filt = match self.f.hdr.interpolation_filter {
+            SWITCHABLE => EIGHTTAP as u8,
+            f => f as u8,
+        };
+        if pred.len() < w * h {
+            pred.resize(w * h, 0);
+        }
+        block_inter_prediction_i16(
+            &r.frame().planes[0],
+            r.upscaled_width as i32 - 1,
+            r.frame_height as i32 - 1,
+            sx,
+            sy,
+            stx,
+            sty,
+            w,
+            h,
+            [filt, filt],
+            self.f.rounding_variables(false),
+            &mut pred[..w * h],
+        )
+    }
+
     /// Luma SATD of the inter prediction from `ref_frame` with `mv`.
     fn inter_satd(&self, ref_frame: i32, mv: Mv) -> u64 {
         let w = block_width(self.b.mi_size);
         let h = block_height(self.b.mi_size);
         let x = self.b.mi_col * MI_SIZE;
         let y = self.b.mi_row * MI_SIZE;
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Some(v) = PRED16.with_borrow_mut(|pred| {
+            if !self.inter_pred16(ref_frame, mv, &mut pred[0]) {
+                return None;
+            }
+            let e = self.enc();
+            let st = e.stride[0];
+            Some(satd_8bit(&e.src[0][y * st + x..], st, &pred[0], w, w, h))
+        }) {
+            return v;
+        }
         PRED.with_borrow_mut(|pred| {
             self.inter_pred(0, x, y, w, h, ref_frame, mv, &mut pred[0]);
             let e = self.enc();
@@ -1478,6 +1531,21 @@ impl TileDecoder<'_, '_> {
         let h = block_height(self.b.mi_size);
         let x = self.b.mi_col * MI_SIZE;
         let y = self.b.mi_row * MI_SIZE;
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Some(v) = PRED16.with_borrow_mut(|pred| {
+            let [p1, p2] = pred;
+            if !self.inter_pred16(r1, mv1, p1) || !self.inter_pred16(r2, mv2, p2) {
+                return None;
+            }
+            for (a, &b) in p1[..w * h].iter_mut().zip(&p2[..w * h]) {
+                *a = ((*a as i32 + b as i32 + 1) >> 1) as i16;
+            }
+            let e = self.enc();
+            let st = e.stride[0];
+            Some(satd_8bit(&e.src[0][y * st + x..], st, &p1[..], w, w, h))
+        }) {
+            return v;
+        }
         PRED.with_borrow_mut(|pred| {
             let [p1, p2] = pred;
             self.inter_pred(0, x, y, w, h, r1, mv1, p1);

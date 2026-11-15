@@ -4,9 +4,20 @@
 //! reconstruction. The SIMD versions (AVX2, NEON) compute exactly what
 //! the scalar ones do (integer sums; tested against them).
 
-/// A row source of the SATD: samples (`u16`) or a prediction (`i32`).
+/// A row source of the SATD: samples (`u16`) or a prediction (`i32`, or
+/// `i16`).
 pub(crate) trait Px: Copy {
+    /// Signed 16 bits (a prediction), not samples.
+    const SIGNED16: bool = false;
     fn get(self) -> i32;
+}
+
+impl Px for i16 {
+    const SIGNED16: bool = true;
+    #[inline(always)]
+    fn get(self) -> i32 {
+        self as i32
+    }
 }
 
 impl Px for u16 {
@@ -429,7 +440,9 @@ unsafe fn load8<B: Px>(p: &[B]) -> std::arch::x86_64::__m256i {
     // SAFETY: the caller passes at least eight elements; the size of `B`
     // says which they are.
     unsafe {
-        if std::mem::size_of::<B>() == 2 {
+        if B::SIGNED16 {
+            _mm256_cvtepi16_epi32(_mm_loadu_si128(p.as_ptr() as *const __m128i))
+        } else if std::mem::size_of::<B>() == 2 {
             _mm256_cvtepu16_epi32(_mm_loadu_si128(p.as_ptr() as *const __m128i))
         } else {
             _mm256_loadu_si256(p.as_ptr() as *const __m256i)
@@ -527,12 +540,29 @@ unsafe fn satd_neon<B: Px>(
     w: usize,
     h: usize,
 ) -> u64 {
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe { satd_neon_sum(a, a_stride, b, b_stride, w, h) / 2 }
+}
+
+/// [`satd_neon`]'s sum, not halved.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn satd_neon_sum<B: Px>(
+    a: &[u16],
+    a_stride: usize,
+    b: &[B],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
     use std::arch::aarch64::*;
     let load4 = |p: &[B]| -> int32x4_t {
         debug_assert!(p.len() >= 4);
         // SAFETY: four elements; the size of `B` says which they are.
         unsafe {
-            if std::mem::size_of::<B>() == 2 {
+            if B::SIGNED16 {
+                vmovl_s16(vld1_s16(p.as_ptr() as *const i16))
+            } else if std::mem::size_of::<B>() == 2 {
                 vreinterpretq_s32_u32(vmovl_u16(vld1_u16(p.as_ptr() as *const u16)))
             } else {
                 vld1q_s32(p.as_ptr() as *const i32)
@@ -584,7 +614,102 @@ unsafe fn satd_neon<B: Px>(
             acc = vpadalq_u32(acc, sum);
         }
     }
-    vaddvq_u64(acc) / 2
+    vaddvq_u64(acc)
+}
+
+/// [`satd`] of 8-bit samples against samples or a 16-bit prediction of
+/// them (a prediction's overshoot of the sample range included: a
+/// difference within ±1023, so the transform's sums, at most 16 of them,
+/// fit 16 bits, and four of its magnitudes an unsigned 16 bits). The same
+/// value as `satd`, eight columns at a time.
+pub(crate) fn satd_8bit<B: Px>(
+    a: &[u16],
+    a_stride: usize,
+    b: &[B],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    const { assert!(std::mem::size_of::<B>() == 2) };
+    #[cfg(target_arch = "aarch64")]
+    if w >= 8 {
+        // SAFETY: NEON is part of the aarch64 baseline; `B` is 16 bits.
+        return unsafe { satd8_neon(a, a_stride, b, b_stride, w, h) };
+    }
+    satd(a, a_stride, b, b_stride, w, h)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn satd8_neon<B: Px>(
+    a: &[u16],
+    a_stride: usize,
+    b: &[B],
+    b_stride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    use std::arch::aarch64::*;
+    let mut acc = vdupq_n_u32(0);
+    let w8 = w & !7;
+    for by in (0..h).step_by(4) {
+        for bx in (0..w8).step_by(8) {
+            // Two 4x4 blocks side by side, one per half.
+            let mut r = [vdupq_n_s16(0); 4];
+            for (i, ri) in r.iter_mut().enumerate() {
+                let ao = (by + i) * a_stride + bx;
+                let bo = (by + i) * b_stride + bx;
+                let (x, y) = (&a[ao..ao + 8], &b[bo..bo + 8]);
+                // SAFETY: eight elements of each; `B` is 16 bits (a
+                // sample's below 2^15 reads the same signed).
+                *ri = unsafe {
+                    vsubq_s16(
+                        vreinterpretq_s16_u16(vld1q_u16(x.as_ptr())),
+                        vld1q_s16(y.as_ptr() as *const i16),
+                    )
+                };
+            }
+            let s0 = vaddq_s16(r[0], r[1]);
+            let s1 = vaddq_s16(r[2], r[3]);
+            let d0 = vsubq_s16(r[0], r[1]);
+            let d1 = vsubq_s16(r[2], r[3]);
+            let v0 = vaddq_s16(s0, s1);
+            let v1 = vsubq_s16(s0, s1);
+            let v2 = vaddq_s16(d0, d1);
+            let v3 = vsubq_s16(d0, d1);
+            // Transpose each half's 4x4.
+            let t01 = vtrnq_s16(v0, v1);
+            let t23 = vtrnq_s16(v2, v3);
+            let u0 = vtrnq_s32(vreinterpretq_s32_s16(t01.0), vreinterpretq_s32_s16(t23.0));
+            let u1 = vtrnq_s32(vreinterpretq_s32_s16(t01.1), vreinterpretq_s32_s16(t23.1));
+            let c0 = vreinterpretq_s16_s32(u0.0);
+            let c1 = vreinterpretq_s16_s32(u1.0);
+            let c2 = vreinterpretq_s16_s32(u0.1);
+            let c3 = vreinterpretq_s16_s32(u1.1);
+            let s0 = vaddq_s16(c0, c1);
+            let s1 = vaddq_s16(c2, c3);
+            let d0 = vsubq_s16(c0, c1);
+            let d1 = vsubq_s16(c2, c3);
+            let sum = vaddq_u16(
+                vaddq_u16(
+                    vreinterpretq_u16_s16(vabsq_s16(vaddq_s16(s0, s1))),
+                    vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(s0, s1))),
+                ),
+                vaddq_u16(
+                    vreinterpretq_u16_s16(vabsq_s16(vaddq_s16(d0, d1))),
+                    vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(d0, d1))),
+                ),
+            );
+            acc = vpadalq_u16(acc, sum);
+        }
+    }
+    let mut total = vaddlvq_u32(acc);
+    if w8 < w {
+        // A last 4-wide column.
+        // SAFETY: as above.
+        total += unsafe { satd_neon_sum(&a[w8..], a_stride, &b[w8..], b_stride, w - w8, h) };
+    }
+    total / 2
 }
 
 #[cfg(test)]
@@ -629,6 +754,26 @@ mod tests {
                     satd(&a, 160, &bi, w, w, h),
                     satd_scalar(&a, 160, &bi, w, w, h),
                     "satd i32 {w}x{h}"
+                );
+                if max == 255 {
+                    // 8-bit samples, a prediction overshooting them.
+                    let bs: Vec<i16> = b.iter().map(|&v| v as i16 * 3 - 300).collect();
+                    assert_eq!(
+                        satd_8bit(&a, 160, &bs, w, w, h),
+                        satd_scalar(&a, 160, &bs, w, w, h),
+                        "satd 8-bit i16 {w}x{h}"
+                    );
+                    assert_eq!(
+                        satd_8bit(&a, 160, &b, 136, w, h),
+                        satd_scalar(&a, 160, &b, 136, w, h),
+                        "satd 8-bit u16 {w}x{h}"
+                    );
+                }
+                let bs: Vec<i16> = b.iter().map(|&v| v as i16 - 700).collect();
+                assert_eq!(
+                    satd(&a, 160, &bs, w, w, h),
+                    satd_scalar(&a, 160, &bs, w, w, h),
+                    "satd i16 {w}x{h}"
                 );
                 for limit in [u64::MAX, 1000, 20_000, 0] {
                     assert_eq!(
