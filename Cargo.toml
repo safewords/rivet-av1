@@ -25,7 +25,36 @@ md5 = "0.7"
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [features]
-default = []
+default = ["encoder"]
+# The encoder: `Encoder`, `Config`, `Tools` and everything behind them. Off,
+# the crate is a decoder alone, and none of the encoder is compiled or linked
+# (for a smaller WebAssembly build: `default-features = false`).
+encoder = []
+
+# The encoder's examples and the tests that encode their streams.
+[[example]]
+name = "av1_ivfenc"
+required-features = ["encoder"]
+
+[[example]]
+name = "av1_rdcurve"
+required-features = ["encoder"]
+
+[[example]]
+name = "av1_ratetest"
+required-features = ["encoder"]
+
+[[test]]
+name = "encode"
+required-features = ["encoder"]
+
+[[test]]
+name = "conformance"
+required-features = ["encoder"]
+
+[[test]]
+name = "recovery"
+required-features = ["encoder"]
 
 [profile.test]
 opt-level = 2

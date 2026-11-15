@@ -489,6 +489,7 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: usize) {
 /// `d`. At the end it picks the code value in the final interval whose
 /// window starts with the one bit `exit_symbol()` expects, followed by
 /// zeros.
+#[cfg(feature = "encoder")]
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct SymbolEncoder {
     out: Vec<u8>,
@@ -507,6 +508,7 @@ pub(crate) struct SymbolEncoder {
 }
 
 /// `-log2(p / 32768)` in 1/256 bit, for `p` in steps of 8.
+#[cfg(feature = "encoder")]
 fn cost_table() -> &'static [u32; 4097] {
     static T: std::sync::OnceLock<[u32; 4097]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
@@ -520,6 +522,7 @@ fn cost_table() -> &'static [u32; 4097] {
 }
 
 /// The cost, in 1/256 bit, of coding `symbol` with `cdf`.
+#[cfg(feature = "encoder")]
 #[inline]
 pub(crate) fn symbol_cost(cdf: &[u16], symbol: usize) -> u32 {
     let hi = cdf[symbol] as u32;
@@ -534,11 +537,13 @@ pub(crate) fn symbol_cost(cdf: &[u16], symbol: usize) -> u32 {
 /// Where an encoder's writer sends its symbols: to be coded (a
 /// [`SymbolEncoder`], which counts them itself when trial coding), or to
 /// have their costs added up ([`CostCounter`]).
+#[cfg(feature = "encoder")]
 pub(crate) trait SymbolSink {
     fn symbol(&mut self, cdf: &mut [u16], symbol: usize);
     fn bool(&mut self, bit: u32);
 }
 
+#[cfg(feature = "encoder")]
 impl SymbolSink for SymbolEncoder {
     #[inline(always)]
     fn symbol(&mut self, cdf: &mut [u16], symbol: usize) {
@@ -553,11 +558,13 @@ impl SymbolSink for SymbolEncoder {
 
 /// The costs of symbols, in 1/256 bit, as trial coding counts them
 /// ([`symbol_cost`]), with the table in hand.
+#[cfg(feature = "encoder")]
 pub(crate) struct CostCounter {
     pub(crate) bits: u64,
     table: &'static [u32; 4097],
 }
 
+#[cfg(feature = "encoder")]
 impl CostCounter {
     pub(crate) fn new() -> Self {
         CostCounter {
@@ -567,6 +574,7 @@ impl CostCounter {
     }
 }
 
+#[cfg(feature = "encoder")]
 impl SymbolSink for CostCounter {
     #[inline(always)]
     fn symbol(&mut self, cdf: &mut [u16], symbol: usize) {
@@ -585,6 +593,7 @@ impl SymbolSink for CostCounter {
     }
 }
 
+#[cfg(feature = "encoder")]
 impl SymbolEncoder {
     pub(crate) fn new(disable_update: bool) -> Self {
         SymbolEncoder {
@@ -712,6 +721,7 @@ impl SymbolEncoder {
 /// planted.
 pub(crate) enum Coder<'a> {
     Dec(SymbolDecoder<'a>),
+    #[cfg(feature = "encoder")]
     Enc(SymbolEncoder),
     /// Decoding, with the reference symbol decoder reading every symbol as
     /// well: what either reads, what it leaves of the CDF and the state it
@@ -753,12 +763,15 @@ fn bool_both<'a>(d: &mut SymbolDecoder<'a>, r: &mut ReferenceSymbolDecoder<'a>) 
     got
 }
 
+// Decoding alone, the values to code go unused.
+#[cfg_attr(not(feature = "encoder"), allow(unused_variables))]
 impl<'a> Coder<'a> {
     /// The decoder, where the caller has established that this is one.
     #[inline(always)]
     pub(crate) fn dec(&mut self) -> &mut SymbolDecoder<'a> {
         match self {
             Coder::Dec(d) | Coder::Both(d, _) => d,
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) => unreachable!("a decoding path in the encoder"),
         }
     }
@@ -797,25 +810,40 @@ impl<'a> Coder<'a> {
         }
     }
 
+    /// Whether this codes the encoder's decisions. Without the `encoder`
+    /// feature, never: every encoding branch of the tile walker is then
+    /// resolved when it is compiled, and none of the encoder is linked.
+    #[cfg(feature = "encoder")]
+    #[inline(always)]
     pub(crate) fn encoding(&self) -> bool {
         matches!(self, Coder::Enc(_))
+    }
+
+    /// See above.
+    #[cfg(not(feature = "encoder"))]
+    #[inline(always)]
+    pub(crate) const fn encoding(&self) -> bool {
+        false
     }
 
     /// See [`SymbolDecoder::ran_out`]; never, encoding.
     pub(crate) fn ran_out(&self) -> bool {
         match self {
             Coder::Dec(d) | Coder::Both(d, _) => d.ran_out(),
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) => false,
         }
     }
 
     /// Whether this is trial coding (see `SymbolEncoder::counting`).
+    #[cfg(feature = "encoder")]
     pub(crate) fn counting(&self) -> bool {
         matches!(self, Coder::Enc(e) if e.counting)
     }
 
     /// Switches trial coding (see `SymbolEncoder::counting`) on or off;
     /// returns the previous setting.
+    #[cfg(feature = "encoder")]
     pub(crate) fn set_counting(&mut self, on: bool) -> bool {
         match self {
             Coder::Enc(e) => std::mem::replace(&mut e.counting, on),
@@ -824,6 +852,7 @@ impl<'a> Coder<'a> {
     }
 
     /// The trial cost accumulated so far, in 1/256 bit.
+    #[cfg(feature = "encoder")]
     pub(crate) fn trial_bits(&self) -> u64 {
         match self {
             Coder::Enc(e) => e.bits,
@@ -832,6 +861,7 @@ impl<'a> Coder<'a> {
     }
 
     /// Resets the trial cost (a search undoes its trials' costs).
+    #[cfg(feature = "encoder")]
     pub(crate) fn set_trial_bits(&mut self, v: u64) {
         if let Coder::Enc(e) = self {
             e.bits = v;
@@ -840,6 +870,7 @@ impl<'a> Coder<'a> {
 
     /// The cost of coding `v` with `cdf`, in 1/256 bit (nothing coded).
     #[inline]
+    #[cfg(feature = "encoder")]
     pub(crate) fn cost(cdf: &[u16], v: usize) -> u32 {
         symbol_cost(cdf, v)
     }
@@ -849,6 +880,7 @@ impl<'a> Coder<'a> {
     pub(crate) fn symbol(&mut self, cdf: &mut [u16], v: usize) -> usize {
         match self {
             Coder::Dec(d) => d.read_symbol(cdf),
+            #[cfg(feature = "encoder")]
             Coder::Enc(e) => {
                 e.write_symbol(cdf, v);
                 v
@@ -862,6 +894,7 @@ impl<'a> Coder<'a> {
     pub(crate) fn read_symbol(&mut self, cdf: &mut [u16]) -> usize {
         match self {
             Coder::Dec(d) => d.read_symbol(cdf),
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) => panic!("the encoder does not code this syntax element"),
             Coder::Both(d, r) => read_both(d, r, cdf),
         }
@@ -872,6 +905,7 @@ impl<'a> Coder<'a> {
     pub(crate) fn literal(&mut self, n: u32, v: u32) -> u32 {
         match self {
             Coder::Dec(d) => d.read_literal(n),
+            #[cfg(feature = "encoder")]
             Coder::Enc(e) => {
                 e.write_literal(n, v);
                 v
@@ -885,7 +919,9 @@ impl<'a> Coder<'a> {
     pub(crate) fn read_literal(&mut self, n: u32) -> u32 {
         match self {
             Coder::Dec(d) => d.read_literal(n),
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) if n == 0 => 0,
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) => panic!("the encoder does not code this literal"),
             Coder::Both(d, r) => (0..n).fold(0, |x, _| 2 * x + bool_both(d, r)),
         }
@@ -900,6 +936,7 @@ impl<'a> Coder<'a> {
     pub(crate) fn ns(&mut self, n: u32, v: u32) -> u32 {
         match self {
             Coder::Dec(d) => d.read_ns(n),
+            #[cfg(feature = "encoder")]
             Coder::Enc(e) => {
                 if n > 1 {
                     let w = floor_log2(n) + 1;
@@ -933,6 +970,7 @@ impl<'a> Coder<'a> {
     pub(crate) fn trailing_ok(&self) -> bool {
         match self {
             Coder::Dec(d) | Coder::Both(d, _) => d.trailing_ok(),
+            #[cfg(feature = "encoder")]
             Coder::Enc(_) => true,
         }
     }
@@ -943,6 +981,7 @@ mod tests {
     use super::*;
 
     /// Symbols written with adapting CDFs decode back, padding and all.
+    #[cfg(feature = "encoder")]
     #[test]
     fn round_trip() {
         let mut seed = 12345u32;
@@ -1037,6 +1076,7 @@ mod tests {
 
     /// The window decoder against the reference on what an encoder wrote:
     /// every symbol, CDF and state, to the end of the data and beyond it.
+    #[cfg(feature = "encoder")]
     #[test]
     fn window_decoder_matches_the_reference() {
         let mut seed = 0x9e37_79b9u32;

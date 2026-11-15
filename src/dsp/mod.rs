@@ -7,6 +7,7 @@
 //! there.
 
 pub(crate) mod cdef;
+#[cfg(feature = "encoder")]
 pub(crate) mod enc;
 pub(crate) mod itx;
 pub(crate) mod lf;

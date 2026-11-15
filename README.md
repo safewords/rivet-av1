@@ -25,12 +25,17 @@ holds an average bitrate. What is and is not there is listed precisely
 below.
 
 Published as `rivet-av1`; **imported as `av1`** (`use av1::…`). One
-dependency (`thiserror`), no features, no build script.
+dependency (`thiserror`), one feature, no build script.
 
 ```toml
 [dependencies]
 av1 = { package = "rivet-av1", git = "https://github.com/safewords/rivet-av1", branch = "develop" }
 ```
+
+The feature, `encoder`, is on by default. A decoder alone
+(`default-features = false`) compiles none of the encoder: the tile
+walker's encoding branches are decided where it is compiled, and nothing
+of the encoder is linked, which is what a WebAssembly build wants.
 
 ## What it decodes
 

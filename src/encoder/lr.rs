@@ -18,15 +18,7 @@ use crate::decoder::state::FrameBuf;
 use crate::dsp::enc::sse_row;
 use crate::tables::*;
 
-/// One unit's restoration, as `read_lr_unit()` codes it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LrChoice {
-    /// `RESTORE_NONE`, `RESTORE_WIENER` or `RESTORE_SGRPROJ`.
-    pub(crate) t: u8,
-    pub(crate) wiener: [[i32; 3]; 2],
-    pub(crate) set: u8,
-    pub(crate) xqd: [i32; 2],
-}
+pub(crate) use crate::decoder::tile::LrChoice;
 
 /// The frame's loop restoration: per plane, `FrameRestorationType` and
 /// each unit's choice.

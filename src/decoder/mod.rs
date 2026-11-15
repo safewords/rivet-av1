@@ -8,6 +8,7 @@
 //! reference update and, on output, film grain synthesis.
 
 mod conformance;
+mod encode_mode;
 mod flight;
 pub(crate) mod grain;
 pub(crate) mod lst;

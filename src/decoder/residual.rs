@@ -46,6 +46,7 @@ use crate::decoder::CoefficientReader;
 use crate::decoder::record::Pass;
 use crate::decoder::tile::{TileDecoder, find_tx_size};
 use crate::dsp::itx::inverse_transform_2d;
+#[cfg(feature = "encoder")]
 use crate::symbol::{Coder, CostCounter, SymbolSink};
 use crate::tables::*;
 
@@ -785,19 +786,15 @@ impl TileDecoder<'_, '_> {
                 eob,
                 at: (x4, y4, w4, h4),
             };
-            (cul_level, dc_category) = if !self.sd.encoding() {
-                self.levels_reference(&block, scan)
-            } else if CHECK_ENCODER_LEVELS.load(std::sync::atomic::Ordering::Relaxed) {
-                self.levels_checked(&block, scan)
+            (cul_level, dc_category) = if self.sd.encoding() {
+                self.levels_encoder(&block, scan)
             } else {
-                self.levels_encode(&block)
+                self.levels_reference(&block, scan)
             };
             cul_level = cul_level.min(63);
         }
-        if eob > 0
-            && let Some(e) = self.enc.as_mut()
-        {
-            e.rdo.nonzero += 1;
+        if eob > 0 && self.sd.encoding() {
+            self.count_nonzero();
         }
         for i in 0..w4 {
             self.above_level_ctx[plane][x4 + i] = cul_level as u8;
@@ -911,9 +908,21 @@ impl TileDecoder<'_, '_> {
         (cul_level, dc_category)
     }
 
+    /// The levels of `coeffs()` when encoding: [`Self::levels_encode`], or,
+    /// for the tests, [`Self::levels_checked`].
+    #[cfg(feature = "encoder")]
+    pub(crate) fn levels_encoder(&mut self, b: &LevelBlock, scan: &[u16]) -> (u32, u8) {
+        if CHECK_ENCODER_LEVELS.load(std::sync::atomic::Ordering::Relaxed) {
+            self.levels_checked(b, scan)
+        } else {
+            self.levels_encode(b)
+        }
+    }
+
     /// [`Self::levels_reference`] for the encoder (see the module
     /// documentation): the same symbols with the same CDFs, coded from the
     /// levels the encoder chose (`EncCtx::coefs`).
+    #[cfg(feature = "encoder")]
     fn levels_encode(&mut self, b: &LevelBlock) -> (u32, u8) {
         let LevelBlock {
             plane,
@@ -949,6 +958,7 @@ impl TileDecoder<'_, '_> {
     /// from the same state, which must end the same — the symbols coded
     /// (or their cost), the CDFs, `Quant`, what they return — or this
     /// panics. For the tests ([`set_check_encoder_levels`]).
+    #[cfg(feature = "encoder")]
     fn levels_checked(&mut self, b: &LevelBlock, scan: &[u16]) -> (u32, u8) {
         let enc = |t: &Self| match &t.sd {
             Coder::Enc(e) => e.clone(),
@@ -1632,6 +1642,7 @@ pub(crate) fn coeff_br_ctx_of(tx_class: usize, row: usize, col: usize, mag: u32)
 
 /// What [`write_levels`] works on: the CDFs, `Quant`, the level map, and
 /// the levels the encoder chose.
+#[cfg(feature = "encoder")]
 struct LevelState<'a> {
     cdf: &'a mut crate::cdf::CdfContext,
     quant: &'a mut [i32; 1024],
@@ -1640,6 +1651,7 @@ struct LevelState<'a> {
 }
 
 /// The body of [`TileDecoder::levels_encode`], for coding or for counting.
+#[cfg(feature = "encoder")]
 fn write_levels<S: SymbolSink>(
     e: &mut S,
     b: &LevelBlock,
@@ -1779,7 +1791,7 @@ fn write_levels<S: SymbolSink>(
 /// A transform block whose levels are being coded: what
 /// [`TileDecoder::levels_reference`] and its encoder's version take.
 #[derive(Clone, Copy)]
-struct LevelBlock {
+pub(crate) struct LevelBlock {
     plane: usize,
     tx_sz: usize,
     tx_sz_ctx: usize,
@@ -1795,12 +1807,13 @@ struct LevelBlock {
 
 /// Whether the encoder's level writer runs alongside the reference, each
 /// transform block checked against it ([`TileDecoder::levels_checked`]).
+#[cfg(feature = "encoder")]
 static CHECK_ENCODER_LEVELS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Has every encoder in the process check its level writer against the
 /// reference, from now on (`true`) or no more: for the tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "encoder"))]
 pub(crate) fn set_check_encoder_levels(on: bool) {
     CHECK_ENCODER_LEVELS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2052,6 +2065,7 @@ mod tests {
     /// transform block of encodes that reach every part of it: trial
     /// coding and coding, all the transform classes, levels from 1 to
     /// past the Golomb part's (a fine quantiser on noise), 8 and 10 bits.
+    #[cfg(feature = "encoder")]
     #[test]
     fn encoder_level_writer_matches_the_reference() {
         use crate::{ChromaFormat, Config, Encoder, Frame};

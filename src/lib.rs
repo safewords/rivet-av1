@@ -57,12 +57,18 @@
 // The decoding processes are written as the specification writes them:
 // indexed loops over arrays, which keeps them checkable line by line.
 #![allow(clippy::needless_range_loop)]
+// Without the encoder, its bitstream writers and the few pieces of the
+// decoder only it calls (the 1D transforms it derives its forward ones
+// from, the encoder's half of `Plan`) go unused. They are linted with the
+// feature on, the default.
+#![cfg_attr(not(feature = "encoder"), allow(dead_code))]
 
 pub(crate) mod bits;
 pub(crate) mod cdf;
 pub(crate) mod consts;
 pub mod decoder;
 pub(crate) mod dsp;
+#[cfg(feature = "encoder")]
 pub mod encoder;
 pub mod frame;
 pub(crate) mod header;
@@ -75,6 +81,7 @@ pub(crate) mod tables;
 pub mod y4m;
 
 pub use decoder::{Decoder, TileListLayout, annexb_temporal_units};
+#[cfg(feature = "encoder")]
 pub use encoder::{Config, Encoder, Tools};
 pub use frame::{
     ChromaFormat, ColorInfo, ContentLightLevel, Frame, HdrMetadata, MasteringDisplay, Plane,

@@ -92,6 +92,8 @@ jobs:
         run: if command -v ci-cache-setup >/dev/null; then ci-cache-setup; else echo "no compile cache on this runner"; fi
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The decoder alone (no `encoder`), as a WebAssembly build takes it.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

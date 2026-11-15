@@ -23,7 +23,7 @@ impl TileDecoder<'_, '_> {
         let sub_block_mi_row = self.b.mi_row & sb_mask;
         let sub_block_mi_col = self.b.mi_col & sb_mask;
         // (The encoder's probes of a prediction measure its luma alone.)
-        let planes = if self.enc.as_ref().is_some_and(|e| e.probing) {
+        let planes = if self.probing() {
             1
         } else {
             1 + if self.b.has_chroma { 2 } else { 0 }

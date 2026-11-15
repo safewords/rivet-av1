@@ -89,6 +89,17 @@ pub(crate) struct Block {
     pub(crate) is_inter_intra: bool,
 }
 
+/// One unit's restoration, as `read_lr_unit()` codes it: the encoder's
+/// choice (encode mode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LrChoice {
+    /// `RESTORE_NONE`, `RESTORE_WIENER` or `RESTORE_SGRPROJ`.
+    pub(crate) t: u8,
+    pub(crate) wiener: [[i32; 3]; 2],
+    pub(crate) set: u8,
+    pub(crate) xqd: [i32; 2],
+}
+
 /// The encoder's decisions for one block, planted before the syntax codes
 /// them (encode mode). Unused when decoding.
 #[derive(Clone, Copy, Default, Debug)]
@@ -161,6 +172,7 @@ pub(crate) struct TileDecoder<'a, 'b> {
     /// The encoder's decisions for the block being coded (encode mode).
     pub(crate) plan: Plan,
     /// The encoder's state (encode mode only).
+    #[cfg(feature = "encoder")]
     pub(crate) enc: Option<Box<crate::encoder::tile::EncCtx>>,
     /// The transform type the encoder chose for the luma block being coded.
     pub(crate) enc_tx_type: usize,
@@ -233,6 +245,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
     }
 
     /// A tile walker that encodes the encoder's decisions (`enc`).
+    #[cfg(feature = "encoder")]
     pub(crate) fn new_encoder(
         f: &'a mut FrameCtx,
         enc: Box<crate::encoder::tile::EncCtx>,
@@ -259,6 +272,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             f,
             sd,
             plan: Plan::default(),
+            #[cfg(feature = "encoder")]
             enc: None,
             enc_tx_type: 0,
             cdf,
@@ -480,12 +494,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let frt = self.f.hdr.frame_restoration_type[plane];
         let idx = unit_row * self.f.lr[plane].unit_cols + unit_col;
         // The encoder's choice for the unit (encode mode).
-        let planned = self
-            .enc
-            .as_ref()
-            .and_then(|e| e.lr_plan.as_ref())
-            .and_then(|p| p.units[plane].get(idx).copied())
-            .unwrap_or_default();
+        let planned = self.planned_lr(plane, idx);
         let restoration_type = if frt == RESTORE_WIENER {
             let p = (planned.t == RESTORE_WIENER) as usize;
             if self.sd.symbol(&mut self.cdf.use_wiener, p) != 0 {
@@ -1151,11 +1160,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
         let c = self.b.mi_col & cdef_mask4;
         let s = self.f.cdef_stride;
         if self.f.cdef_idx[(r >> 4) * s + (c >> 4)] == -1 {
-            let planned = self
-                .enc
-                .as_ref()
-                .and_then(|e| e.cdef_table.as_ref())
-                .map_or(0, |t| t[(r >> 4) * s + (c >> 4)].max(0) as u32);
+            let planned = self.planned_cdef((r >> 4) * s + (c >> 4));
             let v = self.sd.literal(self.f.hdr.cdef_bits, planned) as i8;
             let w4 = NUM_4X4_BLOCKS_WIDE[self.b.mi_size];
             let h4 = NUM_4X4_BLOCKS_HIGH[self.b.mi_size];
@@ -1542,7 +1547,7 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
             if self.sd.encoding() {
                 self.enc_palette_map(onscreen_width, onscreen_height);
             }
-            let p0 = self.enc.as_ref().map_or(0, |e| e.palette_map[0][0]) as u32;
+            let p0 = self.planned_palette_y(0, 0) as u32;
             let v = self.sd.ns(n as u32, p0) as u8;
             self.color_map_y[0][0] = v;
             self.read_color_map(
@@ -1605,20 +1610,18 @@ impl<'a, 'b> TileDecoder<'a, 'b> {
                     palette_color_context(map, i - ju, ju, n)
                 };
                 let ctx = PALETTE_COLOR_CONTEXT[hash as usize] as usize;
+                // The planned index's position in the context's order
+                // (encode mode).
+                let planned = if luma && self.sd.encoding() {
+                    let want = self.planned_palette_y(i - ju, ju);
+                    order.iter().position(|&o| o == want).unwrap_or(0)
+                } else {
+                    0
+                };
                 let rows = if luma {
                     &mut self.cdf.palette_y_color
                 } else {
                     &mut self.cdf.palette_uv_color
-                };
-                // The planned index's position in the context's order
-                // (encode mode).
-                let planned = if luma {
-                    self.enc.as_ref().map_or(0, |e| {
-                        let want = e.palette_map[i - ju][ju];
-                        order.iter().position(|&o| o == want).unwrap_or(0)
-                    })
-                } else {
-                    0
                 };
                 let s = self.sd.symbol(palette_color_cdf(rows, n, ctx), planned);
                 let map = if luma {
