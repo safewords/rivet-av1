@@ -2182,6 +2182,7 @@ impl Encoder {
             aq: p.aq.clone(),
             ibc: p.ibc.clone(),
             probing: false,
+            tx_states: Default::default(),
         })
     }
 

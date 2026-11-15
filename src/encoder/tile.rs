@@ -67,6 +67,8 @@ pub(crate) struct EncCtx {
     /// The search is probing a prediction (`encoder::inter`): the walker
     /// predicts luma alone.
     pub(crate) probing: bool,
+    /// The transform type search's states (before, and its best's).
+    pub(crate) tx_states: [TxState; 2],
 }
 
 /// The positions of the source's luma 8x8 blocks (every sample position
@@ -203,10 +205,17 @@ struct QEntry {
     eob: usize,
 }
 
+/// The transform types to search, in order: `types[..n]`.
+struct TxTypes {
+    types: [usize; 16],
+    n: usize,
+}
+
 /// What coding a luma transform block on trial changes (see
 /// `TileDecoder::search_tx_type`): its samples, its above and left
 /// contexts (levels, DC), its transform types.
-struct TxState {
+#[derive(Default)]
+pub(crate) struct TxState {
     pix: Vec<u16>,
     ctx: [Vec<u8>; 4],
     txt: Vec<u8>,
@@ -2049,13 +2058,17 @@ impl TileDecoder<'_, '_> {
     }
 
     /// The luma transform types worth a trial for this transform block.
-    fn tx_type_candidates(&self, tx_sz: usize) -> Vec<usize> {
+    fn tx_type_candidates(&self, tx_sz: usize) -> TxTypes {
+        let mut out = TxTypes {
+            types: [DCT_DCT; 16],
+            n: 1,
+        };
         if self.b.lossless || TX_SIZE_SQR_UP[tx_sz] > TX_32X32 || self.qindex() == 0 {
-            return vec![DCT_DCT];
+            return out;
         }
         let set = self.get_tx_set(tx_sz);
         if set == 0 {
-            return vec![DCT_DCT];
+            return out;
         }
         const ORDER: [usize; 16] = [
             DCT_DCT,
@@ -2076,12 +2089,17 @@ impl TileDecoder<'_, '_> {
             H_FLIPADST,
         ];
         let max = self.enc().tools.tx_types as usize;
-        ORDER
+        out.n = 0;
+        for t in ORDER
             .iter()
             .copied()
             .filter(|&t| self.is_tx_type_in_set(set, t))
             .take(max.max(1))
-            .collect()
+        {
+            out.types[out.n] = t;
+            out.n += 1;
+        }
+        out
     }
 
     /// Chooses the levels of the transform block about to be coded (its
@@ -2114,12 +2132,16 @@ impl TileDecoder<'_, '_> {
                     t as usize
                 } else {
                     let cands = if self.rdo().fast_tx {
-                        vec![DCT_DCT]
+                        TxTypes {
+                            types: [DCT_DCT; 16],
+                            n: 1,
+                        }
                     } else {
                         self.tx_type_candidates(tx_sz)
                     };
+                    let cands = &cands.types[..cands.n];
                     let t = if cands.len() > 1 {
-                        self.search_tx_type(start_x, start_y, tx_sz, &cands)
+                        self.search_tx_type(start_x, start_y, tx_sz, cands)
                     } else {
                         cands[0]
                     };
@@ -2183,25 +2205,26 @@ impl TileDecoder<'_, '_> {
         let y1 = (y + h).min(pl.h);
         let rows = (y4 + h4).min(self.f.mi_rows + 32);
         let cols = (x4 + w4).min(ms);
-        let grab = |t: &Self| -> TxState {
+        let grab = |t: &Self, s: &mut TxState| {
             let pl = &t.f.cur.planes[0];
-            let mut pix = Vec::with_capacity((x1 - x) * (y1 - y));
+            s.pix.clear();
             for yy in y..y1 {
-                pix.extend_from_slice(&pl.data[yy * pl.stride + x..yy * pl.stride + x1]);
+                s.pix
+                    .extend_from_slice(&pl.data[yy * pl.stride + x..yy * pl.stride + x1]);
             }
-            let mut txt = Vec::new();
+            s.txt.clear();
             for r in y4..rows {
-                txt.extend_from_slice(&t.f.tx_types[r * ms + x4..r * ms + cols]);
+                s.txt
+                    .extend_from_slice(&t.f.tx_types[r * ms + x4..r * ms + cols]);
             }
-            TxState {
-                pix,
-                ctx: [
-                    t.above_level_ctx[0][x4..x4 + w4].to_vec(),
-                    t.above_dc_ctx[0][x4..x4 + w4].to_vec(),
-                    t.left_level_ctx[0][y4..y4 + h4].to_vec(),
-                    t.left_dc_ctx[0][y4..y4 + h4].to_vec(),
-                ],
-                txt,
+            for (v, src) in s.ctx.iter_mut().zip([
+                &t.above_level_ctx[0][x4..x4 + w4],
+                &t.above_dc_ctx[0][x4..x4 + w4],
+                &t.left_level_ctx[0][y4..y4 + h4],
+                &t.left_dc_ctx[0][y4..y4 + h4],
+            ]) {
+                v.clear();
+                v.extend_from_slice(src);
             }
         };
         let put = |t: &mut Self, s: &TxState| {
@@ -2221,7 +2244,10 @@ impl TileDecoder<'_, '_> {
                     .copy_from_slice(&s.txt[i * cw..(i + 1) * cw]);
             }
         };
-        let pre = grab(self);
+        // (The states' buffers are the search's, reused.)
+        let [mut pre, mut post_state] =
+            std::mem::take(&mut self.enc.as_mut().expect("encode mode").tx_states);
+        grab(self, &mut pre);
         let counting = self.sd.set_counting(true);
         let bits_start = self.sd.trial_bits();
         let nonzero = self.rdo().nonzero;
@@ -2234,7 +2260,7 @@ impl TileDecoder<'_, '_> {
         // best type would repeat its trial: what the trial left stands in
         // for it (see `enc_choose_coeffs`).
         let keep = counting && self.enc().tools.rdoq != 2;
-        let mut post: Option<(TxState, u64, usize, usize)> = None;
+        let mut post: Option<(u64, usize, usize)> = None;
         for &t in cands {
             self.rdo().forced_tx_type = Some(t);
             let bits0 = self.sd.trial_bits();
@@ -2249,7 +2275,8 @@ impl TileDecoder<'_, '_> {
             if better {
                 best = (t, cost);
                 if keep {
-                    post = Some((grab(self), bits, eob, self.plane_tx_type));
+                    grab(self, &mut post_state);
+                    post = Some((bits, eob, self.plane_tx_type));
                 }
             }
             put(self, &pre);
@@ -2263,14 +2290,15 @@ impl TileDecoder<'_, '_> {
         self.plane_tx_type = saved_ptt;
         self.sd.set_counting(counting);
         self.sd.set_trial_bits(bits_start);
-        if let Some((state, bits, eob, ptt)) = post {
-            put(self, &state);
+        if let Some((bits, eob, ptt)) = post {
+            put(self, &post_state);
             self.sd.set_trial_bits(bits_start + bits);
             self.plane_tx_type = ptt;
             let rdo = self.rdo();
             rdo.nonzero += (eob > 0) as u32;
             rdo.tx_coded = Some(eob);
         }
+        self.enc.as_mut().expect("encode mode").tx_states = [pre, post_state];
         best.0
     }
 }
