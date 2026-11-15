@@ -203,6 +203,15 @@ struct QEntry {
     eob: usize,
 }
 
+/// What coding a luma transform block on trial changes (see
+/// `TileDecoder::search_tx_type`): its samples, its above and left
+/// contexts (levels, DC), its transform types.
+struct TxState {
+    pix: Vec<u16>,
+    ctx: [Vec<u8>; 4],
+    txt: Vec<u8>,
+}
+
 /// The entries of the cache, picked by where the block lies (a block
 /// coded again is mostly coded again soon). Blocks of the 64-sample
 /// transforms are not kept: an entry is then 8 KB at most.
@@ -2115,6 +2124,12 @@ impl TileDecoder<'_, '_> {
                         cands[0]
                     };
                     self.rdo().log.push(Decision::TxType(t as u8));
+                    if let Some(eob) = self.rdo().tx_coded {
+                        // The search left the block coded with `t` (the
+                        // walker codes nothing more of it).
+                        self.enc_tx_type = t;
+                        return eob;
+                    }
                     t
                 }
             } else {
@@ -2166,43 +2181,60 @@ impl TileDecoder<'_, '_> {
         let pl = &self.f.cur.planes[0];
         let x1 = (x + w).min(pl.w);
         let y1 = (y + h).min(pl.h);
-        let mut pix = Vec::with_capacity(w * h);
-        for yy in y..y1 {
-            pix.extend_from_slice(&pl.data[yy * pl.stride + x..yy * pl.stride + x1]);
-        }
-        let al: Vec<u8> = self.above_level_ctx[0][x4..x4 + w4].to_vec();
-        let ad: Vec<u8> = self.above_dc_ctx[0][x4..x4 + w4].to_vec();
-        let ll: Vec<u8> = self.left_level_ctx[0][y4..y4 + h4].to_vec();
-        let ld: Vec<u8> = self.left_dc_ctx[0][y4..y4 + h4].to_vec();
         let rows = (y4 + h4).min(self.f.mi_rows + 32);
         let cols = (x4 + w4).min(ms);
-        let mut txt = Vec::new();
-        for r in y4..rows {
-            txt.extend_from_slice(&self.f.tx_types[r * ms + x4..r * ms + cols]);
-        }
-        let restore = |t: &mut Self| {
+        let grab = |t: &Self| -> TxState {
+            let pl = &t.f.cur.planes[0];
+            let mut pix = Vec::with_capacity((x1 - x) * (y1 - y));
+            for yy in y..y1 {
+                pix.extend_from_slice(&pl.data[yy * pl.stride + x..yy * pl.stride + x1]);
+            }
+            let mut txt = Vec::new();
+            for r in y4..rows {
+                txt.extend_from_slice(&t.f.tx_types[r * ms + x4..r * ms + cols]);
+            }
+            TxState {
+                pix,
+                ctx: [
+                    t.above_level_ctx[0][x4..x4 + w4].to_vec(),
+                    t.above_dc_ctx[0][x4..x4 + w4].to_vec(),
+                    t.left_level_ctx[0][y4..y4 + h4].to_vec(),
+                    t.left_dc_ctx[0][y4..y4 + h4].to_vec(),
+                ],
+                txt,
+            }
+        };
+        let put = |t: &mut Self, s: &TxState| {
             let pl = &mut t.f.cur.planes[0];
             let xw = x1 - x;
             for (i, yy) in (y..y1).enumerate() {
                 pl.data[yy * pl.stride + x..yy * pl.stride + x1]
-                    .copy_from_slice(&pix[i * xw..(i + 1) * xw]);
+                    .copy_from_slice(&s.pix[i * xw..(i + 1) * xw]);
             }
-            t.above_level_ctx[0][x4..x4 + w4].copy_from_slice(&al);
-            t.above_dc_ctx[0][x4..x4 + w4].copy_from_slice(&ad);
-            t.left_level_ctx[0][y4..y4 + h4].copy_from_slice(&ll);
-            t.left_dc_ctx[0][y4..y4 + h4].copy_from_slice(&ld);
+            t.above_level_ctx[0][x4..x4 + w4].copy_from_slice(&s.ctx[0]);
+            t.above_dc_ctx[0][x4..x4 + w4].copy_from_slice(&s.ctx[1]);
+            t.left_level_ctx[0][y4..y4 + h4].copy_from_slice(&s.ctx[2]);
+            t.left_dc_ctx[0][y4..y4 + h4].copy_from_slice(&s.ctx[3]);
             let cw = cols - x4;
             for (i, r) in (y4..rows).enumerate() {
                 t.f.tx_types[r * ms + x4..r * ms + cols]
-                    .copy_from_slice(&txt[i * cw..(i + 1) * cw]);
+                    .copy_from_slice(&s.txt[i * cw..(i + 1) * cw]);
             }
         };
+        let pre = grab(self);
         let counting = self.sd.set_counting(true);
         let bits_start = self.sd.trial_bits();
         let nonzero = self.rdo().nonzero;
         let saved_ptt = self.plane_tx_type;
         let mut best = (cands[0], f64::MAX);
         let early = self.enc().tools.tx_type_early;
+        // Inside a trial (counting already), with the levels the caller
+        // would choose for the best type what its trial chose (not with
+        // `rdoq` 2, off in this search alone), the caller's coding of the
+        // best type would repeat its trial: what the trial left stands in
+        // for it (see `enc_choose_coeffs`).
+        let keep = counting && self.enc().tools.rdoq != 2;
+        let mut post: Option<(TxState, u64, usize, usize)> = None;
         for &t in cands {
             self.rdo().forced_tx_type = Some(t);
             let bits0 = self.sd.trial_bits();
@@ -2216,8 +2248,11 @@ impl TileDecoder<'_, '_> {
             let better = cost < best.1;
             if better {
                 best = (t, cost);
+                if keep {
+                    post = Some((grab(self), bits, eob, self.plane_tx_type));
+                }
             }
-            restore(self);
+            put(self, &pre);
             // Speed: the DCT coding nothing, or a type not beating the
             // best before it, ends the search.
             if early && ((t == DCT_DCT && eob == 0) || (t != DCT_DCT && !better)) {
@@ -2228,6 +2263,14 @@ impl TileDecoder<'_, '_> {
         self.plane_tx_type = saved_ptt;
         self.sd.set_counting(counting);
         self.sd.set_trial_bits(bits_start);
+        if let Some((state, bits, eob, ptt)) = post {
+            put(self, &state);
+            self.sd.set_trial_bits(bits_start + bits);
+            self.plane_tx_type = ptt;
+            let rdo = self.rdo();
+            rdo.nonzero += (eob > 0) as u32;
+            rdo.tx_coded = Some(eob);
+        }
         best.0
     }
 }

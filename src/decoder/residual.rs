@@ -202,8 +202,10 @@ impl TileDecoder<'_, '_> {
                         self.coeffs_dequantised(plane, start_x, start_y, tx_sz);
                     // The encoder reconstructs as a decoder does: what it
                     // codes is then what the decoder outputs, by
-                    // construction.
-                    if eob > 0 {
+                    // construction. (Unless its search left the block
+                    // reconstructed already.)
+                    let coded = self.sd.encoding() && self.enc_take_tx_coded();
+                    if eob > 0 && !coded {
                         self.reconstruct_decode(plane, start_x, start_y, tx_sz, eob, dequantised);
                     }
                 }
@@ -707,6 +709,9 @@ impl TileDecoder<'_, '_> {
         let mut target_eob = 0usize;
         if self.sd.encoding() {
             target_eob = self.enc_choose_coeffs(plane, start_x, start_y, tx_sz);
+            if self.enc_tx_coded() {
+                return target_eob;
+            }
         }
         self.quant[..seg_eob].fill(0);
         let mut eob = 0usize;

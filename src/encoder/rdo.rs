@@ -46,6 +46,10 @@ pub(crate) struct Rdo {
     pub(crate) forced_partition: Option<usize>,
     pub(crate) forced_plan: Option<Plan>,
     pub(crate) forced_tx_type: Option<usize>,
+    /// The transform type search left the luma transform block coded with
+    /// the best type (its end of block): the walker codes nothing more of
+    /// it (`TileDecoder::enc_take_tx_coded`).
+    pub(crate) tx_coded: Option<usize>,
     /// Trial coding of block candidates: luma transform types are the DCT,
     /// not searched.
     pub(crate) fast_tx: bool,

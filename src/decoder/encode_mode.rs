@@ -45,6 +45,21 @@ impl TileDecoder<'_, '_> {
         self.enc.as_ref().is_some_and(|e| e.probing)
     }
 
+    /// Whether the encoder's transform type search left the transform
+    /// block coded already (its levels' symbols counted, it reconstructed).
+    #[inline]
+    pub(crate) fn enc_tx_coded(&self) -> bool {
+        self.enc.as_ref().is_some_and(|e| e.rdo.tx_coded.is_some())
+    }
+
+    /// [`Self::enc_tx_coded`], clearing it.
+    #[inline]
+    pub(crate) fn enc_take_tx_coded(&mut self) -> bool {
+        self.enc
+            .as_mut()
+            .is_some_and(|e| e.rdo.tx_coded.take().is_some())
+    }
+
     /// Counts a transform block with coefficients, for the encoder's search.
     #[inline]
     pub(crate) fn count_nonzero(&mut self) {
@@ -78,6 +93,16 @@ impl TileDecoder<'_, '_> {
 
     #[inline(always)]
     pub(crate) fn count_nonzero(&mut self) {}
+
+    #[inline(always)]
+    pub(crate) fn enc_tx_coded(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn enc_take_tx_coded(&mut self) -> bool {
+        false
+    }
 
     #[inline(always)]
     pub(crate) fn enc_level(&self, _pos: usize) -> u32 {
