@@ -184,6 +184,16 @@ impl TileDecoder<'_, '_> {
 
     /// Saves the state of a `b_size` block at `(r, c)`.
     pub(crate) fn snap(&mut self, r: usize, c: usize, b_size: usize) -> Snap {
+        self.snap_parts(r, c, b_size, true)
+    }
+
+    /// Saves the state of a `b_size` block at `(r, c)`, its samples only
+    /// with `pixels`. A search's own snapshot needs none: each of its
+    /// trials writes every sample of the block before it reads it (its
+    /// predictions read the samples around it, and those of its own
+    /// transform blocks coded before), and what follows the search codes
+    /// the block again or puts back the samples a trial left.
+    pub(crate) fn snap_parts(&mut self, r: usize, c: usize, b_size: usize, pixels: bool) -> Snap {
         let mut s = self.rdo().pool.pop().unwrap_or_default();
         let (r0, r1, c0, c1) = self.block_rect(r, c, b_size);
         s.r0 = r0;
@@ -227,7 +237,7 @@ impl TileDecoder<'_, '_> {
             let (x0, x1) = (pc0 * 4, (pc1 * 4).min(pl.w));
             let (y0, y1) = (pr0 * 4, (pr1 * 4).min(pl.h));
             s.pix[p].clear();
-            for y in y0..y1 {
+            for y in (y0..y1).filter(|_| pixels) {
                 s.pix[p].extend_from_slice(&pl.data[y * pl.stride + x0..y * pl.stride + x1]);
             }
             let ac = self.above_level_ctx[p].len();
@@ -308,6 +318,7 @@ impl TileDecoder<'_, '_> {
             let (x0, x1) = (pc0 * 4, (pc1 * 4).min(pl.w));
             let (y0, y1) = (pr0 * 4, (pr1 * 4).min(pl.h));
             let xw = x1 - x0;
+            debug_assert!(!pixels || s.pix[p].len() == (y1 - y0) * xw);
             for (i, y) in (y0..y1).enumerate().filter(|_| pixels) {
                 pl.data[y * pl.stride + x0..y * pl.stride + x1]
                     .copy_from_slice(&s.pix[p][i * xw..(i + 1) * xw]);
@@ -461,7 +472,7 @@ impl TileDecoder<'_, '_> {
             return Ok(cands[0]);
         }
         debug_assert!(self.rdo().replay.is_empty());
-        let snap = self.snap(r, c, b_size);
+        let snap = self.snap_parts(r, c, b_size, false);
         let saved_b = self.b.clone();
         let counting = self.sd.set_counting(true);
         let bits_start = self.sd.trial_bits();
@@ -489,7 +500,7 @@ impl TileDecoder<'_, '_> {
         let last = cands.len() - 1;
         for (k, &p) in cands.iter().enumerate() {
             if !first {
-                self.restore(&snap);
+                self.restore_parts(&snap, false);
                 at_best = false;
             }
             // A flat block that codes with no residual as one block is not
@@ -598,7 +609,7 @@ impl TileDecoder<'_, '_> {
         if let Some(post) = best_post {
             self.release(post);
         }
-        self.restore(&snap);
+        self.restore_parts(&snap, false);
         self.release(snap);
         self.b = saved_b;
         self.sd.set_counting(counting);
@@ -639,7 +650,7 @@ impl TileDecoder<'_, '_> {
         }
         let cands = self.block_candidates();
         let (r, c, size) = (self.b.mi_row, self.b.mi_col, self.b.mi_size);
-        let snap = self.snap(r, c, size);
+        let snap = self.snap_parts(r, c, size, false);
         let saved_b = self.b.clone();
         let counting = self.sd.set_counting(true);
         let bits_start = self.sd.trial_bits();
@@ -655,7 +666,7 @@ impl TileDecoder<'_, '_> {
         let mut post: Option<Post> = None;
         let mut trial = |t: &mut Self, p: Plan, fast: bool| -> Result<(f64, bool, Vec<Decision>)> {
             if !first {
-                t.restore(&snap);
+                t.restore_parts(&snap, false);
             }
             first = false;
             t.b = saved_b.clone();
@@ -863,7 +874,7 @@ impl TileDecoder<'_, '_> {
             Some(q) => self.release(q.state),
             None => {}
         }
-        self.restore(&snap);
+        self.restore_parts(&snap, false);
         self.release(snap);
         self.b = saved_b;
         self.sd.set_counting(counting);
