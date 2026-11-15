@@ -716,7 +716,7 @@ fn run(t: &mut [i32], kind: Kind, n: u32, r: u32, lossless: bool, wht_shift: u32
         tx.iwht(wht_shift);
         return;
     }
-    run_lanes(tx.t, kind, n, r);
+    lines_out(tx.t, kind, n, r);
 }
 
 #[inline(always)]
@@ -741,6 +741,44 @@ fn run_lanes<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
         (Kind::Identity, 4) => tx.iidentity(4),
         (Kind::Identity, _) => tx.iidentity(5),
     }
+}
+
+/// [`run_lanes`] for the 2D transforms' lines (eight at a time, or one),
+/// out of line. Inlined, the processes of every size and kind would be
+/// compiled into each place a line is transformed: rows and columns, of
+/// eight lines and of one, in each of the scratch sizes of
+/// [`inverse_transform_2d_lanes_n`], sixteen copies of the lot. Called,
+/// there is one for each kind of line, and a call costs nothing next to
+/// the transform of eight.
+#[inline(always)]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn lines<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is available.
+        return unsafe { lines_avx2(t, kind, n, r) };
+    }
+    lines_out(t, kind, n, r)
+}
+
+/// [`lines`] without AVX2, and the scalar transforms' one line.
+#[inline(never)]
+fn lines_out<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
+    run_lanes(t, kind, n, r)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn lines_avx2<L: Lane>(t: &mut [L], kind: Kind, n: u32, r: u32) {
+    run_lanes(t, kind, n, r)
 }
 
 /// One 1D inverse transform, without intermediate clamping (`r` wide
@@ -965,7 +1003,7 @@ fn inverse_transform_2d_lanes_n<const N: usize>(
                     *v = round2_12(*v as i64 * 2896);
                 }
             }
-            run_lanes(&mut t[..], rk, log2w, row_clamp);
+            lines(&mut t[..], rk, log2w, row_clamp);
             for j in 0..w {
                 out[j] = round2(t[j], row_shift).clamp(lo, hi);
             }
@@ -992,7 +1030,7 @@ fn inverse_transform_2d_lanes_n<const N: usize>(
                     *v = Lanes::scale12(*v, 2896);
                 }
             }
-            run_lanes(&mut t[..], rk, log2w, row_clamp);
+            lines(&mut t[..], rk, log2w, row_clamp);
             for l in 0..8 {
                 let out = &mut residual[(i0 + l) * w..(i0 + l + 1) * w];
                 for j in 0..w {
@@ -1010,7 +1048,7 @@ fn inverse_transform_2d_lanes_n<const N: usize>(
                 t[i] = residual[i * w + j];
             }
             t[done..h].fill(0);
-            run_lanes(&mut t[..], ck, log2h, col_clamp);
+            lines(&mut t[..], ck, log2h, col_clamp);
             for i in 0..h {
                 residual[i * w + j] = round2(t[i], 4);
             }
@@ -1023,7 +1061,7 @@ fn inverse_transform_2d_lanes_n<const N: usize>(
                 .copy_from_slice(&residual[i * w + j0..i * w + j0 + 8]);
         }
         t[done..h].fill(Lanes::zero());
-        run_lanes(&mut t[..], ck, log2h, col_clamp);
+        lines(&mut t[..], ck, log2h, col_clamp);
         for i in 0..h {
             let out = &mut residual[i * w + j0..i * w + j0 + 8];
             for l in 0..8 {
